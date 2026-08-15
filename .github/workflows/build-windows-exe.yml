@@ -28,29 +28,30 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
 
-      - name: Verify v2.1.3 CUDA Stability EXE
+      - name: Verify v2.1.4 Isolated Worker EXE
         shell: powershell
         run: |
           $root = "dist\NOVRIA-AI-Music-Studio"
           $exe = "$root\NOVRIA-AI-Music-Studio.exe"
+          $worker = "$root\NOVRIA-Separation-Worker.exe"
           $ffmpeg = "$root\tools\ffmpeg\ffmpeg.exe"
           if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
+          if (!(Test-Path $worker)) { throw "Worker EXE not found: $worker" }
           if (!(Test-Path $ffmpeg)) { throw "Bundled FFmpeg not found: $ffmpeg" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern 'VERSION = "2.1.3"' -Quiet)) { throw "v2.1.3 launcher not found" }
-          if (!(Select-String -Path "build_tools\build_windows_exe.ps1" -Pattern 'cu128' -Quiet)) { throw "CUDA PyTorch build not configured" }
-          if (!(Select-String -Path "NOVRIA.spec" -Pattern "app/launcher.py" -Quiet)) { throw "PyInstaller is not using launcher.py" }
+          if (!(Select-String -Path "app\launcher.py" -Pattern 'VERSION = "2.1.4"' -Quiet)) { throw "v2.1.4 launcher not found" }
+          if (!(Select-String -Path "NOVRIA.spec" -Pattern "NOVRIA-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
           & $ffmpeg -version | Select-Object -First 1
-          Get-Item $exe,$ffmpeg | Format-Table Name,Length,FullName
+          Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
 
       - name: Package Windows build
         shell: powershell
         run: |
-          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "NOVRIA_AI_Music_Studio_v2.1.3_CUDA_Stability_Windows_x64.zip" -Force
+          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "NOVRIA_AI_Music_Studio_v2.1.4_Isolated_Worker_Windows_x64.zip" -Force
 
-      - name: Upload v2.1.3 CUDA Stability artifact
+      - name: Upload v2.1.4 Isolated Worker artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NOVRIA-AI-Music-Studio-v2.1.3-CUDA-Stability-Windows-x64
-          path: NOVRIA_AI_Music_Studio_v2.1.3_CUDA_Stability_Windows_x64.zip
+          name: NOVRIA-AI-Music-Studio-v2.1.4-Isolated-Worker-Windows-x64
+          path: NOVRIA_AI_Music_Studio_v2.1.4_Isolated_Worker_Windows_x64.zip
           if-no-files-found: error
           retention-days: 30
