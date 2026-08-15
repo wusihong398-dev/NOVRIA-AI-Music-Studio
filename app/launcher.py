@@ -1,4 +1,5 @@
 import sys
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -7,13 +8,31 @@ from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy
 
 from app import main as m
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 
 
 def resource_root():
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
     return Path(__file__).resolve().parent.parent
+
+
+def install_runtime_patches():
+    def _find_ffmpeg(self):
+        exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+        candidates = [
+            exe_dir / "tools" / "ffmpeg" / "ffmpeg.exe",
+            exe_dir / "ffmpeg.exe",
+            Path(getattr(m, "BASE_DIR", exe_dir)) / "tools" / "ffmpeg" / "ffmpeg.exe",
+        ]
+        for p in candidates:
+            if p and p.exists() and p.is_file():
+                return str(p)
+        system_ffmpeg = shutil.which("ffmpeg")
+        return system_ffmpeg or ""
+
+    # UniversalImportPage calls self.main._find_ffmpeg(); other render paths use it too.
+    m.MainWindow._find_ffmpeg = _find_ffmpeg
 
 
 def wrap_stack_pages(win):
@@ -44,6 +63,8 @@ def run():
         m.STEMS_DIR = m.BASE_DIR / "stems"
         m.PROJECTS_DIR = m.BASE_DIR / "projects"
         m.EXPORTS_DIR = m.BASE_DIR / "exports"
+
+    install_runtime_patches()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
