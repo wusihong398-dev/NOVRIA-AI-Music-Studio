@@ -25,20 +25,22 @@ jobs:
         run: |
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
-      - name: Verify EXE
+      - name: Verify v2.1.1 UI EXE
         shell: powershell
         run: |
           $exe = "dist\NOVRIA-AI-Music-Studio\NOVRIA-AI-Music-Studio.exe"
           if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
+          if (!(Select-String -Path "app\launcher.py" -Pattern 'VERSION = "2.1.1"' -Quiet)) { throw "v2.1.1 launcher not found" }
+          if (!(Select-String -Path "NOVRIA.spec" -Pattern "app/launcher.py" -Quiet)) { throw "PyInstaller is not using v2.1.1 launcher" }
           Get-Item $exe | Format-List Name,Length,FullName
       - name: Package Windows build
         shell: powershell
         run: |
-          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "NOVRIA_AI_Music_Studio_v2.1.0_Windows_x64.zip" -Force
-      - name: Upload Windows EXE artifact
+          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "NOVRIA_AI_Music_Studio_v2.1.1_UI_Refresh_Windows_x64.zip" -Force
+      - name: Upload v2.1.1 UI Refresh artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NOVRIA-AI-Music-Studio-v2.1.0-Windows-x64
-          path: NOVRIA_AI_Music_Studio_v2.1.0_Windows_x64.zip
+          name: NOVRIA-AI-Music-Studio-v2.1.1-UI-Refresh-Windows-x64
+          path: NOVRIA_AI_Music_Studio_v2.1.1_UI_Refresh_Windows_x64.zip
           if-no-files-found: error
           retention-days: 30
