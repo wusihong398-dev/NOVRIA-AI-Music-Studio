@@ -1,14 +1,17 @@
 import sys
+import os
 import shutil
+import traceback
+import faulthandler
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy, QMessageBox
 
 from app import main as m
 
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 
 
 def resource_root():
@@ -17,22 +20,64 @@ def resource_root():
     return Path(__file__).resolve().parent.parent
 
 
+def runtime_base():
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+
+
+def install_crash_logging():
+    base = runtime_base()
+    log_dir = base / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    crash_path = log_dir / "crash.log"
+    crash_fp = open(crash_path, "a", encoding="utf-8", buffering=1)
+    crash_fp.write("\n===== NOVRIA startup v%s =====\n" % VERSION)
+    try:
+        faulthandler.enable(crash_fp, all_threads=True)
+    except Exception:
+        pass
+
+    def hook(exc_type, exc_value, exc_tb):
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            crash_fp.write(text + "\n")
+            crash_fp.flush()
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(None, "NOVRIA 运行异常", f"程序发生异常，已写入：\n{crash_path}\n\n{text[-1200:]}")
+        except Exception:
+            pass
+    sys.excepthook = hook
+    return crash_fp
+
+
 def install_runtime_patches():
     def _find_ffmpeg(self):
-        exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+        exe_dir = runtime_base()
         candidates = [
             exe_dir / "tools" / "ffmpeg" / "ffmpeg.exe",
             exe_dir / "ffmpeg.exe",
             Path(getattr(m, "BASE_DIR", exe_dir)) / "tools" / "ffmpeg" / "ffmpeg.exe",
         ]
         for p in candidates:
-            if p and p.exists() and p.is_file():
+            if p.exists() and p.is_file():
                 return str(p)
-        system_ffmpeg = shutil.which("ffmpeg")
-        return system_ffmpeg or ""
+        return shutil.which("ffmpeg") or ""
 
-    # UniversalImportPage calls self.main._find_ffmpeg(); other render paths use it too.
     m.MainWindow._find_ffmpeg = _find_ffmpeg
+
+
+def write_gpu_diagnostic(log_fp):
+    try:
+        import torch
+        log_fp.write(f"torch={torch.__version__}\n")
+        log_fp.write(f"torch.version.cuda={torch.version.cuda}\n")
+        log_fp.write(f"cuda_available={torch.cuda.is_available()}\n")
+        if torch.cuda.is_available():
+            log_fp.write(f"gpu={torch.cuda.get_device_name(0)}\n")
+            log_fp.write(f"gpu_count={torch.cuda.device_count()}\n")
+    except Exception:
+        log_fp.write(traceback.format_exc() + "\n")
 
 
 def wrap_stack_pages(win):
@@ -54,17 +99,19 @@ def wrap_stack_pages(win):
 
 
 def run():
+    crash_fp = install_crash_logging()
     root = resource_root()
     m.VERSION = VERSION
     m.ASSETS_DIR = root / "assets"
     m.ICONS_DIR = m.ASSETS_DIR / "icons"
     if getattr(sys, "frozen", False):
-        m.BASE_DIR = Path(sys.executable).resolve().parent
+        m.BASE_DIR = runtime_base()
         m.STEMS_DIR = m.BASE_DIR / "stems"
         m.PROJECTS_DIR = m.BASE_DIR / "projects"
         m.EXPORTS_DIR = m.BASE_DIR / "exports"
 
     install_runtime_patches()
+    write_gpu_diagnostic(crash_fp)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
