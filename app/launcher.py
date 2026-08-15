@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import json
 import shutil
 import subprocess
@@ -84,20 +85,12 @@ class ProcessSeparationWorker(QThread):
         try:
             cmd = self._command()
             self.log.emit("六轨任务已切换到独立 GPU Worker 进程")
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=creationflags,
-            )
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace", bufsize=1,
+                                    creationflags=creationflags)
             last_error = ""
+            done_emitted = False
             if proc.stdout is not None:
                 for raw in proc.stdout:
                     line = raw.strip()
@@ -106,8 +99,7 @@ class ProcessSeparationWorker(QThread):
                     try:
                         data = json.loads(line)
                     except Exception:
-                        self.log.emit(line[:500])
-                        continue
+                        self.log.emit(line[:500]); continue
                     kind = data.get("type")
                     if kind == "model_progress":
                         self.model_progress.emit(int(data.get("value", 0)), str(data.get("text", "")))
@@ -116,42 +108,39 @@ class ProcessSeparationWorker(QThread):
                     elif kind == "diagnostic":
                         self.log.emit("Worker: " + json.dumps(data, ensure_ascii=False))
                     elif kind == "failed":
-                        last_error = str(data.get("error", "六轨 Worker 失败"))
-                        self.log.emit(last_error)
+                        last_error = str(data.get("error", "六轨 Worker 失败")); self.log.emit(last_error)
                     elif kind == "done":
                         stem_dir = str(data.get("stem_dir", ""))
                         if stem_dir:
-                            self.done.emit(stem_dir)
+                            done_emitted = True; self.done.emit(stem_dir)
             stderr_text = proc.stderr.read() if proc.stderr is not None else ""
             code = proc.wait()
             if stderr_text:
-                try:
-                    with worker_log.open("a", encoding="utf-8") as f:
-                        f.write("\n===== worker stderr =====\n")
-                        f.write(stderr_text[-12000:])
-                except Exception:
-                    pass
+                with worker_log.open("a", encoding="utf-8") as f:
+                    f.write("\n===== worker stderr =====\n" + stderr_text[-12000:])
             if code != 0:
                 detail = last_error or stderr_text[-1500:] or f"Worker 退出码 {code}"
                 self.failed.emit(f"独立六轨 Worker 异常退出（代码 {code}）：{detail}")
+            elif not done_emitted:
+                self.failed.emit("独立六轨 Worker 已结束，但没有返回六轨结果。")
         except Exception as exc:
             try:
                 with worker_log.open("a", encoding="utf-8") as f:
-                    f.write("\n===== parent worker exception =====\n")
-                    f.write(traceback.format_exc())
+                    f.write("\n===== parent worker exception =====\n" + traceback.format_exc())
             except Exception:
                 pass
             self.failed.emit(str(exc))
 
 
 def install_runtime_patches():
+    # main.py v2.1.x forgot to import re, but _transpose_chord uses re.match.
+    # Inject it into the module namespace so score refresh/auto transpose is stable.
+    m.re = re
+
     def _find_ffmpeg(self):
         exe_dir = runtime_base()
-        candidates = [
-            exe_dir / "tools" / "ffmpeg" / "ffmpeg.exe",
-            exe_dir / "ffmpeg.exe",
-            Path(getattr(m, "BASE_DIR", exe_dir)) / "tools" / "ffmpeg" / "ffmpeg.exe",
-        ]
+        candidates = [exe_dir / "tools" / "ffmpeg" / "ffmpeg.exe", exe_dir / "ffmpeg.exe",
+                      Path(getattr(m, "BASE_DIR", exe_dir)) / "tools" / "ffmpeg" / "ffmpeg.exe"]
         for p in candidates:
             if p.exists() and p.is_file():
                 return str(p)
@@ -164,12 +153,9 @@ def install_runtime_patches():
 def write_gpu_diagnostic(log_fp):
     try:
         import torch
-        log_fp.write(f"torch={torch.__version__}\n")
-        log_fp.write(f"torch.version.cuda={torch.version.cuda}\n")
-        log_fp.write(f"cuda_available={torch.cuda.is_available()}\n")
+        log_fp.write(f"torch={torch.__version__}\ntorch.version.cuda={torch.version.cuda}\ncuda_available={torch.cuda.is_available()}\n")
         if torch.cuda.is_available():
-            log_fp.write(f"gpu={torch.cuda.get_device_name(0)}\n")
-            log_fp.write(f"gpu_count={torch.cuda.device_count()}\n")
+            log_fp.write(f"gpu={torch.cuda.get_device_name(0)}\ngpu_count={torch.cuda.device_count()}\n")
     except Exception:
         log_fp.write(traceback.format_exc() + "\n")
 
@@ -181,46 +167,23 @@ def wrap_stack_pages(win):
     for widget in original:
         stack.removeWidget(widget)
     for widget in original:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        scroll.setWidget(widget)
-        stack.addWidget(scroll)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding); scroll.setWidget(widget); stack.addWidget(scroll)
     stack.setCurrentIndex(current)
 
 
 def run():
     crash_fp = install_crash_logging()
-    root = resource_root()
-    m.VERSION = VERSION
-    m.ASSETS_DIR = root / "assets"
-    m.ICONS_DIR = m.ASSETS_DIR / "icons"
+    root = resource_root(); m.VERSION = VERSION; m.ASSETS_DIR = root / "assets"; m.ICONS_DIR = m.ASSETS_DIR / "icons"
     if getattr(sys, "frozen", False):
-        m.BASE_DIR = runtime_base()
-        m.STEMS_DIR = m.BASE_DIR / "stems"
-        m.PROJECTS_DIR = m.BASE_DIR / "projects"
-        m.EXPORTS_DIR = m.BASE_DIR / "exports"
-
-    install_runtime_patches()
-    write_gpu_diagnostic(crash_fp)
-
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setFont(QFont("Microsoft YaHei UI", 10))
+        m.BASE_DIR = runtime_base(); m.STEMS_DIR = m.BASE_DIR / "stems"; m.PROJECTS_DIR = m.BASE_DIR / "projects"; m.EXPORTS_DIR = m.BASE_DIR / "exports"
+    install_runtime_patches(); write_gpu_diagnostic(crash_fp)
+    app = QApplication(sys.argv); app.setStyle("Fusion"); app.setFont(QFont("Microsoft YaHei UI", 10))
     theme = m.ASSETS_DIR / "theme.qss"
-    if theme.exists():
-        app.setStyleSheet(theme.read_text(encoding="utf-8"))
-
-    win = m.MainWindow()
-    wrap_stack_pages(win)
-    win.setWindowTitle(f"{m.APP_NAME}  ·  v{VERSION}")
-    win.resize(1500, 940)
-    win.setMinimumSize(1100, 700)
-    win.show()
-    return app.exec()
+    if theme.exists(): app.setStyleSheet(theme.read_text(encoding="utf-8"))
+    win = m.MainWindow(); wrap_stack_pages(win); win.setWindowTitle(f"{m.APP_NAME}  ·  v{VERSION}")
+    win.resize(1500, 940); win.setMinimumSize(1100, 700); win.show(); return app.exec()
 
 
 if __name__ == "__main__":
