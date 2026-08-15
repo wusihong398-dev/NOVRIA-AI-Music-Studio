@@ -1,17 +1,19 @@
 import sys
 import os
+import json
 import shutil
+import subprocess
 import traceback
 import faulthandler
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy, QMessageBox
 
 from app import main as m
 
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 
 
 def resource_root():
@@ -51,6 +53,97 @@ def install_crash_logging():
     return crash_fp
 
 
+class ProcessSeparationWorker(QThread):
+    log = Signal(str)
+    model_progress = Signal(int, str)
+    separation_progress = Signal(int, str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, input_file: str):
+        super().__init__()
+        self.input_file = input_file
+
+    def _command(self):
+        base = runtime_base()
+        if getattr(sys, "frozen", False):
+            worker = base / "NOVRIA-Separation-Worker.exe"
+            if not worker.exists():
+                raise RuntimeError(f"未找到独立六轨 Worker：{worker}")
+            cmd = [str(worker)]
+        else:
+            cmd = [sys.executable, "-m", "app.separation_worker_process"]
+        cmd += [self.input_file, "--output", str(m.STEMS_DIR), "--device", "auto"]
+        return cmd
+
+    def run(self):
+        base = runtime_base()
+        log_dir = base / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        worker_log = log_dir / "separation-parent.log"
+        try:
+            cmd = self._command()
+            self.log.emit("六轨任务已切换到独立 GPU Worker 进程")
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+            last_error = ""
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        self.log.emit(line[:500])
+                        continue
+                    kind = data.get("type")
+                    if kind == "model_progress":
+                        self.model_progress.emit(int(data.get("value", 0)), str(data.get("text", "")))
+                    elif kind == "separation_progress":
+                        self.separation_progress.emit(int(data.get("value", 0)), str(data.get("text", "")))
+                    elif kind == "diagnostic":
+                        self.log.emit("Worker: " + json.dumps(data, ensure_ascii=False))
+                    elif kind == "failed":
+                        last_error = str(data.get("error", "六轨 Worker 失败"))
+                        self.log.emit(last_error)
+                    elif kind == "done":
+                        stem_dir = str(data.get("stem_dir", ""))
+                        if stem_dir:
+                            self.done.emit(stem_dir)
+            stderr_text = proc.stderr.read() if proc.stderr is not None else ""
+            code = proc.wait()
+            if stderr_text:
+                try:
+                    with worker_log.open("a", encoding="utf-8") as f:
+                        f.write("\n===== worker stderr =====\n")
+                        f.write(stderr_text[-12000:])
+                except Exception:
+                    pass
+            if code != 0:
+                detail = last_error or stderr_text[-1500:] or f"Worker 退出码 {code}"
+                self.failed.emit(f"独立六轨 Worker 异常退出（代码 {code}）：{detail}")
+        except Exception as exc:
+            try:
+                with worker_log.open("a", encoding="utf-8") as f:
+                    f.write("\n===== parent worker exception =====\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
+            self.failed.emit(str(exc))
+
+
 def install_runtime_patches():
     def _find_ffmpeg(self):
         exe_dir = runtime_base()
@@ -65,6 +158,7 @@ def install_runtime_patches():
         return shutil.which("ffmpeg") or ""
 
     m.MainWindow._find_ffmpeg = _find_ffmpeg
+    m.SeparationWorker = ProcessSeparationWorker
 
 
 def write_gpu_diagnostic(log_fp):
