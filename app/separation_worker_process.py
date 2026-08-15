@@ -6,6 +6,21 @@ import traceback
 from pathlib import Path
 
 
+def _force_utf8_stdio():
+    # PyInstaller console workers on Simplified Chinese Windows may inherit GBK/CP936.
+    # The parent process consumes JSONL as UTF-8, so make the worker stream deterministic.
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_force_utf8_stdio()
+
+
 def emit(kind, **payload):
     obj = {"type": kind, **payload}
     print(json.dumps(obj, ensure_ascii=False), flush=True)
