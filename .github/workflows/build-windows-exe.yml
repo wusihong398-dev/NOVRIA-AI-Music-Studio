@@ -1,0 +1,44 @@
+name: Build NOVRIA Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Build EXE
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          .\build_tools\build_windows_exe.ps1
+      - name: Verify EXE
+        shell: powershell
+        run: |
+          $exe = "dist\NOVRIA-AI-Music-Studio\NOVRIA-AI-Music-Studio.exe"
+          if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
+          Get-Item $exe | Format-List Name,Length,FullName
+      - name: Package Windows build
+        shell: powershell
+        run: |
+          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "NOVRIA_AI_Music_Studio_v2.1.0_Windows_x64.zip" -Force
+      - name: Upload Windows EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOVRIA-AI-Music-Studio-v2.1.0-Windows-x64
+          path: NOVRIA_AI_Music_Studio_v2.1.0_Windows_x64.zip
+          if-no-files-found: error
+          retention-days: 30
