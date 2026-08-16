@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
-title NOVRIA AI Music Studio - 模型目录
+title 橘味儿音乐 - 模型目录
 cd /d "%~dp0"
-echo NOVRIA 模型缓存目录：
+echo 橘味儿音乐模型缓存目录：
 echo.
 if exist "ai_models" (
   explorer "%cd%\ai_models"

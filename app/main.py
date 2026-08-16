@@ -17,6 +17,14 @@ import math
 import time, json, subprocess, traceback, platform, urllib.request, hashlib, io, os
 from pathlib import Path
 
+from app.project_utils import (
+    atomic_write_json,
+    normalized_path,
+    repair_text,
+    safe_file_stem,
+    unique_import_candidates,
+)
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -29,8 +37,8 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QStackedWidget, QGridLayout, QDialogButtonBox, QTableWidget, QTableWidgetItem, QTabWidget, QRadioButton, QFileSystemModel, QTreeWidgetItem, QTreeWidget, QPlainTextEdit, QButtonGroup, QTextBrowser, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox
 )
 
-APP_NAME = "NOVRIA AI Music Studio"
-VERSION = "2.1.0"
+APP_NAME = "橘味儿音乐"
+VERSION = "2.1.7"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -124,7 +132,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "NOVRIA-AI-Music-Studio/0.3.2"}
+            headers={"User-Agent": "Juweier-Music/2.1.7"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -227,6 +235,25 @@ class SeparationWorker(QThread):
             self.done.emit(str(stem_dir))
         except Exception as e:
             self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+class PipelineStageWorker(QThread):
+    """Run CPU-heavy non-Qt stages without freezing the interface."""
+
+    succeeded = Signal()
+    failed = Signal(str)
+
+    def __init__(self, operation):
+        super().__init__()
+        self.operation = operation
+
+    def run(self):
+        try:
+            self.operation()
+            self.succeeded.emit()
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+
 
 class MultiStemEngine:
     def __init__(self):
@@ -1228,7 +1255,7 @@ class ArrangementScorePage(QWidget):
         self.manual_space = QSlider(Qt.Horizontal)
         self.manual_space.setRange(-50,50); self.manual_space.setValue(0)
 
-        self.manual_label = QLabel("调整范围：-50% ～ +50%，0 表示沿用 NOVRIA 自动策略")
+        self.manual_label = QLabel("调整范围：-50% ～ +50%，0 表示沿用橘味儿音乐自动策略")
         self.manual_label.setObjectName("SectionHint")
         self.manual_label.setWordWrap(True)
 
@@ -1562,7 +1589,7 @@ class VoiceLabPage(QWidget):
         gl.addWidget(save,4,2)
         layout.addWidget(box)
 
-        rights=QLabel("使用真实人物声音前应确认拥有必要授权/同意；NOVRIA 保存任务来源信息，便于后续授权管理。")
+        rights=QLabel("使用真实人物声音前应确认拥有必要授权/同意；橘味儿音乐保存任务来源信息，便于后续授权管理。")
         rights.setWordWrap(True)
         layout.addWidget(rights)
         layout.addStretch(1)
@@ -1618,7 +1645,7 @@ class InstrumentExperiencePage(QWidget):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        hint = QLabel("选择你现场演奏的乐器，NOVRIA 自动关闭对应原乐器轨，并显示该乐手最需要的谱面、排练和演奏参数。")
+        hint = QLabel("选择你现场演奏的乐器，橘味儿音乐自动关闭对应原乐器轨，并显示该乐手最需要的谱面、排练和演奏参数。")
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1934,7 +1961,7 @@ class UniversalImportPage(QWidget):
 
         hint = QLabel(
             "支持本地多格式、批量文件、分享文本/链接、剪贴板导入。"
-            "导入后统一转为 NOVRIA 工作 WAV，不修改原文件。"
+            "导入后统一转为橘味儿音乐工作 WAV，不修改原文件。"
         )
         hint.setWordWrap(True)
         hint.setObjectName("SectionHint")
@@ -2014,7 +2041,7 @@ class UniversalImportPage(QWidget):
         l.addWidget(self.link_table)
 
         notice=QLabel(
-            "NOVRIA 只下载普通可直接访问的媒体/文件链接。"
+            "橘味儿音乐只下载普通可直接访问的媒体/文件链接。"
             "不会绕过 DRM、会员、付费下载、登录验证或平台访问控制。"
         )
         notice.setWordWrap(True)
@@ -2098,7 +2125,11 @@ class UniversalImportPage(QWidget):
 
     def _convert_to_wav(self, src):
         src=Path(src)
-        out=self._working_dir()/(src.stem+"_work.wav")
+        try:
+            fingerprint=self._fingerprint(src)[:12]
+        except Exception:
+            fingerprint=hashlib.sha256(normalized_path(src).encode("utf-8")).hexdigest()[:12]
+        out=self._working_dir()/(safe_file_stem(src.stem)+f"_{fingerprint}_work.wav")
         ffmpeg=self.main._find_ffmpeg() if hasattr(self.main,"_find_ffmpeg") else ""
         if not ffmpeg:
             # WAV can be used directly when ffmpeg isn't available.
@@ -2128,7 +2159,7 @@ class UniversalImportPage(QWidget):
 
         completed=0
         for idx,item in enumerate(self.queue):
-            if item.get("status")=="已导入":
+            if item.get("status") in ("已导入", "已去重/复用"):
                 continue
             src=item["source"]
             try:
@@ -2177,7 +2208,7 @@ class UniversalImportPage(QWidget):
                 self.refresh_tables()
                 QApplication.processEvents()
 
-        fingerprint_db.write_text(json.dumps(fpdb,ensure_ascii=False,indent=2),encoding="utf-8")
+        atomic_write_json(fingerprint_db, fpdb)
         if hasattr(self.main,"music_library"):
             self.main.music_library.scan_imports()
         QMessageBox.information(self,"导入完成",f"已处理 {completed} 个音乐素材，并同步到音乐库。")
@@ -2237,7 +2268,7 @@ class UniversalImportPage(QWidget):
             QMessageBox.information(
                 self,"暂不直接下载",
                 "该链接不是明确的公开音频直链。\n\n"
-                "NOVRIA 不会绕过登录、DRM、会员、付费或平台访问控制。"
+                "橘味儿音乐不会绕过登录、DRM、会员、付费或平台访问控制。"
                 "如果平台能提供公开下载地址或用户自己的文件直链，可再粘贴该直链。"
             )
             return
@@ -2247,7 +2278,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"NOVRIA-AI-Music-Studio/1.7"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/2.1.7"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2339,6 +2370,8 @@ class MusicLibraryPage(QWidget):
         self.pipeline_paused = False
         self.pipeline_job_index = -1
         self.pipeline_stage = ""
+        self.pipeline_batch_worker = None
+        self.pipeline_stage_worker = None
         self.pipeline_stage_order = [
             "stems","analysis","chords","score","arrangement","render","library"
         ]
@@ -2626,15 +2659,15 @@ class MusicLibraryPage(QWidget):
                 if v:
                     if isinstance(v,(list,tuple)):
                         v=v[0]
-                    return str(v)
+                    return repair_text(v, default)
             except Exception:
                 pass
-        return default
+        return repair_text(default, default)
 
     def _extract_metadata(self,path):
         p=Path(path)
         data={
-            "title":p.stem,"artist":"未知歌手","album":"未分类专辑","year":"",
+            "title":repair_text(p.stem,p.stem),"artist":"未知歌手","album":"未分类专辑","year":"",
             "duration":0.0,"bitrate":0,"samplerate":0,"channels":0,
             "format":p.suffix.lower().lstrip(".").upper(),"cover_path":""
         }
@@ -2652,10 +2685,10 @@ class MusicLibraryPage(QWidget):
                 tags=getattr(audio,"tags",None)
                 if tags:
                     try:
-                        if "TIT2" in tags: data["title"]=str(tags["TIT2"])
-                        if "TPE1" in tags: data["artist"]=str(tags["TPE1"])
-                        if "TALB" in tags: data["album"]=str(tags["TALB"])
-                        if "TDRC" in tags: data["year"]=str(tags["TDRC"])
+                        if "TIT2" in tags: data["title"]=repair_text(tags["TIT2"],p.stem)
+                        if "TPE1" in tags: data["artist"]=repair_text(tags["TPE1"],"未知歌手")
+                        if "TALB" in tags: data["album"]=repair_text(tags["TALB"],"未分类专辑")
+                        if "TDRC" in tags: data["year"]=repair_text(tags["TDRC"],"")
                     except Exception:
                         pass
 
@@ -2729,32 +2762,52 @@ class MusicLibraryPage(QWidget):
         if fpfile.exists():
             try:
                 fpdb=json.loads(fpfile.read_text(encoding="utf-8"))
-                for fp,item in fpdb.items():
-                    work=item.get("working") or item.get("source")
-                    src=item.get("source") or work
-                    if work and Path(work).exists():
-                        candidates.append((fp,src,work,float(item.get("imported_at",time.time()))))
+                workdir=BASE_DIR/"imports"/"working"
+                candidates=unique_import_candidates(
+                    fpdb,
+                    workdir.glob("*.wav") if workdir.exists() else [],
+                    self._fingerprint,
+                )
             except Exception:
                 pass
-
-        workdir=BASE_DIR/"imports"/"working"
-        if workdir.exists():
-            for p in workdir.glob("*.wav"):
-                try:
-                    fp=self._fingerprint(p)
-                except Exception:
-                    continue
-                if not any(x[0]==fp for x in candidates):
-                    candidates.append((fp,str(p),str(p),time.time()))
+        else:
+            workdir=BASE_DIR/"imports"/"working"
+            if workdir.exists():
+                candidates=unique_import_candidates({},workdir.glob("*.wav"),self._fingerprint)
 
         total=max(1,len(candidates))
         con=self._db()
         added=0
+        # Clean legacy duplicates created when a converted work WAV was scanned
+        # once as an original source and once as a generated work file.
+        existing_rows=con.execute(
+            "SELECT id,source_path,working_path FROM tracks ORDER BY id"
+        ).fetchall()
+        keep_by_work={}
+        for row in existing_rows:
+            raw_work=row["working_path"] or row["source_path"] or ""
+            if not raw_work:
+                continue
+            key=normalized_path(raw_work)
+            current=keep_by_work.get(key)
+            source_diff=normalized_path(row["source_path"] or "") != normalized_path(raw_work)
+            if current is None:
+                keep_by_work[key]=(int(row["id"]),source_diff)
+            elif source_diff and not current[1]:
+                con.execute("DELETE FROM tracks WHERE id=?",(current[0],))
+                keep_by_work[key]=(int(row["id"]),True)
+            else:
+                con.execute("DELETE FROM tracks WHERE id=?",(row["id"],))
         for i,(fp,src,work,imported) in enumerate(candidates):
             self.progress.setValue(int(i/total*95))
             QApplication.processEvents()
             meta=self._extract_metadata(src if Path(src).exists() else work)
             try:
+                same_work=con.execute(
+                    "SELECT id,fingerprint FROM tracks WHERE working_path=? LIMIT 1",(work,)
+                ).fetchone()
+                if same_work and same_work["fingerprint"] != fp:
+                    con.execute("DELETE FROM tracks WHERE id=?",(same_work["id"],))
                 con.execute("""
                 INSERT INTO tracks(
                     fingerprint,source_path,working_path,title,artist,album,year,
@@ -2923,8 +2976,7 @@ class MusicLibraryPage(QWidget):
 
     def _save_batch_queue(self):
         p=self._batch_queue_file()
-        p.parent.mkdir(parents=True,exist_ok=True)
-        p.write_text(json.dumps(self.batch_queue,ensure_ascii=False,indent=2),encoding="utf-8")
+        atomic_write_json(p, self.batch_queue)
 
     def _load_batch_queue(self):
         p=self._batch_queue_file()
@@ -3062,11 +3114,19 @@ class MusicLibraryPage(QWidget):
 
         # Use the stable single-song worker already proven by the main six-track page.
         self.batch_worker=SeparationWorker(item["path"])
+        active_worker=self.batch_worker
         self.batch_worker.model_progress.connect(self._on_batch_model_progress)
         self.batch_worker.separation_progress.connect(self._on_batch_song_progress)
         self.batch_worker.done.connect(self._on_batch_song_done)
         self.batch_worker.failed.connect(self._on_batch_song_failed)
+        self.batch_worker.finished.connect(lambda w=active_worker:self._release_batch_worker(w))
         self.batch_worker.start()
+
+    def _release_batch_worker(self,worker):
+        if self.batch_worker is worker:
+            self.batch_worker=None
+            if self.batch_running and not self.batch_paused:
+                QTimer.singleShot(0,self._start_next_batch_task)
 
     def _on_batch_model_progress(self,value,text):
         # Model preparation occupies the first 5% of the task display.
@@ -3111,8 +3171,6 @@ class MusicLibraryPage(QWidget):
         self._save_batch_queue()
         self.refresh_task_table()
         self._update_total_progress()
-        self.batch_worker=None
-
         if self.batch_paused:
             self.batch_status.setText("批处理：当前歌曲完成，已暂停")
         else:
@@ -3144,8 +3202,6 @@ class MusicLibraryPage(QWidget):
         self._save_batch_queue()
         self.refresh_task_table()
         self._update_total_progress()
-        self.batch_worker=None
-
         if self.batch_paused:
             self.batch_status.setText("批处理：已暂停")
         else:
@@ -3272,7 +3328,9 @@ class MusicLibraryPage(QWidget):
 
     def _scheduler_tick(self):
         if getattr(self,"pipeline_running",False) and not getattr(self,"pipeline_paused",False):
-            if not getattr(self,"pipeline_batch_worker",None):
+            stem_worker=getattr(self,"pipeline_batch_worker",None)
+            stage_worker=getattr(self,"pipeline_stage_worker",None)
+            if not (stem_worker and stem_worker.isRunning()) and not (stage_worker and stage_worker.isRunning()):
                 if self._scheduler_allows_start():
                     self._start_next_pipeline_job()
 
@@ -3307,8 +3365,7 @@ class MusicLibraryPage(QWidget):
 
     def _save_pipeline_jobs(self):
         p=self._pipeline_file()
-        p.parent.mkdir(parents=True,exist_ok=True)
-        p.write_text(json.dumps(self.pipeline_jobs,ensure_ascii=False,indent=2),encoding="utf-8")
+        atomic_write_json(p, self.pipeline_jobs)
 
     def _load_pipeline_jobs(self):
         p=self._pipeline_file()
@@ -3459,10 +3516,26 @@ class MusicLibraryPage(QWidget):
     def _start_next_pipeline_job(self):
         if not self.pipeline_running or self.pipeline_paused:
             return
+        if self.pipeline_batch_worker and self.pipeline_batch_worker.isRunning():
+            return
+        if self.pipeline_stage_worker and self.pipeline_stage_worker.isRunning():
+            return
         if not self._scheduler_allows_start():
             return
         idx=self._pipeline_next_job_index()
         if idx<0:
+            enabled=self._enabled_pipeline_stages()
+            pending=[
+                item for item in self.pipeline_jobs
+                if item.get("status") in ("待处理","处理中")
+                and any(item.get("stages",{}).get(s,"待处理")!="完成" for s in enabled)
+            ]
+            if pending:
+                future=[float(x.get("next_retry_at",0) or 0) for x in pending]
+                wait=max(1,int(min(future)-time.time())) if any(future) else 1
+                self.pipeline_status.setText(f"流水线：失败任务退避中，约 {wait} 秒后继续")
+                QTimer.singleShot(1000,self._start_next_pipeline_job)
+                return
             self.pipeline_running=False
             self.pipeline_status.setText("流水线：全部完成")
             self.pipeline_progress.setValue(100)
@@ -3518,6 +3591,8 @@ class MusicLibraryPage(QWidget):
     def _pipeline_complete_stage(self,job,stage):
         job["stages"][stage]="完成"
         job["updated_at"]=time.time()
+        job["retry_count"]=0
+        job["next_retry_at"]=0
         if not self._pipeline_next_stage(job):
             job["status"]="完成"
         self._save_pipeline_jobs()
@@ -3532,6 +3607,7 @@ class MusicLibraryPage(QWidget):
         gpu_index=self.gpu_selector.currentData() if hasattr(self,"gpu_selector") else -1
         job["gpu_index"]=int(gpu_index) if gpu_index is not None else -1
         self.pipeline_batch_worker=SeparationWorker(job["path"])
+        active_worker=self.pipeline_batch_worker
         self.pipeline_batch_worker.separation_progress.connect(
             lambda v,t:self.pipeline_status.setText(f"流水线：{job['title']} · 六轨 {v}%")
         )
@@ -3541,7 +3617,16 @@ class MusicLibraryPage(QWidget):
         self.pipeline_batch_worker.failed.connect(
             lambda err:self._pipeline_fail(job,"stems",err)
         )
+        self.pipeline_batch_worker.finished.connect(
+            lambda w=active_worker:self._release_pipeline_batch_worker(w)
+        )
         self.pipeline_batch_worker.start()
+
+    def _release_pipeline_batch_worker(self,worker):
+        if self.pipeline_batch_worker is worker:
+            self.pipeline_batch_worker=None
+            if self.pipeline_running and not self.pipeline_paused:
+                QTimer.singleShot(0,self._start_next_pipeline_job)
 
     def _pipeline_stems_done(self,job,stem_dir):
         job["stem_dir"]=stem_dir
@@ -3549,26 +3634,47 @@ class MusicLibraryPage(QWidget):
         con=self._db()
         con.execute("UPDATE tracks SET stems_status='完成' WHERE id=?",(job["track_id"],))
         con.commit(); con.close()
-        self.pipeline_batch_worker=None
         self._pipeline_complete_stage(job,"stems")
 
     def _pipeline_run_sync_stage(self,stage,job):
         try:
-            if stage=="analysis":
-                self._pipeline_stage_analysis(job)
-            elif stage=="chords":
-                self._pipeline_stage_chords(job)
-            elif stage=="score":
-                self._pipeline_stage_score(job)
-            elif stage=="arrangement":
-                self._pipeline_stage_arrangement(job)
-            elif stage=="render":
-                self._pipeline_stage_render(job)
-            elif stage=="library":
-                self._pipeline_stage_library(job)
-            self._pipeline_complete_stage(job,stage)
+            if stage=="render":
+                try:
+                    job["render_soundfont"]=self.main.arrangement.soundfont_edit.text().strip()
+                except Exception:
+                    job["render_soundfont"]=""
+                job["render_output"]=self.pipeline_output.currentText()
+            operations={
+                "analysis":lambda:self._pipeline_stage_analysis(job),
+                "chords":lambda:self._pipeline_stage_chords(job),
+                "score":lambda:self._pipeline_stage_score(job),
+                "arrangement":lambda:self._pipeline_stage_arrangement(job),
+                "render":lambda:self._pipeline_stage_render(job),
+                "library":lambda:self._pipeline_stage_library(job),
+            }
+            operation=operations.get(stage)
+            if operation is None:
+                raise RuntimeError(f"未知流水线阶段：{stage}")
+            self.pipeline_stage_worker=PipelineStageWorker(operation)
+            active_worker=self.pipeline_stage_worker
+            self.pipeline_stage_worker.succeeded.connect(
+                lambda:self._pipeline_complete_stage(job,stage)
+            )
+            self.pipeline_stage_worker.failed.connect(
+                lambda error:self._pipeline_fail(job,stage,error)
+            )
+            self.pipeline_stage_worker.finished.connect(
+                lambda w=active_worker:self._release_pipeline_stage_worker(w)
+            )
+            self.pipeline_stage_worker.start()
         except Exception as e:
             self._pipeline_fail(job,stage,e)
+
+    def _release_pipeline_stage_worker(self,worker):
+        if self.pipeline_stage_worker is worker:
+            self.pipeline_stage_worker=None
+            if self.pipeline_running and not self.pipeline_paused:
+                QTimer.singleShot(0,self._start_next_pipeline_job)
 
     def _pipeline_stage_analysis(self,job):
         import librosa
@@ -3786,12 +3892,7 @@ class MusicLibraryPage(QWidget):
         if not midi or not Path(midi).exists():
             raise RuntimeError("没有编配 MIDI")
 
-        sf_path=""
-        # Reuse selected SoundFont from arrangement page if available.
-        try:
-            sf_path=self.main.arrangement.soundfont_edit.text().strip()
-        except Exception:
-            sf_path=""
+        sf_path=str(job.get("render_soundfont","") or "")
 
         if not sf_path or not Path(sf_path).exists():
             raise RuntimeError("未设置 SoundFont。请先在 AI 改编页面选择 SoundFont。")
@@ -3811,7 +3912,7 @@ class MusicLibraryPage(QWidget):
             raise RuntimeError((p.stderr or p.stdout or "渲染失败")[-1500:])
         job["artifacts"]["final_wav"]=str(wav)
 
-        if self.pipeline_output.currentText()=="WAV + MP3":
+        if job.get("render_output")=="WAV + MP3":
             ffmpeg=self.main._find_ffmpeg()
             if not ffmpeg:
                 raise RuntimeError("需要 MP3，但未找到 FFmpeg")
@@ -3907,9 +4008,9 @@ class MainWindow(QMainWindow):
         pix = QPixmap(asset_path("novria_app_icon_256.png"))
         brand_icon.setPixmap(pix.scaled(48,48,Qt.KeepAspectRatio,Qt.SmoothTransformation))
         brand_text = QVBoxLayout()
-        bt = QLabel("NOVRIA")
+        bt = QLabel(APP_NAME)
         bt.setObjectName("BrandTitle")
-        bs = QLabel("AI Music Studio")
+        bs = QLabel("AI 音乐工作站")
         bs.setObjectName("BrandSub")
         brand_text.addWidget(bt)
         brand_text.addWidget(bs)
@@ -3975,7 +4076,7 @@ class MainWindow(QMainWindow):
         root.addWidget(sidebar)
         root.addWidget(self.stack, 1)
         self.setCentralWidget(central)
-        self.statusBar().showMessage(f"就绪   ·   NOVRIA AI Music Studio v{VERSION}")
+        self.statusBar().showMessage(f"就绪   ·   {APP_NAME} v{VERSION}")
         QTimer.singleShot(300, self.restore_live_session)
         QTimer.singleShot(500, self.refresh_smart_arranger_summary)
 
@@ -4467,7 +4568,7 @@ class MainWindow(QMainWindow):
 <h1>{html.escape(title)}</h1><div class="meta">BPM {bpm} · 原调参考 {html.escape(str(key))} · 演出调 {html.escape(str(target))} · 升降 {semis:+d} 半音 · 4/4</div>
 <div class="guide">{html.escape(guides.get(instrument,guides['lead']))}</div>
 <table><tr><th>小节</th><th>时间</th><th>段落</th><th>和弦</th></tr>{''.join(trs)}</table>
-<p><small>NOVRIA AI Music Studio · AI 分析生成的排练/演奏参考谱，建议乐手演出前人工校对。</small></p></body></html>'''
+<p><small>橘味儿音乐 · AI 分析生成的排练/演奏参考谱，建议乐手演出前人工校对。</small></p></body></html>'''
 
     def export_lead_sheet(self):
         self.export_instrument_score("lead")
@@ -5433,10 +5534,10 @@ class MainWindow(QMainWindow):
             meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
             meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
 
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name=f'NOVRIA Variant {variant} Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name=f'NOVRIA Variant {variant} Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name=f'NOVRIA Variant {variant} Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name=f'NOVRIA Variant {variant} Drums',time=0)); mid.tracks.append(drums)
+            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Guitar',time=0)); mid.tracks.append(guitar)
+            bass=MidiTrack(); bass.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Bass',time=0)); mid.tracks.append(bass)
+            piano=MidiTrack(); piano.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Piano',time=0)); mid.tracks.append(piano)
+            drums=MidiTrack(); drums.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Drums',time=0)); mid.tracks.append(drums)
 
             section_map=self._build_section_map()
             semis=int(v.get("transpose",self.arrangement.transpose.value()))
@@ -5495,10 +5596,10 @@ class MainWindow(QMainWindow):
             meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
             meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
 
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='NOVRIA Musical Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='NOVRIA Musical Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='NOVRIA Musical Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='NOVRIA Musical Drums',time=0)); mid.tracks.append(drums)
+            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='Juweier Musical Guitar',time=0)); mid.tracks.append(guitar)
+            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='Juweier Musical Bass',time=0)); mid.tracks.append(bass)
+            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='Juweier Musical Piano',time=0)); mid.tracks.append(piano)
+            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='Juweier Musical Drums',time=0)); mid.tracks.append(drums)
 
             section_map=self._build_section_map()
             semis=self.arrangement.transpose.value()
@@ -5565,10 +5666,10 @@ class MainWindow(QMainWindow):
             meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
             meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
 
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='NOVRIA Smart Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='NOVRIA Smart Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='NOVRIA Smart Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='NOVRIA Smart Drums',time=0)); mid.tracks.append(drums)
+            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='Juweier Smart Guitar',time=0)); mid.tracks.append(guitar)
+            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='Juweier Smart Bass',time=0)); mid.tracks.append(bass)
+            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='Juweier Smart Piano',time=0)); mid.tracks.append(piano)
+            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='Juweier Smart Drums',time=0)); mid.tracks.append(drums)
 
             semis=self.arrangement.transpose.value()
             prev_section=None
@@ -5633,10 +5734,10 @@ class MainWindow(QMainWindow):
                 third=3 if m.group(2)=="m" else 4
                 return [base,base+third,base+7]
 
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='NOVRIA Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='NOVRIA Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='NOVRIA Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='NOVRIA Drums',time=0)); mid.tracks.append(drums)
+            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='Juweier Guitar',time=0)); mid.tracks.append(guitar)
+            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='Juweier Bass',time=0)); mid.tracks.append(bass)
+            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='Juweier Piano',time=0)); mid.tracks.append(piano)
+            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='Juweier Drums',time=0)); mid.tracks.append(drums)
 
             for row in self.chord_timeline:
                 chord=(row.get("chords") or ["C"])[0]
@@ -5840,7 +5941,7 @@ class MainWindow(QMainWindow):
         song=Path(self.song_file).stem if self.song_file else "song"
         p,_=QFileDialog.getSaveFileName(
             self, "导出 MusicXML",
-            str(EXPORTS_DIR/f"{song}_NOVRIA.musicxml"),
+            str(EXPORTS_DIR/f"{song}_Juweier.musicxml"),
             "MusicXML (*.musicxml *.xml)"
         )
         if not p:
@@ -5871,7 +5972,7 @@ class MainWindow(QMainWindow):
 <!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
 <score-partwise version="4.0">
 <work><work-title>{html.escape(song)}</work-title></work>
-<part-list><score-part id="P1"><part-name>NOVRIA Lead Sheet</part-name></score-part></part-list>
+<part-list><score-part id="P1"><part-name>Juweier Lead Sheet</part-name></score-part></part-list>
 <part id="P1">{''.join(parts)}</part>
 </score-partwise>"""
         Path(p).write_text(xml,encoding="utf-8")
@@ -6077,7 +6178,7 @@ class MainWindow(QMainWindow):
             }
         }
         default = PROJECTS_DIR / (Path(self.song_file).stem + ".novria.json")
-        p, _ = QFileDialog.getSaveFileName(self, "保存工程", str(default), "NOVRIA工程 (*.json)")
+        p, _ = QFileDialog.getSaveFileName(self, "保存工程", str(default), "橘味儿音乐工程 (*.json)")
         if not p:
             return
         Path(p).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -6182,6 +6283,38 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event: QCloseEvent):
+        library=getattr(self,"music_library",None)
+        workers=[getattr(self,"worker",None)]
+        if library is not None:
+            workers.extend([
+                getattr(library,"batch_worker",None),
+                getattr(library,"pipeline_batch_worker",None),
+            ])
+            stage_worker=getattr(library,"pipeline_stage_worker",None)
+            if stage_worker and stage_worker.isRunning():
+                QMessageBox.information(
+                    self,"正在安全完成任务",
+                    "当前分析/编配阶段仍在运行。为防止工程文件损坏，请等待本阶段完成后再关闭软件。"
+                )
+                event.ignore()
+                return
+        for worker in workers:
+            if worker and worker.isRunning():
+                try:
+                    if hasattr(worker,"stop"):
+                        worker.stop()
+                    else:
+                        worker.requestInterruption()
+                    worker.wait(3000)
+                except Exception:
+                    pass
+                if worker.isRunning():
+                    QMessageBox.information(
+                        self,"正在停止 AI 任务",
+                        "六轨任务仍在释放模型资源，请稍后再关闭软件。"
+                    )
+                    event.ignore()
+                    return
         self.engine.close()
         event.accept()
 

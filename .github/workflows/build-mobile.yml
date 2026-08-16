@@ -1,4 +1,4 @@
-name: Build Dongba Music Mobile Test
+name: Build Juweier Music Android and iOS
 
 on:
   workflow_dispatch:
@@ -29,26 +29,11 @@ jobs:
       - name: Create Flutter platform project
         shell: bash
         run: |
-          flutter create --org com.db0888 --project-name dongba_music --platforms=android,ios mobile_build
+          flutter create --org com.db0888 --project-name juweier_music --platforms=android,ios mobile_build
           rm -rf mobile_build/lib
           cp -r mobile/lib mobile_build/lib
           cp mobile/pubspec.yaml mobile_build/pubspec.yaml
-          mkdir -p mobile_build/assets
-          python3 - <<'PY'
-          import struct,zlib
-          w=h=256
-          raw=bytearray()
-          for y in range(h):
-              raw.append(0)
-              for x in range(w):
-                  dx=x-128; dy=y-128; r=(dx*dx+dy*dy)**0.5
-                  c=(215,166,58) if r<100 else (7,16,29)
-                  raw.extend(c)
-          def chunk(t,d):
-              return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
-          png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw),9))+chunk(b'IEND',b'')
-          open('mobile_build/assets/dongba_icon.png','wb').write(png)
-          PY
+          cp -r mobile/assets mobile_build/assets
           cd mobile_build
           flutter pub get
           dart run flutter_launcher_icons
@@ -56,13 +41,11 @@ jobs:
           from pathlib import Path
           manifest=Path('android/app/src/main/AndroidManifest.xml')
           s=manifest.read_text()
-          s=s.replace('android:label="dongba_music"','android:label="东巴音乐"')
+          if '<uses-permission android:name="android.permission.INTERNET" />' not in s:
+              s=s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">', '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />')
+          s=s.replace('android:label="juweier_music"','android:label="橘味儿音乐"')
+          s=s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
           manifest.write_text(s)
-          gradle=Path('android/app/build.gradle.kts')
-          g=gradle.read_text()
-          g=g.replace('compileSdk = flutter.compileSdkVersion','compileSdk = 36')
-          g=g.replace('targetSdk = flutter.targetSdkVersion','targetSdk = 36')
-          gradle.write_text(g)
           PY
       - name: Build release APK
         working-directory: mobile_build
@@ -70,7 +53,7 @@ jobs:
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Dongba-Music-Mobile-Test-Android-APK
+          name: Juweier-Music-v2.1.7-Android-APK
           path: mobile_build/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 30
@@ -89,30 +72,19 @@ jobs:
       - name: Create Flutter platform project
         shell: bash
         run: |
-          flutter create --org com.db0888 --project-name dongba_music --platforms=android,ios mobile_build
+          flutter create --org com.db0888 --project-name juweier_music --platforms=android,ios mobile_build
           rm -rf mobile_build/lib
           cp -r mobile/lib mobile_build/lib
           cp mobile/pubspec.yaml mobile_build/pubspec.yaml
-          mkdir -p mobile_build/assets
-          python3 - <<'PY'
-          import struct,zlib
-          w=h=256
-          raw=bytearray()
-          for y in range(h):
-              raw.append(0)
-              for x in range(w):
-                  dx=x-128; dy=y-128; r=(dx*dx+dy*dy)**0.5
-                  c=(215,166,58) if r<100 else (7,16,29)
-                  raw.extend(c)
-          def chunk(t,d):
-              return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
-          png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw),9))+chunk(b'IEND',b'')
-          open('mobile_build/assets/dongba_icon.png','wb').write(png)
-          PY
+          cp -r mobile/assets mobile_build/assets
           cd mobile_build
           flutter pub get
           dart run flutter_launcher_icons
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 东巴音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
       - name: Build iOS without signing
         working-directory: mobile_build
         run: flutter build ios --release --no-codesign
@@ -120,12 +92,12 @@ jobs:
         shell: bash
         run: |
           cd mobile_build/build/ios/iphoneos
-          zip -0qry ../../../../Dongba-Music-Mobile-Test-iOS-Unsigned.zip Runner.app
+          zip -0qry ../../../../Juweier-Music-v2.1.7-iOS-Unsigned.zip Runner.app
       - name: Upload iOS unsigned package
         uses: actions/upload-artifact@v4
         with:
-          name: Dongba-Music-Mobile-Test-iOS-Unsigned
-          path: Dongba-Music-Mobile-Test-iOS-Unsigned.zip
+          name: Juweier-Music-v2.1.7-iOS-Unsigned
+          path: Juweier-Music-v2.1.7-iOS-Unsigned.zip
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

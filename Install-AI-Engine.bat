@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title NOVRIA AI Music Studio - AI Engine Installer
+title 橘味儿音乐 - AI 引擎安装程序
 cd /d "%~dp0"
 
 echo ============================================================
-echo NOVRIA AI Music Studio v0.2.0 AI 引擎安装
+echo 橘味儿音乐 v2.1.7 AI 引擎安装
 echo ============================================================
 
 where py >nul 2>nul
@@ -52,7 +52,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo 安装完成。
-echo 现在可以双击 Run-NOVRIA.bat 启动。
+echo 现在可以双击 Run-Juweier-Music.bat 启动。
 echo 第一次执行六轨分离时会自动下载 htdemucs_6s 模型。
 echo ============================================================
 pause

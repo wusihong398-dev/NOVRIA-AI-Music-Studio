@@ -1,9 +1,9 @@
 @echo off
 chcp 65001 >nul
-title NOVRIA GPU Check
+title 橘味儿音乐 GPU 检测
 cd /d "%~dp0"
 echo ============================================================
-echo NOVRIA AI Music Studio - NVIDIA GPU / CUDA 检测
+echo 橘味儿音乐 - NVIDIA GPU / CUDA 检测
 echo ============================================================
 echo.
 where nvidia-smi >nul 2>nul
@@ -19,7 +19,7 @@ echo.
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -c "import torch; print('PyTorch:',torch.__version__); print('CUDA available:',torch.cuda.is_available()); print('GPU:',torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU mode')"
 ) else (
-  echo 尚未安装 NOVRIA AI 引擎，请先运行 Install-AI-Engine.bat
+  echo 尚未安装橘味儿音乐 AI 引擎，请先运行 Install-AI-Engine.bat
 )
 echo.
 pause
