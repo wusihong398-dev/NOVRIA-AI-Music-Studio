@@ -28,7 +28,7 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
 
-      - name: Verify v2.1.5 Stability Fix EXE
+      - name: Verify v2.1.6 Live Transpose EXE
         shell: powershell
         run: |
           $root = "dist\NOVRIA-AI-Music-Studio"
@@ -38,9 +38,10 @@ jobs:
           if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
           if (!(Test-Path $worker)) { throw "Worker EXE not found: $worker" }
           if (!(Test-Path $ffmpeg)) { throw "Bundled FFmpeg not found: $ffmpeg" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern 'VERSION = "2.1.5"' -Quiet)) { throw "v2.1.5 launcher not found" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern 'PYTHONIOENCODING' -Quiet)) { throw "UTF-8 worker isolation patch missing" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern 'subprocess.STDOUT' -Quiet)) { throw "Worker deadlock protection missing" }
+          if (!(Select-String -Path "app\launcher.py" -Pattern 'VERSION = "2.1.6"' -Quiet)) { throw "v2.1.6 launcher not found" }
+          if (!(Select-String -Path "app\launcher.py" -Pattern '▲ 升半音' -Quiet)) { throw "Live transpose up button missing" }
+          if (!(Select-String -Path "app\launcher.py" -Pattern '▼ 降半音' -Quiet)) { throw "Live transpose down button missing" }
+          if (!(Select-String -Path "app\launcher.py" -Pattern 'recommended_capo' -Quiet)) { throw "Capo sync patch missing" }
           if (!(Select-String -Path "NOVRIA.spec" -Pattern "NOVRIA-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
           & $ffmpeg -version | Select-Object -First 1
           Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
@@ -48,12 +49,12 @@ jobs:
       - name: Package Windows build
         shell: powershell
         run: |
-          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "NOVRIA_AI_Music_Studio_v2.1.5_Stability_Fix_Windows_x64.zip" -Force
+          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "Dongba_Music_v2.1.6_Live_Transpose_Windows_x64.zip" -Force
 
-      - name: Upload v2.1.5 Stability Fix artifact
+      - name: Upload v2.1.6 Live Transpose artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NOVRIA-AI-Music-Studio-v2.1.5-Stability-Fix-Windows-x64
-          path: NOVRIA_AI_Music_Studio_v2.1.5_Stability_Fix_Windows_x64.zip
+          name: Dongba-Music-v2.1.6-Live-Transpose-Windows-x64
+          path: Dongba_Music_v2.1.6_Live_Transpose_Windows_x64.zip
           if-no-files-found: error
           retention-days: 30
