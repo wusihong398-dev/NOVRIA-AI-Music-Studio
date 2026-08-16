@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (
 
 from app import main as m
 
-VERSION = "2.1.6"
-DISPLAY_NAME = "东巴音乐"
+VERSION = "2.1.7"
+DISPLAY_NAME = "橘味儿音乐"
 
 
 def resource_root():
@@ -37,7 +37,7 @@ def install_crash_logging():
     log_dir.mkdir(parents=True, exist_ok=True)
     crash_path = log_dir / "crash.log"
     crash_fp = open(crash_path, "a", encoding="utf-8", buffering=1)
-    crash_fp.write("\n===== Dongba Music startup v%s =====\n" % VERSION)
+    crash_fp.write("\n===== Juweier Music startup v%s =====\n" % VERSION)
     try:
         faulthandler.enable(crash_fp, all_threads=True)
     except Exception:
@@ -84,7 +84,9 @@ class ProcessSeparationWorker(QThread):
     def _command(self):
         base = runtime_base()
         if getattr(sys, "frozen", False):
-            worker = base / "NOVRIA-Separation-Worker.exe"
+            worker = base / "Juweier-Separation-Worker.exe"
+            if not worker.exists():
+                worker = base / "NOVRIA-Separation-Worker.exe"
             if not worker.exists():
                 raise RuntimeError(f"未找到独立六轨 Worker：{worker}")
             cmd = [str(worker)]
@@ -92,6 +94,20 @@ class ProcessSeparationWorker(QThread):
             cmd = [sys.executable, "-m", "app.separation_worker_process"]
         cmd += [self.input_file, "--output", str(m.STEMS_DIR), "--device", "auto"]
         return cmd
+
+    def stop(self):
+        self.requestInterruption()
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def run(self):
         base = runtime_base()
@@ -183,30 +199,8 @@ def install_runtime_patches():
     m.MainWindow._find_ffmpeg = _find_ffmpeg
     m.SeparationWorker = ProcessSeparationWorker
 
-    original_scan = m.MusicLibraryPage.scan_imports
-
-    def scan_imports_without_work_duplicates(self):
-        original_scan(self)
-        try:
-            con = self._db()
-            rows = con.execute("SELECT id,source_path,working_path,title FROM tracks").fetchall()
-            removed = 0
-            for row in rows:
-                src = str(row["source_path"] or "").replace("/", "\\").lower()
-                work = str(row["working_path"] or "").replace("/", "\\").lower()
-                title = str(row["title"] or "")
-                if src == work and "\\imports\\working\\" in src and title.lower().endswith("_work"):
-                    con.execute("DELETE FROM tracks WHERE id=?", (row["id"],))
-                    removed += 1
-            if removed:
-                con.commit()
-            con.close()
-            if removed:
-                self.refresh_library()
-        except Exception:
-            pass
-
-    m.MusicLibraryPage.scan_imports = scan_imports_without_work_duplicates
+    # v2.1.7 implements source/work-file de-duplication in MusicLibraryPage
+    # directly, so launcher monkey-patching is no longer needed.
 
 
 def write_gpu_diagnostic(log_fp):

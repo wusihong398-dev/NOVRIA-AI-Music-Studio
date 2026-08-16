@@ -30,7 +30,7 @@ analysis = Analysis(
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz, analysis.scripts, [], exclude_binaries=True,
-    name='NOVRIA-AI-Music-Studio', debug=False, bootloader_ignore_signals=False,
+    name='Juweier-Music', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=False, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
 )
@@ -46,7 +46,7 @@ worker_analysis = Analysis(
 worker_pyz = PYZ(worker_analysis.pure)
 worker_exe = EXE(
     worker_pyz, worker_analysis.scripts, [], exclude_binaries=True,
-    name='NOVRIA-Separation-Worker', debug=False, bootloader_ignore_signals=False,
+    name='Juweier-Separation-Worker', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
 )
@@ -56,5 +56,5 @@ coll = COLLECT(
     analysis.binaries, analysis.datas,
     worker_analysis.binaries, worker_analysis.datas,
     strip=False, upx=False, upx_exclude=[],
-    name='NOVRIA-AI-Music-Studio',
+    name='Juweier-Music',
 )

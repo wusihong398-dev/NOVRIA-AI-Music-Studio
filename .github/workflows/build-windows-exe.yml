@@ -1,9 +1,9 @@
-name: Build NOVRIA Windows EXE
+name: Build Juweier Music Windows EXE
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "agent/build-juweier-v2.1.7-windows" ]
     paths:
       - "app/**"
       - "assets/**"
@@ -34,18 +34,18 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Build CUDA EXE
+      - name: Build CPU-compatible EXE
         shell: powershell
         run: |
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
 
-      - name: Verify v2.1.6 Live Transpose EXE
+      - name: Verify v2.1.7 stable pipeline EXE
         shell: powershell
         run: |
-          $root = "dist\NOVRIA-AI-Music-Studio"
-          $exe = "$root\NOVRIA-AI-Music-Studio.exe"
-          $worker = "$root\NOVRIA-Separation-Worker.exe"
+          $root = "dist\Juweier-Music"
+          $exe = "$root\Juweier-Music.exe"
+          $worker = "$root\Juweier-Separation-Worker.exe"
           $ffmpeg = "$root\tools\ffmpeg\ffmpeg.exe"
           if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
           if (!(Test-Path $worker)) { throw "Worker EXE not found: $worker" }
@@ -53,12 +53,13 @@ jobs:
 
           # Keep verification ASCII-only so Windows PowerShell code pages cannot corrupt Chinese UI text.
           $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
-          if ($launcher -notmatch 'VERSION\s*=\s*"2\.1\.6"') { throw "v2.1.6 launcher not found" }
+          if ($launcher -notmatch 'VERSION\s*=\s*"2\.1\.7"') { throw "v2.1.7 launcher not found" }
           if ($launcher -notmatch 'def install_live_transpose_controls') { throw "Live transpose controls patch missing" }
           if ($launcher -notmatch 'def _recommended_capo') { throw "Capo sync patch missing" }
           if ($launcher -notmatch 'change\(-1\)') { throw "Transpose-down action missing" }
           if ($launcher -notmatch 'change\(1\)') { throw "Transpose-up action missing" }
-          if (!(Select-String -Path "NOVRIA.spec" -Pattern "NOVRIA-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
+          if (!(Select-String -Path "NOVRIA.spec" -Pattern "Juweier-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
+          python -m unittest discover -s tests -v
 
           & $ffmpeg -version | Select-Object -First 1
           Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
@@ -66,12 +67,12 @@ jobs:
       - name: Package Windows build
         shell: powershell
         run: |
-          Compress-Archive -Path "dist\NOVRIA-AI-Music-Studio\*" -DestinationPath "Dongba_Music_v2.1.6_Live_Transpose_Windows_x64.zip" -Force
+          Compress-Archive -Path "dist\Juweier-Music\*" -DestinationPath "Juweier_Music_v2.1.7_Windows_x64.zip" -Force
 
-      - name: Upload v2.1.6 Live Transpose artifact
+      - name: Upload v2.1.7 Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Dongba-Music-v2.1.6-Live-Transpose-Windows-x64
-          path: Dongba_Music_v2.1.6_Live_Transpose_Windows_x64.zip
+          name: Juweier-Music-v2.1.7-Windows-x64
+          path: Juweier_Music_v2.1.7_Windows_x64.zip
           if-no-files-found: error
           retention-days: 30

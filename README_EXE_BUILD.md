@@ -1,4 +1,4 @@
-# NOVRIA AI Music Studio v2.1.0 — Windows EXE 发布工程
+# 橘味儿音乐 v2.1.7 — Windows EXE 发布工程
 
 这个版本已经针对“冻结成 EXE”修正 Demucs 调用方式，不再使用 `sys.executable -m demucs`。
 
@@ -7,12 +7,12 @@
 1. 新建一个 GitHub 仓库。
 2. 把这个压缩包里的全部文件上传到仓库根目录，包括隐藏目录 `.github`。
 3. 打开仓库的 **Actions**。
-4. 选择 **Build NOVRIA Windows EXE**。
+4. 选择 **Build Juweier Music Windows EXE**。
 5. 点击 **Run workflow**。
 6. 构建完成后，在该次 Actions 页面底部下载 Artifact：
-   `NOVRIA-AI-Music-Studio-v2.1.0-Windows-x64`
+   `Juweier-Music-v2.1.7-Windows-x64`
 7. 解压 Artifact 后得到便携版 ZIP，其中包含：
-   `NOVRIA-AI-Music-Studio.exe`
+   `Juweier-Music.exe`
 
 用户电脑不需要安装 Python。
 
@@ -25,7 +25,7 @@
 ## 安装程序
 
 工程里同时包含 `installer/NOVRIA.iss`。Windows 构建完成后可以用 Inno Setup 6 编译为标准安装程序：
-`NOVRIA_AI_Music_Studio_v2.1.0_Setup_x64.exe`
+`Juweier_Music_v2.1.7_Setup_x64.exe`
 
 ## 注意
 
