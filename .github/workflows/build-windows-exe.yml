@@ -4,9 +4,18 @@ on:
   workflow_dispatch:
   push:
     branches: [ "main" ]
-    paths-ignore:
-      - "mobile/**"
-      - ".github/workflows/build-mobile.yml"
+    paths:
+      - "app/**"
+      - "assets/**"
+      - "config/**"
+      - "build_tools/**"
+      - "NOVRIA.spec"
+      - "requirements.txt"
+      - "requirements-build.txt"
+      - "Check-GPU.bat"
+      - "Install-AI-Engine.bat"
+      - "Open-Model-Folder.bat"
+      - ".github/workflows/build-windows-exe.yml"
 
 permissions:
   contents: read
@@ -41,11 +50,16 @@ jobs:
           if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
           if (!(Test-Path $worker)) { throw "Worker EXE not found: $worker" }
           if (!(Test-Path $ffmpeg)) { throw "Bundled FFmpeg not found: $ffmpeg" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern 'VERSION = "2.1.6"' -Quiet)) { throw "v2.1.6 launcher not found" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern '▲ 升半音' -Quiet)) { throw "Live transpose up button missing" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern '▼ 降半音' -Quiet)) { throw "Live transpose down button missing" }
-          if (!(Select-String -Path "app\launcher.py" -Pattern 'recommended_capo' -Quiet)) { throw "Capo sync patch missing" }
+
+          # Keep verification ASCII-only so Windows PowerShell code pages cannot corrupt Chinese UI text.
+          $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
+          if ($launcher -notmatch 'VERSION\s*=\s*"2\.1\.6"') { throw "v2.1.6 launcher not found" }
+          if ($launcher -notmatch 'def install_live_transpose_controls') { throw "Live transpose controls patch missing" }
+          if ($launcher -notmatch 'def _recommended_capo') { throw "Capo sync patch missing" }
+          if ($launcher -notmatch 'change\(-1\)') { throw "Transpose-down action missing" }
+          if ($launcher -notmatch 'change\(1\)') { throw "Transpose-up action missing" }
           if (!(Select-String -Path "NOVRIA.spec" -Pattern "NOVRIA-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
+
           & $ffmpeg -version | Select-Object -First 1
           Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
 
