@@ -606,6 +606,7 @@ def _analyze(path: Path) -> tuple[dict, list[dict]]:
         "bpm": round(bpm, 1), "key": key,
         "duration": float(librosa.get_duration(y=y, sr=sample_rate)),
         "melody_notes": melody_notes,
+        "lyrics": load_synced_lyrics(path, float(librosa.get_duration(y=y, sr=sample_rate))),
     }, rows
 
 
