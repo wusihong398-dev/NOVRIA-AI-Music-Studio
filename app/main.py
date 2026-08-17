@@ -1516,6 +1516,82 @@ class ArrangementScorePage(QWidget):
 
 
 
+class DesktopScoreCanvas(QWidget):
+    def __init__(self,main):
+        super().__init__()
+        self.main=main
+        self.mode="五线谱"
+        self.position=0.0
+        self.setMinimumHeight(230)
+
+    def set_mode(self,mode):
+        self.mode=str(mode)
+        self.update()
+
+    def set_position(self,seconds):
+        self.position=max(0,float(seconds))
+        self.update()
+
+    def _midi(self,note):
+        if "midi" in note:
+            return int(note.get("midi",60))
+        match=re.match(r"^([A-G])([#b]?)(-?\d+)$",str(note.get("note","C4")))
+        if not match:
+            return 60
+        pitch={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}[match.group(1)]
+        pitch += 1 if match.group(2)=="#" else -1 if match.group(2)=="b" else 0
+        return 12*(int(match.group(3))+1)+pitch
+
+    def paintEvent(self,event):
+        painter=QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(),QColor("#0d1018"))
+        width=max(100,self.width())
+        top=40
+        gap=22
+        tablature=self.mode=="六线谱"
+        line_count=6 if tablature else 5
+        painter.setPen(QPen(QColor("#BDAAB5"),1))
+        for index in range(line_count):
+            y=top+index*gap
+            painter.drawLine(24,y,width-24,y)
+        painter.setPen(QPen(QColor("#FF7A18"),2))
+        painter.drawLine(34,top-18,34,top+(line_count-1)*gap+18)
+
+        notes=[
+            note for note in getattr(self.main,"melody_reference",[])
+            if self.position-1 <= float(note.get("start",0)) <= self.position+15
+        ][:32]
+        tuning=[64,59,55,50,45,40]
+        for note in notes:
+            start=float(note.get("start",0))
+            x=52+(start-(self.position-1))/16*max(20,width-92)
+            midi=self._midi(note)
+            if tablature:
+                choices=[(midi-open_note,index) for index,open_note in enumerate(tuning) if 0<=midi-open_note<=24]
+                fret,string=min(choices,default=(0,0),key=lambda item:item[0])
+                painter.setPen(QColor("#FF9A2A"))
+                painter.drawText(QRectF(x-11,top+string*gap-11,24,22),Qt.AlignCenter,str(fret))
+            else:
+                y=max(18,min(top+4*gap+18,top+4*gap-(midi-60)*gap/3.5))
+                painter.setBrush(QColor("#FF7A18")); painter.setPen(Qt.NoPen)
+                painter.drawEllipse(QPointF(x,y),7,5)
+                painter.setPen(QPen(QColor("#FF7A18"),2)); painter.drawLine(QPointF(x+6,y),QPointF(x+6,y-30))
+
+        lyric=""
+        for row in getattr(self.main,"lyric_reference",[]):
+            if self.position>=float(row.get("start",0)):
+                lyric=str(row.get("text",""))
+            else:
+                break
+        painter.setPen(QColor("#FFFFFF"))
+        font=painter.font(); font.setPointSize(15); font.setBold(True); painter.setFont(font)
+        painter.drawText(QRectF(24,self.height()-55,width-48,42),Qt.AlignCenter,lyric or "歌词将随播放位置同步显示")
+        if not notes:
+            painter.setPen(QColor("#A995A6"))
+            painter.drawText(QRectF(24,top+line_count*gap+5,width-48,30),Qt.AlignCenter,"请先运行乐谱分析，自动生成主旋律五线谱和六线谱")
+
+
 class ScorePerformancePage(QWidget):
     def __init__(self, main):
         super().__init__()
