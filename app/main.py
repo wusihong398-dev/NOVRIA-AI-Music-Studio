@@ -345,16 +345,29 @@ class MultiStemEngine:
         solos = [k for k, v in self.solo.items() if v]
         active = set(solos) if solos else {k for k in self.files if not self.mute[k]}
 
+        source_frames = max(1, int(math.ceil(frames * self.speed)))
         mix = np.zeros((frames, self.channels), dtype=np.float32)
         valid_frames = frames
 
         with self._io_lock:
             for key, f in self.files.items():
-                data = f.read(frames, dtype="float32", always_2d=True)
+                data = f.read(source_frames, dtype="float32", always_2d=True)
                 n = len(data)
-                valid_frames = min(valid_frames, n)
-                if key in active and n:
-                    mix[:n] += data * float(self.volume[key])
+                output_count = min(frames, max(0, int(n / self.speed)))
+                valid_frames = min(valid_frames, output_count)
+                if key in active and n and output_count:
+                    if n == output_count:
+                        rendered = data
+                    else:
+                        old_positions = np.arange(n, dtype=np.float32)
+                        new_positions = np.linspace(0, max(0, n - 1), output_count, dtype=np.float32)
+                        rendered = np.column_stack([
+                            np.interp(new_positions, old_positions, data[:, channel])
+                            for channel in range(self.channels)
+                        ]).astype(np.float32)
+                    mix[:output_count] += rendered * float(self.volume[key])
+            if self.files:
+                self.frames_played = min(int(f.tell()) for f in self.files.values())
 
         if valid_frames <= 0:
             outdata.fill(0)
@@ -367,8 +380,6 @@ class MultiStemEngine:
             mix /= peak
 
         outdata[:] = mix
-        self.frames_played += valid_frames
-
         if valid_frames < frames:
             outdata[valid_frames:] = 0
             self.playing = False
@@ -436,6 +447,9 @@ class MultiStemEngine:
                 f.seek(pos)
             self.frames_played = pos
 
+    def set_speed(self, value: float):
+        self.speed = max(0.5, min(1.5, float(value)))
+
     def position_seconds(self):
         return self.frames_played / self.sample_rate if self.sample_rate else 0
 
@@ -487,7 +501,7 @@ class StudioPage(QWidget):
         self.main = main
         layout = QVBoxLayout(self)
 
-        title = QLabel("AI 七轨兼容分离 / 多轨工作台")
+        title = QLabel("AI 六轨分离 + 电吉他二次分离 / 多轨工作台")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
@@ -495,7 +509,7 @@ class StudioPage(QWidget):
         self.file_label = QLabel("尚未导入歌曲")
         btn_import = QPushButton(QIcon(icon_path("import")), "导入歌曲")
         btn_import.clicked.connect(main.import_song)
-        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 七轨兼容分离")
+        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 六轨分离 + 电吉他二次分离")
         apply_button_accent(self.btn_split, "primary")
         self.btn_split.clicked.connect(main.start_separation)
         file_row.addWidget(self.file_label, 1)
@@ -562,7 +576,7 @@ class StudioPage(QWidget):
         model_l.addWidget(self.model_progress)
         layout.addWidget(model_box)
 
-        split_box = QGroupBox("七轨兼容分离进度")
+        split_box = QGroupBox("六轨基础分离与电吉他二次识别进度")
         split_l = QVBoxLayout(split_box)
         self.split_status = QLabel("等待开始")
         self.split_progress = QProgressBar()
@@ -1071,7 +1085,8 @@ class LiveProPage(QWidget):
         preset = QGroupBox("演出身份")
         pg = QGridLayout(preset)
         modes = [
-            ("🎸 吉他弹唱","guitar"),("🎹 钢琴弹唱","piano"),
+            ("🎸 木吉他弹唱","guitar"),("🎸 电吉他手","electric_guitar"),
+            ("🎹 钢琴弹唱","piano"),
             ("🥁 鼓手","drums"),("🎸 贝斯手","bass"),
             ("🎤 KTV/纯伴奏","vocals"),("🎼 全部恢复",None)
         ]
