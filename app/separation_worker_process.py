@@ -54,7 +54,7 @@ def _ensure_model(torch_module) -> Path:
     part = target.with_suffix(target.suffix + ".part")
     part.unlink(missing_ok=True)
     emit("model_progress", value=0, text="首次使用：正在连接 AI 模型服务器...")
-    request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Juweier-Music/2.1.7"})
+    request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Juweier-Music/3.0.0"})
     with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
         total = int(response.headers.get("Content-Length") or 0)
         downloaded = 0
