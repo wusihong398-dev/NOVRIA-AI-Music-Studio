@@ -1204,10 +1204,23 @@ class ScorePainter extends CustomPainter {
       text.layout();
       text.paint(canvas, Offset((size.width - text.width) / 2, 142));
     }
+    var currentLyric = '';
+    for (final row in lyrics) {
+      if (((row['start'] as num?)?.toDouble() ?? 0) <= positionSeconds) {
+        currentLyric = '${row['text'] ?? ''}';
+      } else {
+        break;
+      }
+    }
+    if (currentLyric.isNotEmpty) {
+      text.text = TextSpan(text: currentLyric, style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700));
+      text.layout(maxWidth: size.width - 28);
+      text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 4));
+    }
   }
 
   @override
-  bool shouldRepaint(covariant ScorePainter oldDelegate) => oldDelegate.notes != notes || oldDelegate.tablature != tablature || oldDelegate.positionSeconds != positionSeconds;
+  bool shouldRepaint(covariant ScorePainter oldDelegate) => oldDelegate.notes != notes || oldDelegate.lyrics != lyrics || oldDelegate.tablature != tablature || oldDelegate.positionSeconds != positionSeconds;
 }
 
 class CommunityPage extends StatefulWidget {
