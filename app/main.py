@@ -2346,12 +2346,18 @@ class UniversalImportPage(QWidget):
         return h.hexdigest()
 
     def _working_dir(self):
-        d=BASE_DIR/"imports"/"working"
+        if hasattr(self.main,"music_library"):
+            d=self.main.music_library.library_paths["temp"]/"working"
+        else:
+            d=BASE_DIR/"imports"/"working"
         d.mkdir(parents=True,exist_ok=True)
         return d
 
     def _original_dir(self):
-        d=BASE_DIR/"imports"/"originals"
+        if hasattr(self.main,"music_library"):
+            d=self.main.music_library.library_paths["originals"]/"本地导入"
+        else:
+            d=BASE_DIR/"imports"/"originals"
         d.mkdir(parents=True,exist_ok=True)
         return d
 
@@ -2505,12 +2511,16 @@ class UniversalImportPage(QWidget):
             )
             return
         try:
-            downloads=BASE_DIR/"imports"/"downloads"
+            downloads=(
+                self.main.music_library.library_paths["temp"]/"链接导入"
+                if hasattr(self.main,"music_library")
+                else BASE_DIR/"imports"/"downloads"
+            )
             downloads.mkdir(parents=True,exist_ok=True)
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.0.0"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.0"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2523,6 +2533,8 @@ class UniversalImportPage(QWidget):
                         self.link_table.setItem(self.link_table.currentRow() if self.link_table.currentRow()>=0 else 0,2,QTableWidgetItem(f"下载 {pct}%"))
                         QApplication.processEvents()
             self.add_local_files([str(dest)])
+            if hasattr(self.main,"music_library"):
+                self.main.music_library.scan_imports()
             QMessageBox.information(self,"下载完成",f"已下载并加入本地导入队列：\n{dest}")
         except Exception as e:
             QMessageBox.critical(self,"链接下载失败",str(e))
@@ -2590,6 +2602,9 @@ class MusicLibraryPage(QWidget):
         self.library_paths = ensure_library_layout(default_library_root())
         self.db_path = self.library_paths["database"]/"juweier_music_library.sqlite3"
         self.cover_dir = self.library_paths["covers"]
+        self.scan_roots_file = self.library_paths["database"]/"scan_roots.json"
+        self.scan_roots = self._load_scan_roots()
+        self.link_worker = None
         self.batch_queue = []
         self.batch_index = -1
         self.batch_worker = None
@@ -2621,22 +2636,31 @@ class MusicLibraryPage(QWidget):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        hint=QLabel(f"歌曲目录：{self.library_paths['originals']}。按歌手、榜单和歌曲检索，并保存 BPM、调性、封面、音质与七轨状态。")
+        hint=QLabel(
+            f"主歌曲目录：{self.library_paths['originals']}。递归读取 MP3/FLAC 并按 G 盘歌手文件夹显示；"
+            "基础模型保持六轨，吉他轨完成后再二次识别木吉他与电吉他。"
+        )
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         top=QHBoxLayout()
-        scan=QPushButton("扫描 G 盘歌曲库")
+        scan=QPushButton("扫描全部歌曲目录")
+        choose_root=QPushButton("选择/增加歌曲目录")
+        import_local=QPushButton("导入本地音乐")
+        import_link=QPushButton("粘贴分享链接")
         analyze=QPushButton("批量 BPM / 调性分析")
-        stems=QPushButton("建立七轨兼容队列")
+        stems=QPushButton("建立六轨+电吉他队列")
         refresh=QPushButton("刷新音乐库")
         apply_button_accent(scan,"primary")
         scan.clicked.connect(self.scan_imports)
+        choose_root.clicked.connect(self.choose_scan_folder)
+        import_local.clicked.connect(self.import_local_music)
+        import_link.clicked.connect(self.import_share_link)
         analyze.clicked.connect(self.batch_analyze)
         stems.clicked.connect(self.enqueue_stems)
         refresh.clicked.connect(self.refresh_library)
-        for b in [scan,analyze,stems,refresh]:
+        for b in [scan,choose_root,import_local,import_link,analyze,stems,refresh]:
             top.addWidget(b)
         top.addStretch(1)
         layout.addLayout(top)
