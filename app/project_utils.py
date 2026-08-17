@@ -53,6 +53,50 @@ def repair_text(value: Any, fallback: str = "") -> str:
     return text.strip() or fallback
 
 
+_LRC_TIME = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+
+
+def _parse_lrc(text: str) -> list[dict]:
+    rows: list[dict] = []
+    offset_match = re.search(r"\[offset:([+-]?\d+)\]", text, flags=re.I)
+    offset_ms = int(offset_match.group(1)) if offset_match else 0
+    for line in text.splitlines():
+        stamps = list(_LRC_TIME.finditer(line))
+        lyric = _LRC_TIME.sub("", line).strip()
+        if not stamps or not lyric or re.fullmatch(r"\[[a-z]+:.*\]", lyric, flags=re.I):
+            continue
+        for stamp in stamps:
+            fraction = stamp.group(3) or "0"
+            start = max(
+                0.0,
+                int(stamp.group(1)) * 60 + int(stamp.group(2))
+                + int(fraction) / (10 ** len(fraction)) + offset_ms / 1000,
+            )
+            rows.append({"start": round(start, 3), "text": lyric})
+    rows.sort(key=lambda row: row["start"])
+    return rows
+
+
+def _embedded_lyrics(path: Path) -> str:
+    try:
+        import mutagen
+        audio = mutagen.File(str(path), easy=False)
+        tags = getattr(audio, "tags", None)
+        if not tags:
+            return ""
+        for key in tags.keys():
+            value = tags[key]
+            lowered = str(key).casefold()
+            if lowered.startswith(("sylt", "uslt")):
+                raw = getattr(value, "text", "")
+                return "\n".join(str(item) for item in raw) if isinstance(raw, list) else str(raw or "")
+            if lowered in {"lyrics", "unsyncedlyrics", "syncedlyrics", "©lyr"}:
+                return "\n".join(str(item) for item in value) if isinstance(value, (list, tuple)) else str(value or "")
+    except Exception:
+        return ""
+    return ""
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     """Persist JSON without leaving a half-written recovery file after a crash."""
 
