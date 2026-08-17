@@ -419,13 +419,32 @@ def library(
         if song.get("cover_path"):
             song["cover_url"] = str(request.url_for("library_cover", track_id=track_id))
         song.pop("cover_path", None)
-    return {"songs": songs, "count": len(songs), "categories": ["全部", "本地导入", "抖音流行", "酷狗排行榜"]}
+    artists = {}
+    for song in songs:
+        name = song.get("artist") or "未知歌手"
+        artists[name] = artists.get(name, 0) + 1
+    return {
+        "songs": songs, "count": len(songs),
+        "artists": [{"name": name, "count": count} for name, count in sorted(artists.items())],
+        "categories": ["全部", "本地导入", "临时歌曲库", "抖音流行", "酷狗排行榜"],
+    }
 
 
 @app.post("/api/v1/library/scan")
 def scan_library(_: None = Depends(authorize)) -> dict:
-    result = scan_catalog(LIBRARY_PATHS["originals"], LIBRARY_DB, LIBRARY_PATHS["covers"])
+    result = scan_catalog_roots(
+        [LIBRARY_PATHS["originals"], LIBRARY_PATHS["temp"]],
+        LIBRARY_DB, LIBRARY_PATHS["covers"],
+    )
     return {**result, "root": str(LIBRARY_PATHS["root"])}
+
+
+@app.post("/api/v1/library/import-url", status_code=201)
+def import_library_url(payload: LinkImportPayload, _: None = Depends(authorize)) -> dict:
+    destination = LIBRARY_PATHS["temp"] / "链接导入"
+    path = download_public_audio(payload.url.strip(), destination, shutil.which("ffmpeg") or "")
+    result = scan_catalog_roots([destination], LIBRARY_DB, LIBRARY_PATHS["covers"])
+    return {"status": "imported", "file_name": path.name, "scan": result}
 
 
 @app.get("/api/v1/library/{track_id}/audio", name="library_audio")
