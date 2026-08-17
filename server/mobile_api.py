@@ -646,6 +646,7 @@ def _transpose_analysis(analysis: dict, rows: list[dict], semitones: int) -> tup
 
 
 def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) -> Path:
+    pitch_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     fifths = {"C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5, "F#": 6,
               "F": -1, "A#": -2, "D#": -3, "G#": -4, "C#": -5}
     note_steps = {"C": ("C", 0), "C#": ("C", 1), "D": ("D", 0), "D#": ("D", 1),
