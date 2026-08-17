@@ -3,7 +3,7 @@ name: Build Juweier Music iOS TestFlight Package
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.0"]
+    branches: ["main", "agent/juweier-v3.2.1"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-ios-testflight-package.yml"
@@ -71,7 +71,7 @@ jobs:
           - 勾选 Automatically manage signing
           - Team 选择你的 Apple Developer 团队
           - Bundle Identifier：`com.db0888.juweierMusic`
-          - Version 当前来自 pubspec：3.2.0
+          - Version 当前来自 pubspec：3.2.1
           - Build：310，可按需要递增
 
           ## 3. 归档上传
@@ -84,12 +84,12 @@ jobs:
       - name: Package iOS Xcode project
         shell: bash
         run: |
-          zip -qry Juweier-Music-v3.2.0-iOS-TestFlight-Xcode-Project.zip mobile_ios
+          zip -qry Juweier-Music-v3.2.1-iOS-TestFlight-Xcode-Project.zip mobile_ios
       - name: Upload iOS TestFlight project package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.0-iOS-TestFlight-Xcode-Project
-          path: Juweier-Music-v3.2.0-iOS-TestFlight-Xcode-Project.zip
+          name: Juweier-Music-v3.2.1-iOS-TestFlight-Xcode-Project
+          path: Juweier-Music-v3.2.1-iOS-TestFlight-Xcode-Project.zip
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

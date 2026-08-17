@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.0';
+const appVersion = '3.2.1';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
 const violet = Color(0xFF8F3DFF);

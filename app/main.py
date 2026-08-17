@@ -30,6 +30,7 @@ from app.project_utils import (
 )
 from app.library_catalog import (
     AUDIO_EXTENSIONS,
+    catalog_artist_name,
     connect_catalog,
     default_library_root,
     ensure_library_layout,
@@ -52,7 +53,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -147,7 +148,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/3.2.0"}
+            headers={"User-Agent": "Juweier-Music/3.2.1"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -972,7 +973,10 @@ class SetlistPage(QWidget):
         layout.addWidget(title)
 
         bar = QHBoxLayout()
-        add_btn = QPushButton("添加歌曲")
+        add_current_btn = QPushButton("加入当前 G 盘歌曲")
+        apply_button_accent(add_current_btn, "primary")
+        add_current_btn.clicked.connect(self.add_current_song)
+        add_btn = QPushButton("添加本地文件")
         add_btn.clicked.connect(self.add_song)
         remove_btn = QPushButton("删除所选")
         remove_btn.clicked.connect(self.remove_selected)
@@ -984,7 +988,7 @@ class SetlistPage(QWidget):
         load_btn.clicked.connect(self.load_selected)
         self.auto_next = QCheckBox("播放结束自动下一首")
         self.auto_next.setChecked(True)
-        for w in [add_btn, remove_btn, up_btn, down_btn, load_btn, self.auto_next]:
+        for w in [add_current_btn, add_btn, remove_btn, up_btn, down_btn, load_btn, self.auto_next]:
             bar.addWidget(w)
         bar.addStretch(1)
         layout.addLayout(bar)
@@ -1007,6 +1011,18 @@ class SetlistPage(QWidget):
             if p not in [x["path"] for x in self.items]:
                 self.items.append({"path":p,"mode":"全部开启","key":"原调","speed":"100%"})
         self.refresh()
+
+    def add_current_song(self):
+        path = str(self.main.song_file or "")
+        if not path or not Path(path).exists():
+            QMessageBox.information(self, "Setlist", "请先从左侧的 G 盘歌曲库选择一首歌曲。")
+            self.main.open_g_drive_library()
+            return
+        if path not in [item["path"] for item in self.items]:
+            self.items.append({"path": path, "mode": "全部开启", "key": "原调", "speed": "100%"})
+        self.refresh()
+        if self.items:
+            self.table.selectRow(len(self.items) - 1)
 
     def refresh(self):
         self.table.setRowCount(len(self.items))
@@ -1032,9 +1048,7 @@ class SetlistPage(QWidget):
     def load_selected(self):
         r = self.table.currentRow()
         if 0 <= r < len(self.items):
-            self.main.song_file = self.items[r]["path"]
-            self.main.studio.file_label.setText(Path(self.main.song_file).name)
-            self.main.nav.setCurrentRow(2)
+            self.main.load_imported_working_file(self.items[r]["path"])
             QMessageBox.information(self, "Setlist", "歌曲已载入。若该歌曲尚未分轨，请先执行 AI 六轨分离。")
 
     def current_index(self):
@@ -2520,7 +2534,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.0"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.1"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2690,6 +2704,34 @@ class MusicLibraryPage(QWidget):
         self.library_scan_status.setWordWrap(True)
         layout.addWidget(self.library_scan_status)
 
+        library_box=QGroupBox("G 盘歌手歌曲库（展开歌手即可查看全部歌曲）")
+        library_layout=QHBoxLayout(library_box)
+        self.tree=QTreeWidget()
+        self.tree.setHeaderLabels(["歌手分类 / 歌曲","数量 · 分类 · 专辑 · 音质"])
+        self.tree.setMinimumHeight(330)
+        self.tree.itemSelectionChanged.connect(self.show_selected)
+        self.tree.itemDoubleClicked.connect(lambda item,col: self.load_selected_to_workspace())
+        library_layout.addWidget(self.tree,2)
+
+        right=QVBoxLayout()
+        self.cover=QLabel("无封面")
+        self.cover.setFixedSize(180,180)
+        self.cover.setAlignment(Qt.AlignCenter)
+        self.cover.setStyleSheet("border:1px solid #293957;border-radius:12px;background:#0c1424;")
+        right.addWidget(self.cover)
+
+        self.detail=QLabel("请选择歌曲")
+        self.detail.setWordWrap(True)
+        right.addWidget(self.detail)
+
+        self.task_table=QTableWidget(0,6)
+        self.task_table.setHorizontalHeaderLabels(["序号","歌曲","设备","状态","进度","失败原因"])
+        self.task_table.horizontalHeader().setStretchLastSection(True)
+        right.addWidget(QLabel("批量任务"))
+        right.addWidget(self.task_table,1)
+        library_layout.addLayout(right,1)
+        layout.addWidget(library_box,2)
+
         batch_box=QGroupBox("批量 AI 处理器")
         bgl=QGridLayout(batch_box)
 
@@ -2848,32 +2890,6 @@ class MusicLibraryPage(QWidget):
 
         layout.addWidget(scheduler_box)
 
-        body=QHBoxLayout()
-        self.tree=QTreeWidget()
-        self.tree.setHeaderLabels(["歌手分类 / 歌曲","分类 · 专辑 · 音质"])
-        self.tree.itemSelectionChanged.connect(self.show_selected)
-        self.tree.itemDoubleClicked.connect(lambda item,col: self.load_selected_to_workspace())
-        body.addWidget(self.tree,1)
-
-        right=QVBoxLayout()
-        self.cover=QLabel("无封面")
-        self.cover.setFixedSize(220,220)
-        self.cover.setAlignment(Qt.AlignCenter)
-        self.cover.setStyleSheet("border:1px solid #293957;border-radius:12px;background:#0c1424;")
-        right.addWidget(self.cover)
-
-        self.detail=QLabel("请选择歌曲")
-        self.detail.setWordWrap(True)
-        right.addWidget(self.detail)
-
-        self.task_table=QTableWidget(0,6)
-        self.task_table.setHorizontalHeaderLabels(["序号","歌曲","设备","状态","进度","失败原因"])
-        self.task_table.horizontalHeader().setStretchLastSection(True)
-        right.addWidget(QLabel("批量任务"))
-        right.addWidget(self.task_table,1)
-        body.addLayout(right,1)
-        layout.addLayout(body,1)
-
         self.progress=QProgressBar()
         self.progress.setRange(0,100)
         self.progress.setValue(0)
@@ -2886,14 +2902,17 @@ class MusicLibraryPage(QWidget):
         self.refresh_pipeline_table()
 
     def _load_scan_roots(self):
-        defaults=[self.library_paths["originals"],self.library_paths["temp"]]
+        defaults=[self.library_paths["originals"],self.library_paths["temp"]/"链接导入"]
         try:
             rows=json.loads(self.scan_roots_file.read_text(encoding="utf-8"))
             saved=[Path(row) for row in rows if str(row).strip()]
         except Exception:
             saved=[]
         result=[]
+        legacy_temp=normalized_path(self.library_paths["temp"])
         for path in [*defaults,*saved]:
+            if normalized_path(path)==legacy_temp:
+                continue
             key=normalized_path(path)
             if key not in {normalized_path(item) for item in result}:
                 result.append(Path(path))
@@ -3137,18 +3156,22 @@ class MusicLibraryPage(QWidget):
             ),
         )
         self.progress.setValue(100)
+        self._prune_stale_jobs()
         self.refresh_library()
         roots="\n".join(f"• {root}" for root in result.get("roots",[]))
         errors="\n".join(result.get("error_samples",[])[:5])
         self.library_scan_status.setText(
             f"扫描完成：{result['folders']} 个文件夹，发现 {result['total']} 首；"
             f"新增 {result['added']}、更新 {result['updated']}、已有 {result['skipped']}、失败 {result['failed']}。"
+            f" 已清理内部工作副本 {result.get('removed_generated',0)} 个。"
         )
         QMessageBox.information(
             self,"歌曲库扫描完成",
             f"实际扫描目录：\n{roots}\n\n"
             f"扫描 {result['folders']} 个文件夹，发现 {result['total']} 个完整音频文件。\n"
+            f"已进入 Windows/网盘链接目录 {result.get('linked_folders',0)} 个。\n"
             f"新增 {result['added']} 首，更新 {result['updated']} 首，已有 {result['skipped']} 首，失败 {result['failed']} 首。\n"
+            f"自动清理重复的内部工作副本 {result.get('removed_generated',0)} 个。\n"
             f"忽略未下载完成文件 {result.get('ignored_partial',0)} 个。"
             + (f"\n\n目录读取提示：\n{errors}" if errors else "")
         )
@@ -3237,14 +3260,37 @@ class MusicLibraryPage(QWidget):
         self.refresh_library()
         QMessageBox.information(self,"音乐库",f"扫描完成，共处理 {added} 首音乐。")
 
+    def _prune_stale_jobs(self):
+        active_workers=(
+            getattr(self,"batch_worker",None),
+            getattr(self,"pipeline_batch_worker",None),
+            getattr(self,"pipeline_stage_worker",None),
+        )
+        if any(worker and worker.isRunning() for worker in active_workers):
+            return
+        con=self._db()
+        valid_ids={int(row["id"]) for row in con.execute("SELECT id FROM tracks").fetchall()}
+        con.close()
+        old_batch=len(self.batch_queue)
+        old_pipeline=len(self.pipeline_jobs)
+        self.batch_queue=[item for item in self.batch_queue if int(item.get("id",-1)) in valid_ids]
+        self.pipeline_jobs=[item for item in self.pipeline_jobs if int(item.get("track_id",-1)) in valid_ids]
+        if len(self.batch_queue)!=old_batch:
+            self._save_batch_queue()
+            self.refresh_task_table()
+        if len(self.pipeline_jobs)!=old_pipeline:
+            self._save_pipeline_jobs()
+            self.refresh_pipeline_table()
+
     def refresh_library(self):
+        self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         query=self.library_search.text() if hasattr(self,"library_search") else ""
         category=self.library_category.currentText() if hasattr(self,"library_category") else "全部"
         rows=list_catalog(self.db_path,query,category)
         artists={}
         for row in rows:
-            artist=row["artist"] or "未知歌手"
+            artist=catalog_artist_name(row)
             if artist not in artists:
                 ai=QTreeWidgetItem([artist,""])
                 ai.setData(0,Qt.UserRole,("artist",artist))
@@ -3266,6 +3312,7 @@ class MusicLibraryPage(QWidget):
             f"当前显示 {len(artists)} 位歌手、{len(rows)} 首歌曲 · "
             + "扫描目录："+"；".join(str(item) for item in self.scan_roots)
         )
+        self.tree.setUpdatesEnabled(True)
 
     def _selected_track_id(self):
         items=self.tree.selectedItems()
@@ -4348,11 +4395,7 @@ class MusicLibraryPage(QWidget):
         tid=self._selected_track_id()
         if not tid:
             return
-        con=self._db()
-        row=con.execute("SELECT working_path FROM tracks WHERE id=?",(tid,)).fetchone()
-        con.close()
-        if row and Path(row["working_path"]).exists():
-            self.main.load_imported_working_file(row["working_path"])
+        self.main.load_library_track(tid)
 
 
 class CommunityPage(QWidget):
@@ -4548,6 +4591,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
         self.song_file = None
+        self.selected_library_track_id = None
         self.stem_dir = None
         self.base_stem_dir = None
         self.markers = []
@@ -4634,6 +4678,18 @@ class MainWindow(QMainWindow):
         self.nav.setCurrentRow(2)
         side.addWidget(self.nav, 1)
 
+        song_context=QGroupBox("全局 G 盘歌曲")
+        song_context_layout=QVBoxLayout(song_context)
+        self.current_song_label=QLabel("尚未选择歌曲")
+        self.current_song_label.setWordWrap(True)
+        self.current_song_label.setObjectName("BrandSub")
+        choose_library_song=QPushButton("从歌曲库选择")
+        apply_button_accent(choose_library_song,"primary")
+        choose_library_song.clicked.connect(self.open_g_drive_library)
+        song_context_layout.addWidget(self.current_song_label)
+        song_context_layout.addWidget(choose_library_song)
+        side.addWidget(song_context)
+
         footer = QLabel("让音乐创作与演出更自由")
         footer.setAlignment(Qt.AlignCenter)
         footer.setObjectName("BrandSub")
@@ -4664,7 +4720,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.community)
         self.settings_page = SettingsPage(self)
         self.stack.addWidget(self.settings_page)
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+        self._on_nav_changed(self.nav.currentRow())
 
         root.addWidget(sidebar)
         root.addWidget(self.stack, 1)
@@ -4687,14 +4744,43 @@ class MainWindow(QMainWindow):
             pass
 
 
-    def load_imported_working_file(self, path):
+    def _on_nav_changed(self,index):
+        self.stack.setCurrentIndex(index)
+        if index in {2,3,4,5,6,7,8,9} and not self.song_file:
+            self.statusBar().showMessage("请先点击左侧‘从歌曲库选择’，选择 G 盘歌曲")
+
+    def open_g_drive_library(self):
+        self.nav.setCurrentRow(1)
+        self.music_library.tree.setFocus()
+        self.statusBar().showMessage("请按歌手展开歌曲，双击歌曲后即可供左侧所有功能共同处理")
+
+    def load_library_track(self,track_id):
+        con=self.music_library._db()
+        row=con.execute("SELECT * FROM tracks WHERE id=?",(int(track_id),)).fetchone()
+        con.close()
+        if not row:
+            QMessageBox.warning(self,"歌曲库","找不到这首歌曲，请重新扫描 G 盘歌曲库。")
+            return
+        path=Path(row["working_path"] or row["source_path"] or "")
+        if not path.exists():
+            QMessageBox.warning(self,"歌曲库",f"歌曲文件不存在：\n{path}")
+            return
+        self.load_imported_working_file(path,library_track_id=int(track_id))
+        artist=catalog_artist_name(dict(row))
+        self.current_song_label.setText(f"{artist}\n{row['title']}")
+        self.statusBar().showMessage(f"当前 G 盘歌曲：{artist} - {row['title']}")
+
+    def load_imported_working_file(self, path, library_track_id=None):
         p=Path(path)
         if not p.exists():
             return
         self.song_file=str(p)
+        self.selected_library_track_id=library_track_id
         self.stem_dir=None
         self.engine.close()
         self.studio.file_label.setText(p.name)
+        if hasattr(self,"current_song_label") and library_track_id is None:
+            self.current_song_label.setText(p.name)
         self._load_song_lyrics(p)
         if hasattr(self,"arrangement"):
             self.arrangement.song_label.setText(p.name)
@@ -4709,6 +4795,9 @@ class MainWindow(QMainWindow):
         if not p:
             return
         self.song_file = p
+        self.selected_library_track_id = None
+        if hasattr(self,"current_song_label"):
+            self.current_song_label.setText(Path(p).name)
         self.stem_dir = None
         self.stop_variant_preview()
         self.stop_ab_instant_preview()
@@ -4975,6 +5064,14 @@ class MainWindow(QMainWindow):
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            song = str(data.get("song_file") or "")
+            if song and Path(song).exists():
+                self.song_file = song
+                self.selected_library_track_id = None
+                self.studio.file_label.setText(Path(song).name)
+                if hasattr(self, "current_song_label"):
+                    self.current_song_label.setText(Path(song).name)
+                self._load_song_lyrics(Path(song))
             if hasattr(self, "setlist"):
                 self.setlist.items = data.get("setlist", [])
                 self.setlist.refresh()

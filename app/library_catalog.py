@@ -28,6 +28,7 @@ PARTIAL_DOWNLOAD_SUFFIXES = {
 GENERIC_ARTIST_FOLDERS = {
     "01_originals", "originals", "本地导入", "链接导入", "临时歌曲库",
     "抖音流行", "酷狗排行榜", "mp3", "flac", "无损", "音乐", "歌曲",
+    "05_temp", "temp", "database", "按歌手分类", "working", "converted",
 }
 
 
@@ -49,6 +50,7 @@ def ensure_library_layout(root: Path) -> dict[str, Path]:
         "processed": root / "03_AI_Processed",
         "failed": root / "04_Import_Failed",
         "temp": root / "05_Temp",
+        "link_imports": root / "05_Temp" / "链接导入",
         "database": root / "database",
     }
     for path in paths.values():
@@ -121,6 +123,17 @@ def _clean_folder_artist(value: str) -> str:
     return text.strip(" ._-—")
 
 
+def _is_letter_bucket(value: str) -> bool:
+    """Return True for folders such as `A 字母开头歌手`, but not `A-Lin`."""
+    text = _clean_folder_artist(value)
+    if re.fullmatch(r"[A-Z]", text, flags=re.I):
+        return True
+    return bool(
+        re.match(r"^[A-Z]\s+", text, flags=re.I)
+        and any(marker in text for marker in ("字母", "开头", "歌手", "歌曲", "分类"))
+    )
+
+
 def infer_artist_from_path(path: Path, root: Path | None = None) -> str:
     """Infer the singer from the user's `按歌手分类/歌手/歌曲` directory layout."""
     try:
@@ -130,14 +143,20 @@ def infer_artist_from_path(path: Path, root: Path | None = None) -> str:
 
     for index, raw in enumerate(parts):
         if "按歌手分类" in raw and index + 1 < len(parts):
-            candidate = _clean_folder_artist(parts[index + 1])
-            if candidate:
+            for nested in parts[index + 1:]:
+                candidate = _clean_folder_artist(nested)
+                if not candidate or _is_letter_bucket(candidate):
+                    continue
+                if candidate.casefold() in GENERIC_ARTIST_FOLDERS:
+                    continue
                 return candidate
 
     for raw in reversed(parts):
         candidate = _clean_folder_artist(raw)
         folded = candidate.casefold()
         if not candidate or folded in GENERIC_ARTIST_FOLDERS:
+            continue
+        if _is_letter_bucket(candidate):
             continue
         if "按歌手分类" in candidate or candidate.lower().endswith(("musiclibrary", "covers")):
             continue
@@ -149,15 +168,39 @@ def infer_artist_from_path(path: Path, root: Path | None = None) -> str:
     return "未知歌手"
 
 
+def catalog_artist_name(row: dict) -> str:
+    """Prefer the real singer folder so G-drive classification wins over bad tags."""
+    source_group = _clean_folder_artist(str(row.get("source_group") or ""))
+    if (
+        source_group
+        and source_group != "未知歌手"
+        and source_group.casefold() not in GENERIC_ARTIST_FOLDERS
+        and not _is_letter_bucket(source_group)
+    ):
+        return source_group
+    return repair_text(row.get("artist"), "未知歌手")
+
+
 def _is_partial_download(path: Path) -> bool:
     name = path.name.casefold()
     return any(name.endswith(suffix) for suffix in PARTIAL_DOWNLOAD_SUFFIXES)
 
 
+def is_generated_work_audio(path: str | Path) -> bool:
+    """Identify internal conversion files that must never become library songs."""
+    item = Path(path)
+    name = item.name.casefold()
+    if re.search(r"_[0-9a-f]{8,64}_work\.(?:wav|flac|aiff?|alac)$", name):
+        return True
+    parts = {part.casefold() for part in item.parts}
+    return bool({"working", "converted"} & parts and {"05_temp", "imports"} & parts)
+
+
 def discover_audio_files(roots: list[Path] | tuple[Path, ...]) -> tuple[list[tuple[Path, Path]], dict]:
-    """Walk every configured library folder and return diagnostics the UI can show."""
+    """Walk every configured folder, including Windows junction/reparse directories."""
     found: dict[str, tuple[Path, Path]] = {}
     folder_count = 0
+    linked_folders = 0
     ignored_partial = 0
     errors: list[str] = []
     scanned_roots: list[str] = []
@@ -172,13 +215,44 @@ def discover_audio_files(roots: list[Path] | tuple[Path, ...]) -> tuple[list[tup
         if not root.exists():
             errors.append(f"目录不存在：{root}")
             continue
-        for current, _, names in os.walk(root, onerror=onerror):
+        stack = [root]
+        visited: set[tuple | str] = set()
+        while stack:
+            current_path = stack.pop()
+            try:
+                current_stat = current_path.stat()
+                identity: tuple | str
+                if getattr(current_stat, "st_ino", 0):
+                    identity = (getattr(current_stat, "st_dev", 0), current_stat.st_ino)
+                else:
+                    identity = os.path.normcase(os.path.realpath(str(current_path))).casefold()
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                with os.scandir(current_path) as stream:
+                    entries = list(stream)
+            except OSError as error:
+                onerror(error)
+                continue
             folder_count += 1
-            current_path = Path(current)
-            for name in names:
-                path = current_path / name
+            for entry in entries:
+                path = current_path / entry.name
                 if _is_partial_download(path):
                     ignored_partial += 1
+                    continue
+                if is_generated_work_audio(path):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        stat_result = entry.stat(follow_symlinks=True)
+                        if entry.is_symlink() or bool(getattr(stat_result, "st_file_attributes", 0) & 0x400):
+                            linked_folders += 1
+                        stack.append(path)
+                        continue
+                    if not entry.is_file(follow_symlinks=True):
+                        continue
+                except OSError as error:
+                    onerror(error)
                     continue
                 if path.suffix.casefold() not in AUDIO_EXTENSIONS:
                     continue
@@ -187,6 +261,7 @@ def discover_audio_files(roots: list[Path] | tuple[Path, ...]) -> tuple[list[tup
     rows = sorted(found.values(), key=lambda item: str(item[0]).casefold())
     return rows, {
         "folders": folder_count,
+        "linked_folders": linked_folders,
         "ignored_partial": ignored_partial,
         "scan_errors": len(errors),
         "error_samples": errors,
@@ -333,7 +408,7 @@ def scan_catalog_roots(
 ) -> dict:
     files, diagnostics = discover_audio_files(tuple(Path(root) for root in roots))
     connection = connect_catalog(db_path)
-    added = updated = skipped = failed = 0
+    added = updated = skipped = failed = removed_generated = 0
     try:
         for index, (path, scan_root) in enumerate(files, start=1):
             if progress:
@@ -343,17 +418,17 @@ def scan_catalog_roots(
                 existing = connection.execute(
                     "SELECT id,imported_at,source_group,artist FROM tracks WHERE source_path=?", (str(path),)
                 ).fetchone()
+                source_group = infer_artist_from_path(path, scan_root)
                 if (
                     existing
                     and float(existing["imported_at"] or 0) == float(stat.st_mtime)
-                    and str(existing["source_group"] or "").strip()
+                    and str(existing["source_group"] or "").strip() == source_group
                     and str(existing["artist"] or "").strip() not in {"", "未知歌手"}
                 ):
                     skipped += 1
                     continue
                 fingerprint = quick_fingerprint(path)
                 metadata = extract_metadata(path, cover_dir, scan_root)
-                source_group = infer_artist_from_path(path, scan_root)
                 connection.execute(
                     """
                     INSERT INTO tracks(
@@ -385,32 +460,38 @@ def scan_catalog_roots(
                     added += 1
             except Exception:
                 failed += 1
+        generated_rows = connection.execute("SELECT id,source_path FROM tracks").fetchall()
+        for row in generated_rows:
+            if is_generated_work_audio(row["source_path"] or ""):
+                connection.execute("DELETE FROM tracks WHERE id=?", (row["id"],))
+                removed_generated += 1
         connection.commit()
     finally:
         connection.close()
     return {
         "total": len(files), "added": added, "updated": updated,
-        "skipped": skipped, "failed": failed, **diagnostics,
+        "skipped": skipped, "failed": failed, "removed_generated": removed_generated,
+        **diagnostics,
     }
 
 
-def list_catalog(db_path: Path, query: str = "", category: str = "全部", limit: int = 500) -> list[dict]:
+def list_catalog(db_path: Path, query: str = "", category: str = "全部", limit: int = 100000) -> list[dict]:
     connection = connect_catalog(db_path)
     try:
         where = []
         values: list[object] = []
         text = query.strip()
         if text:
-            where.append("(title LIKE ? OR artist LIKE ? OR album LIKE ?)")
+            where.append("(title LIKE ? OR artist LIKE ? OR album LIKE ? OR source_group LIKE ?)")
             like = f"%{text}%"
-            values.extend((like, like, like))
+            values.extend((like, like, like, like))
         if category and category != "全部":
             where.append("category=?")
             values.append(category)
         clause = " WHERE " + " AND ".join(where) if where else ""
-        values.append(max(1, min(5000, int(limit))))
+        values.append(max(1, min(100000, int(limit))))
         rows = connection.execute(
-            "SELECT * FROM tracks" + clause + " ORDER BY artist,title LIMIT ?", values
+            "SELECT * FROM tracks" + clause + " ORDER BY source_group,artist,title LIMIT ?", values
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -423,9 +504,9 @@ def list_artists(db_path: Path, query: str = "", category: str = "全部") -> li
         where = []
         values: list[object] = []
         if query.strip():
-            where.append("(title LIKE ? OR artist LIKE ? OR album LIKE ?)")
+            where.append("(title LIKE ? OR artist LIKE ? OR album LIKE ? OR source_group LIKE ?)")
             like = f"%{query.strip()}%"
-            values.extend((like, like, like))
+            values.extend((like, like, like, like))
         if category and category != "全部":
             where.append("category=?")
             values.append(category)
@@ -453,7 +534,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
         source_name = urllib.parse.unquote(Path(parsed.path).name) or "link_audio.mp3"
         target = destination / f"{safe_file_stem(Path(source_name).stem, 'link_audio')}{suffix}"
         part = target.with_suffix(target.suffix + ".part")
-        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.2.0"})
+        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.2.1"})
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
             total, downloaded = int(response.headers.get("Content-Length") or 0), 0
             while True:
@@ -470,7 +551,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("当前安装包缺少公开链接解析组件，请更新到完整版 v3.2.0") from exc
+        raise RuntimeError("当前安装包缺少公开链接解析组件，请更新到完整版 v3.2.1") from exc
     before = {path.resolve() for path in destination.iterdir() if path.is_file()}
 
     def hook(status: dict) -> None:
