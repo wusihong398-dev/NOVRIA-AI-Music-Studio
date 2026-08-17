@@ -1140,7 +1140,11 @@ class _ScorePreviewState extends State<ScorePreview> {
       if (response.statusCode >= 200 && response.statusCode < 300) {
         final data = Map<String, dynamic>.from(jsonDecode(body) as Map);
         final rows = data[widget.tablature ? 'tab_notes' : 'staff_notes'];
-        if (mounted) setState(() => notes = rows is List ? rows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const []);
+        final lyricRows = data['lyrics'];
+        if (mounted) setState(() {
+          notes = rows is List ? rows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
+          lyrics = lyricRows is List ? lyricRows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
+        });
       }
     } finally {
       client.close(force: true);
