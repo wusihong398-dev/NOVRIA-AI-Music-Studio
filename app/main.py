@@ -2669,12 +2669,26 @@ class MusicLibraryPage(QWidget):
         self.library_search=QLineEdit()
         self.library_search.setPlaceholderText("搜索歌曲、歌手或专辑")
         self.library_category=QComboBox()
-        self.library_category.addItems(["全部","本地导入","抖音流行","酷狗排行榜"])
-        self.library_search.textChanged.connect(self.refresh_library)
+        self.library_category.addItems(["全部","本地导入","临时歌曲库","抖音流行","酷狗排行榜"])
+        search_button=QPushButton("🔍 搜索")
+        clear_button=QPushButton("清空")
+        apply_button_accent(search_button,"primary")
+        self.library_search.returnPressed.connect(self.refresh_library)
         self.library_category.currentTextChanged.connect(self.refresh_library)
+        search_button.clicked.connect(self.refresh_library)
+        clear_button.clicked.connect(lambda: (self.library_search.clear(), self.refresh_library()))
         search_row.addWidget(self.library_search,1)
         search_row.addWidget(self.library_category)
+        search_row.addWidget(search_button)
+        search_row.addWidget(clear_button)
         layout.addLayout(search_row)
+
+        self.library_scan_status=QLabel(
+            "扫描目录：" + "；".join(str(path) for path in self.scan_roots)
+        )
+        self.library_scan_status.setObjectName("SectionHint")
+        self.library_scan_status.setWordWrap(True)
+        layout.addWidget(self.library_scan_status)
 
         batch_box=QGroupBox("批量 AI 处理器")
         bgl=QGridLayout(batch_box)
@@ -2728,7 +2742,7 @@ class MusicLibraryPage(QWidget):
         self.pipeline_output=QComboBox()
         self.pipeline_output.addItems(["WAV","WAV + MP3"])
 
-        self.pipe_stems=QCheckBox("七轨兼容")
+        self.pipe_stems=QCheckBox("六轨+电吉他")
         self.pipe_analysis=QCheckBox("BPM/调性")
         self.pipe_chords=QCheckBox("和弦/段落")
         self.pipe_score=QCheckBox("乐谱")
@@ -2753,7 +2767,7 @@ class MusicLibraryPage(QWidget):
 
         self.pipeline_table=QTableWidget(0,10)
         self.pipeline_table.setHorizontalHeaderLabels(
-            ["优先级","歌曲","七轨","分析","和弦","乐谱","改编","渲染","入库","状态"]
+            ["优先级","歌曲","六轨+电吉他","分析","和弦","乐谱","改编","渲染","入库","状态"]
         )
         self.pipeline_table.horizontalHeader().setStretchLastSection(True)
 
@@ -2836,7 +2850,7 @@ class MusicLibraryPage(QWidget):
 
         body=QHBoxLayout()
         self.tree=QTreeWidget()
-        self.tree.setHeaderLabels(["音乐库","信息"])
+        self.tree.setHeaderLabels(["歌手分类 / 歌曲","分类 · 专辑 · 音质"])
         self.tree.itemSelectionChanged.connect(self.show_selected)
         self.tree.itemDoubleClicked.connect(lambda item,col: self.load_selected_to_workspace())
         body.addWidget(self.tree,1)
