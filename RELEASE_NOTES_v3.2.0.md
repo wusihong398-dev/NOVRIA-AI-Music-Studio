@@ -13,4 +13,4 @@
 
 Default library root: `G:\JuweierMusicLibrary`.
 
-Mobile clients stil
+Mobile clients still use the Windows/GPU server for separation, analysis, scores, and arrangement. Demucs does not run on the phone.
