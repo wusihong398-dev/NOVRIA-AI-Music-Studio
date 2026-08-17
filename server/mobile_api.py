@@ -673,7 +673,7 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
         note_xml = []
         for event in melody[(index - 1) * 4:index * 4]:
             midi = int(event.get("midi", 60))
-            pitch = names[midi % 12]
+            pitch = pitch_names[midi % 12]
             note_step, note_alter = note_steps[pitch]
             octave = midi // 12 - 1
             alter_note_xml = f"<alter>{note_alter}</alter>" if note_alter else ""
