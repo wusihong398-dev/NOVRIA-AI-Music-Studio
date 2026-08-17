@@ -55,6 +55,36 @@ class ProjectUtilsTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(normalized_path(rows[0][2]), normalized_path(working))
 
+    def test_lrc_timeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "song.wav"
+            with wave.open(str(audio), "wb") as stream:
+                stream.setnchannels(1); stream.setsampwidth(2); stream.setframerate(8000)
+                stream.writeframes(b"\0\0" * 8000)
+            audio.with_suffix(".lrc").write_text("[00:01.00]第一句\n[00:03.50]第二句", encoding="utf-8")
+            rows = load_synced_lyrics(audio, 6)
+            self.assertEqual(rows[0]["text"], "第一句")
+            self.assertEqual(rows[0]["start"], 1.0)
+            self.assertEqual(rows[0]["end"], 3.5)
+
+    @unittest.skipUnless(HAS_AUDIO_STACK, "soundfile/librosa audio test dependencies are not installed")
+    def test_guitar_second_stage_creates_distinct_aligned_tracks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sample_rate = 8000
+            t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+            signal = (0.2 * np.sin(2 * np.pi * 220 * t) + 0.08 * np.sin(2 * np.pi * 1800 * t)).astype(np.float32)
+            sf.write(folder / "guitar.wav", np.column_stack((signal, signal)), sample_rate)
+            info = split_guitar_stem(folder)
+            acoustic, _ = sf.read(folder / "guitar.wav", always_2d=True)
+            electric, _ = sf.read(folder / "electric_guitar.wav", always_2d=True)
+            combined, _ = sf.read(folder / "guitar_combined.wav", always_2d=True)
+            self.assertEqual(acoustic.shape, combined.shape)
+            self.assertEqual(electric.shape, combined.shape)
+            self.assertGreater(float(np.max(np.abs(electric))), 0.001)
+            self.assertLess(float(np.max(np.abs((acoustic + electric) - combined))), 0.01)
+            self.assertEqual(info["base_model"], "htdemucs_6s")
+
 
 if __name__ == '__main__':
     unittest.main()
