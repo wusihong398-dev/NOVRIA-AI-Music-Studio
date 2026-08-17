@@ -77,6 +77,10 @@ class LibraryProcessPayload(BaseModel):
     output: str = "wav_mp3"
 
 
+class LinkImportPayload(BaseModel):
+    url: str = Field(min_length=8, max_length=4096)
+
+
 def _db() -> sqlite3.Connection:
     connection = sqlite3.connect(ACCOUNT_DB, timeout=20)
     connection.row_factory = sqlite3.Row
