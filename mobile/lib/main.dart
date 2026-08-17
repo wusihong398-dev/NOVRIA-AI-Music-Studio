@@ -1046,7 +1046,7 @@ class _PerformancePageState extends State<PerformancePage> {
           const Text('拖动后会同步定位所有音轨，不再自动跳回原播放位置。', style: TextStyle(color: Color(0xFFBDAAB5))),
         ]))),
         const SizedBox(height: 12),
-        const Text('七轨兼容混音', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+        const Text('六轨基础 + 电吉他二次分离混音', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
         Card(child: Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Column(children: [
           for (final entry in levels.entries)
