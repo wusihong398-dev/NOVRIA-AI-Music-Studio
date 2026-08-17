@@ -97,6 +97,35 @@ def _embedded_lyrics(path: Path) -> str:
     return ""
 
 
+def load_synced_lyrics(path: str | Path, duration: float = 0) -> list[dict]:
+    audio_path = Path(path)
+    text = ""
+    for candidate in (audio_path.with_suffix(".lrc"), audio_path.parent / f"{audio_path.stem}.LRC"):
+        if not candidate.is_file():
+            continue
+        for encoding in ("utf-8-sig", "gb18030", "big5"):
+            try:
+                text = candidate.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text:
+            break
+    if not text:
+        text = _embedded_lyrics(audio_path)
+    if not text.strip():
+        return []
+    rows = _parse_lrc(text)
+    if not rows:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        step = max(2.0, float(duration or len(lines) * 4) / max(1, len(lines)))
+        rows = [{"start": round(index * step, 3), "text": line} for index, line in enumerate(lines)]
+    for index, row in enumerate(rows):
+        next_start = rows[index + 1]["start"] if index + 1 < len(rows) else max(float(duration), row["start"] + 4)
+        row["end"] = round(max(row["start"] + .2, next_start), 3)
+    return rows
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     """Persist JSON without leaving a half-written recovery file after a crash."""
 
