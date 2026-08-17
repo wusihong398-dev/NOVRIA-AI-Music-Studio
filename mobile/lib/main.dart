@@ -249,6 +249,12 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<Map<String, dynamic>> importPublicLink(String url) async {
+    if (serverBase.isEmpty) throw const FormatException('请先配置 AI 服务器地址');
+    final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
+    return client.importLink(url.trim());
+  }
+
   Future<PipelineJob> addLibrarySong(LibrarySong song) async {
     final existing = jobs.where((job) => job.libraryId == song.id);
     if (existing.isNotEmpty) return existing.first;
