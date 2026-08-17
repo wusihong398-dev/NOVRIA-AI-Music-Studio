@@ -126,6 +126,59 @@ def load_synced_lyrics(path: str | Path, duration: float = 0) -> list[dict]:
     return rows
 
 
+def split_guitar_stem(stem_dir: str | Path) -> dict:
+    """Split the six-stem model's combined guitar into aligned acoustic/electric files."""
+    import shutil
+    import librosa
+    import numpy as np
+    import soundfile as sf
+
+    def percentile_scale(values):
+        low, high = np.percentile(values, (10, 90))
+        if high - low < 1e-8:
+            return np.full_like(values, 0.5, dtype=np.float32)
+        return np.clip((values - low) / (high - low), 0, 1).astype(np.float32)
+
+    folder = Path(stem_dir)
+    guitar = folder / "guitar.wav"
+    if not guitar.is_file():
+        raise FileNotFoundError(f"缺少基础吉他轨：{guitar}")
+    combined = folder / "guitar_combined.wav"
+    if not combined.exists():
+        shutil.copy2(guitar, combined)
+    audio, sample_rate = sf.read(str(combined), always_2d=True, dtype="float32")
+    if not len(audio):
+        raise RuntimeError("基础吉他轨为空")
+
+    acoustic_channels, electric_channels, frame_scores = [], [], []
+    n_fft, hop = 2048, 512
+    for channel in audio.T:
+        spectrum = librosa.stft(channel, n_fft=n_fft, hop_length=hop, center=True)
+        magnitude = np.abs(spectrum) + 1e-9
+        frequencies = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
+        flatness = librosa.feature.spectral_flatness(S=magnitude)[0]
+        centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sample_rate)[0]
+        high = magnitude[frequencies >= 1800].sum(axis=0) / magnitude.sum(axis=0)
+        electric_time = 0.42 * percentile_scale(flatness) + 0.33 * percentile_scale(centroid) + 0.25 * percentile_scale(high)
+        electric_time = np.convolve(electric_time, np.ones(9) / 9, mode="same")
+        frame_scores.append(float(np.mean(electric_time)))
+        frequency_prior = 0.35 + 0.65 / (1 + np.exp(-(frequencies - 900) / 650))
+        mask = np.clip(0.10 + 0.72 * frequency_prior[:, None] * electric_time[None, :], 0.08, 0.82)
+        electric = librosa.istft(spectrum * mask, hop_length=hop, length=len(channel))
+        electric_channels.append(electric.astype(np.float32))
+        acoustic_channels.append((channel - electric).astype(np.float32))
+    sf.write(str(guitar), np.column_stack(acoustic_channels), sample_rate, subtype="PCM_24")
+    sf.write(str(folder / "electric_guitar.wav"), np.column_stack(electric_channels), sample_rate, subtype="PCM_24")
+    diagnostics = {
+        "method": "spectral-soft-mask-v1", "base_model": "htdemucs_6s",
+        "sample_rate": int(sample_rate), "duration": float(len(audio) / sample_rate),
+        "electric_activity": round(float(np.mean(frame_scores)), 4),
+        "outputs": ["guitar.wav", "electric_guitar.wav", "guitar_combined.wav"],
+    }
+    (folder / "guitar_second_stage.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return diagnostics
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     """Persist JSON without leaving a half-written recovery file after a crash."""
 
