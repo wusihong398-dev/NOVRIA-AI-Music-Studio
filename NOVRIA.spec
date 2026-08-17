@@ -19,6 +19,15 @@ _common_hidden = _hidden + [
     'demucs.separate', 'demucs.pretrained', 'demucs.apply', 'demucs.api',
 ]
 
+_windows_manifest = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>'''
+
 analysis = Analysis(
     ['app/launcher.py'],
     pathex=['.'],
@@ -33,6 +42,7 @@ exe = EXE(
     name='Juweier-Music', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=False, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
+    manifest=_windows_manifest,
 )
 
 worker_analysis = Analysis(
@@ -49,6 +59,7 @@ worker_exe = EXE(
     name='Juweier-Separation-Worker', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
+    manifest=_windows_manifest,
 )
 
 coll = COLLECT(
