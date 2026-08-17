@@ -4570,6 +4570,7 @@ class MainWindow(QMainWindow):
         self.ab_frame = 0
         self.soundfont_path = ""
         self.melody_reference = []
+        self.lyric_reference = []
         self.worker = None
         self.engine = MultiStemEngine()
         self.metronome_engine = MetronomeEngine()
@@ -4617,7 +4618,7 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("统一音乐导入","import"),
             ("音乐库","projects"),
-            ("AI 七轨分离","split"),
+            ("AI 六轨+电吉他","split"),
             ("AI 改编 / 乐谱","arrange"),
             ("演出谱面","arrange"),
             ("乐手演奏中心","live"),
@@ -4694,6 +4695,7 @@ class MainWindow(QMainWindow):
         self.stem_dir=None
         self.engine.close()
         self.studio.file_label.setText(p.name)
+        self._load_song_lyrics(p)
         if hasattr(self,"arrangement"):
             self.arrangement.song_label.setText(p.name)
             self.arrangement.analysis_status.setText("已从统一导入中心载入，等待分析")
@@ -4716,11 +4718,12 @@ class MainWindow(QMainWindow):
             self.midi_worker.wait(700)
         self.engine.close()
         self.studio.file_label.setText(Path(p).name)
+        self._load_song_lyrics(Path(p))
         if hasattr(self, "arrangement"):
             self.arrangement.song_label.setText(Path(p).name)
             self.arrangement.analysis_status.setText("已导入歌曲，等待和弦/乐谱分析")
         self.load_live_preset_file()
-        self.studio.log.setText("歌曲已导入。点击“AI 七轨兼容分离”。")
+        self.studio.log.setText("歌曲已导入。点击“AI 六轨分离 + 电吉他二次分离”。")
         self.studio.model_progress.setValue(0)
         self.studio.split_progress.setValue(0)
         self.studio.model_status.setText("等待检测 AI 模型")
@@ -4738,7 +4741,7 @@ class MainWindow(QMainWindow):
         self.studio.split_progress.setRange(0, 100)
         self.studio.model_progress.setValue(0)
         self.studio.split_progress.setValue(0)
-        self.studio.log.setText("正在准备 AI 模型与七轨兼容分离...")
+        self.studio.log.setText("正在准备 AI 六轨模型与电吉他二次分离...")
         self.worker = SeparationWorker(self.song_file)
         self.worker.log.connect(self.on_split_log)
         self.worker.model_progress.connect(self.on_model_progress)
@@ -4764,6 +4767,7 @@ class MainWindow(QMainWindow):
         self.studio.split_status.setText("基础六轨完成 · 电吉他轨按识别结果载入")
         self.studio.btn_split.setEnabled(True)
         self.stem_dir = Path(stem_dir)
+        self.base_stem_dir = Path(stem_dir)
         try:
             self.engine.load(self.stem_dir)
             self.load_waveform_if_ready()
@@ -4869,7 +4873,8 @@ class MainWindow(QMainWindow):
             row.mute.setChecked(key == muted_key if muted_key else False)
         self.sync_mix_controls()
         names = {
-            "guitar":"吉他弹唱（吉他轨关闭）",
+            "guitar":"木吉他演奏（木吉他轨关闭）",
+            "electric_guitar":"电吉他演奏（电吉他轨关闭）",
             "piano":"钢琴弹唱（钢琴轨关闭）",
             "drums":"鼓手演出（鼓轨关闭）",
             "bass":"贝斯演出（贝斯轨关闭）",
@@ -4877,6 +4882,15 @@ class MainWindow(QMainWindow):
             None:"全部恢复"
         }
         self.live.status.setText("当前预设：" + names[muted_key])
+
+    def apply_live_transpose(self):
+        if not hasattr(self,"live_pro"):
+            return
+        if not self.base_stem_dir and self.stem_dir:
+            self.base_stem_dir=Path(self.stem_dir)
+        if hasattr(self,"arrangement"):
+            self.arrangement.transpose.setValue(int(self.live_pro.transpose.value()))
+        self.generate_transposed_stems()
 
 
     def start_midi_worker(self):
@@ -4913,6 +4927,7 @@ class MainWindow(QMainWindow):
         self.setlist.select_index(target)
         item = self.setlist.items[target]
         self.song_file = item["path"]
+        self._load_song_lyrics(Path(self.song_file))
         self.studio.file_label.setText(Path(self.song_file).name)
 
         # 优先复用已经存在的六轨目录。
@@ -5016,6 +5031,7 @@ class MainWindow(QMainWindow):
             self.arrangement.analysis_status.setText("正在读取音频并检测节拍...")
             QApplication.processEvents()
             y, sr = librosa.load(self.song_file, sr=22050, mono=True)
+            self._load_song_lyrics(Path(self.song_file), float(librosa.get_duration(y=y,sr=sr)))
             tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
             tempo_val = float(np.asarray(tempo).reshape(-1)[0])
             beat_times = librosa.frames_to_time(beat_frames, sr=sr)
@@ -5101,6 +5117,11 @@ class MainWindow(QMainWindow):
                 row["section"]=sec or "段落 1"
             self.chord_timeline=rows
 
+            self.arrangement.progress.setValue(78)
+            self.arrangement.analysis_status.setText("正在生成主旋律五线谱、六线谱与歌词同步数据...")
+            QApplication.processEvents()
+            self.melody_reference=self._extract_melody_reference(y,sr)
+
             self.arrangement.chord_table.setRowCount(len(rows))
             for r,row in enumerate(rows):
                 values=[str(row["bar"]),self._format_time(row["seconds"]),"  ".join(row["chords"]),row["section"]]
@@ -5120,12 +5141,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,"乐谱分析失败",str(e))
 
     def generate_transposed_stems(self):
-        if not self.stem_dir or not Path(self.stem_dir).exists():
+        source_dir=Path(self.base_stem_dir or self.stem_dir) if (self.base_stem_dir or self.stem_dir) else None
+        if not source_dir or not source_dir.exists():
             QMessageBox.warning(self,"提示","请先完成六轨分离。")
             return
         semis=int(self.arrangement.transpose.value())
         if semis == 0:
-            QMessageBox.information(self,"提示","当前为原调，无需生成。")
+            self.stem_dir=source_dir
+            self.engine.load(source_dir)
+            self.engine.set_speed(self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0)
+            self.load_waveform_if_ready()
+            self.sync_mix_controls()
+            QMessageBox.information(self,"恢复原调",f"已恢复原调分轨：\n{source_dir}")
             return
         try:
             import librosa
@@ -5137,7 +5164,7 @@ class MainWindow(QMainWindow):
             for idx,key in enumerate(stems):
                 self.arrangement.progress.setValue(int(idx/len(stems)*90))
                 QApplication.processEvents()
-                src=Path(self.stem_dir)/f"{key}.wav"
+                src=source_dir/f"{key}.wav"
                 if not src.is_file():
                     continue
                 data,sr=sf.read(str(src),dtype="float32",always_2d=True)
@@ -5149,6 +5176,7 @@ class MainWindow(QMainWindow):
             self.arrangement.progress.setValue(100)
             self.stem_dir=out_dir
             self.engine.load(out_dir)
+            self.engine.set_speed(self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0)
             self.load_waveform_if_ready()
             self.sync_mix_controls()
             QMessageBox.information(self,"升降调完成",f"已生成 {semis:+d} 半音演出版并载入：\n{out_dir}")
