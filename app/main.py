@@ -11,6 +11,7 @@ import os
 import subprocess
 import webbrowser
 import html
+import re
 import queue
 import wave
 import math
@@ -24,6 +25,8 @@ from app.project_utils import (
     repair_text,
     safe_file_stem,
     unique_import_candidates,
+    load_synced_lyrics,
+    split_guitar_stem,
 )
 from app.library_catalog import (
     AUDIO_EXTENSIONS,
@@ -32,22 +35,24 @@ from app.library_catalog import (
     ensure_library_layout,
     list_catalog,
     scan_catalog,
+    scan_catalog_roots,
+    download_public_audio,
 )
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from PySide6.QtCore import QFileInfo, Qt, QSize, QThread, Signal, QTimer
+from PySide6.QtCore import QFileInfo, Qt, QSize, QThread, Signal, QTimer, QPointF, QRectF
 from PySide6.QtGui import QPainter, QPen, QColor, QCloseEvent, QIcon, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QSlider, QGroupBox, QMessageBox, QProgressBar,
-    QListWidget, QListWidgetItem, QStackedWidget, QGridLayout, QDialogButtonBox, QTableWidget, QTableWidgetItem, QTabWidget, QRadioButton, QFileSystemModel, QTreeWidgetItem, QTreeWidget, QPlainTextEdit, QButtonGroup, QTextBrowser, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox
+    QListWidget, QListWidgetItem, QStackedWidget, QGridLayout, QDialogButtonBox, QTableWidget, QTableWidgetItem, QTabWidget, QRadioButton, QFileSystemModel, QTreeWidgetItem, QTreeWidget, QPlainTextEdit, QButtonGroup, QTextBrowser, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox, QInputDialog
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -142,7 +147,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/3.0.0"}
+            headers={"User-Agent": "Juweier-Music/3.2.0"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -240,8 +245,13 @@ class SeparationWorker(QThread):
             if missing:
                 raise RuntimeError("分轨结果缺少：" + ", ".join(missing))
 
-            self.separation_progress.emit(100, "六轨分离完成")
-            self.log.emit("AI 六轨分离完成，可以进入现场演出模式。")
+            self.separation_progress.emit(97, "正在二次识别木吉他与电吉他...")
+            guitar_diagnostics = split_guitar_stem(stem_dir)
+            self.separation_progress.emit(100, "六轨基础分离 + 电吉他二次分离完成")
+            self.log.emit(
+                "AI 六轨模型处理完成；已从吉他轨生成独立木吉他与电吉他轨。"
+                f" 电吉他活跃度 {guitar_diagnostics['electric_activity']:.0%}。"
+            )
             self.done.emit(str(stem_dir))
         except Exception as e:
             self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
@@ -265,6 +275,28 @@ class PipelineStageWorker(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
 
 
+class LinkDownloadWorker(QThread):
+    progress = Signal(int, str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url, destination, ffmpeg_path=""):
+        super().__init__()
+        self.url = str(url).strip()
+        self.destination = Path(destination)
+        self.ffmpeg_path = str(ffmpeg_path or "")
+
+    def run(self):
+        try:
+            path = download_public_audio(
+                self.url, self.destination, self.ffmpeg_path,
+                lambda value, text: self.progress.emit(int(value), str(text)),
+            )
+            self.done.emit(str(path))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class MultiStemEngine:
     def __init__(self):
         self.files = {}
@@ -278,6 +310,7 @@ class MultiStemEngine:
         self.volume = {k: 0.9 for k, _, _ in STEM_ORDER}
         self.frames_played = 0
         self.total_frames = 0
+        self.speed = 1.0
         self._io_lock = threading.RLock()
 
     def load(self, stem_dir: Path):
