@@ -10,7 +10,16 @@ from app.project_utils import (
     repair_text,
     safe_file_stem,
     unique_import_candidates,
+    load_synced_lyrics,
 )
+
+try:
+    import numpy as np
+    import soundfile as sf
+    from app.project_utils import split_guitar_stem
+    HAS_AUDIO_STACK = True
+except ImportError:
+    HAS_AUDIO_STACK = False
 
 
 class ProjectUtilsTests(unittest.TestCase):
