@@ -3,7 +3,7 @@ name: Build Juweier Music Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "agent/build-juweier-v2.1.7-windows" ]
+    branches: [ "main", "agent/juweier-v3.0.0" ]
     paths:
       - "app/**"
       - "assets/**"
@@ -40,7 +40,7 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
 
-      - name: Verify v2.1.7 stable pipeline EXE
+      - name: Verify v3.0.0 complete pipeline EXE
         shell: powershell
         run: |
           $root = "dist\Juweier-Music"
@@ -53,7 +53,7 @@ jobs:
 
           # Keep verification ASCII-only so Windows PowerShell code pages cannot corrupt Chinese UI text.
           $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
-          if ($launcher -notmatch 'VERSION\s*=\s*"2\.1\.7"') { throw "v2.1.7 launcher not found" }
+          if ($launcher -notmatch 'VERSION\s*=\s*"3\.0\.0"') { throw "v3.0.0 launcher not found" }
           if ($launcher -notmatch 'def install_live_transpose_controls') { throw "Live transpose controls patch missing" }
           if ($launcher -notmatch 'def _recommended_capo') { throw "Capo sync patch missing" }
           if ($launcher -notmatch 'change\(-1\)') { throw "Transpose-down action missing" }
@@ -67,12 +67,12 @@ jobs:
       - name: Package Windows build
         shell: powershell
         run: |
-          Compress-Archive -Path "dist\Juweier-Music\*" -DestinationPath "Juweier_Music_v2.1.7_Windows_x64.zip" -Force
+          Compress-Archive -Path "dist\Juweier-Music\*" -DestinationPath "Juweier_Music_v3.0.0_Windows_x64.zip" -Force
 
-      - name: Upload v2.1.7 Windows artifact
+      - name: Upload v3.0.0 Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v2.1.7-Windows-x64
-          path: Juweier_Music_v2.1.7_Windows_x64.zip
+          name: Juweier-Music-v3.0.0-Windows-x64
+          path: Juweier_Music_v3.0.0_Windows_x64.zip
           if-no-files-found: error
           retention-days: 30
