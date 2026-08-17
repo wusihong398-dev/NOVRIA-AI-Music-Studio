@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.0.
+"""Mobile API companion for 橘味儿音乐 v3.2.1.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 from app.project_utils import atomic_write_json, safe_file_stem, load_synced_lyrics
 from app.library_catalog import (
+    catalog_artist_name,
     catalog_track,
     connect_catalog,
     default_library_root,
@@ -43,7 +44,7 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -407,11 +408,13 @@ def _queue_job(
 
 @app.get("/api/v1/library")
 def library(
-    request: Request, q: str = "", category: str = "全部", limit: int = 500,
+    request: Request, q: str = "", category: str = "全部", limit: int = 100000,
     _: None = Depends(authorize),
 ) -> dict:
     songs = list_catalog(LIBRARY_DB, q, category, limit)
     for song in songs:
+        song["metadata_artist"] = song.get("artist") or "未知歌手"
+        song["artist"] = catalog_artist_name(song)
         track_id = int(song["id"])
         song.pop("source_path", None)
         song.pop("working_path", None)
@@ -433,7 +436,7 @@ def library(
 @app.post("/api/v1/library/scan")
 def scan_library(_: None = Depends(authorize)) -> dict:
     result = scan_catalog_roots(
-        [LIBRARY_PATHS["originals"], LIBRARY_PATHS["temp"]],
+        [LIBRARY_PATHS["originals"], LIBRARY_PATHS["link_imports"]],
         LIBRARY_DB, LIBRARY_PATHS["covers"],
     )
     return {**result, "root": str(LIBRARY_PATHS["root"])}
