@@ -502,6 +502,9 @@ class ApiClient {
         {'arrangement_mode': job.arrangementMode, 'transpose': job.semitones, 'output': 'wav_mp3'},
       );
 
+  Future<Map<String, dynamic>> importLink(String url) =>
+      postJson('/api/v1/library/import-url', {'url': url});
+
   Future<Map<String, dynamic>> getJson(String path) => _jsonRequest('GET', path);
 
   Future<Map<String, dynamic>> postJson(String path, Map<String, dynamic> payload) =>
