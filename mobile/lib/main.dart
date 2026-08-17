@@ -810,27 +810,34 @@ class _LibraryPageState extends State<LibraryPage> {
               ? EmptyState(icon: Icons.library_music, title: '服务器歌曲库暂无结果', detail: '把歌曲放进 G:\\JuweierMusicLibrary\\01_Originals，再在 Windows 端扫描；也可直接导入手机文件。', action: widget.onImport)
               : ListView.builder(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                  itemCount: widget.store.catalog.length,
+                  itemCount: artists.length,
                   itemBuilder: (context, i) {
-                    final song = widget.store.catalog[i];
-                    return Card(child: ListTile(
-                      leading: const CircleAvatar(backgroundColor: Color(0xFF432B39), child: Icon(Icons.music_note, color: accent)),
-                      title: Text(song.title), subtitle: Text('${song.artist} · ${song.category}'),
-                      trailing: FilledButton.tonal(onPressed: () async {
-                        final job = await widget.store.addLibrarySong(song);
-                        await widget.store.startJob(job);
-                      }, child: const Text('AI处理')),
+                    final group = artists[i];
+                    return Card(child: ExpansionTile(
+                      initiallyExpanded: i < 3,
+                      leading: const CircleAvatar(backgroundColor: Color(0xFF432B39), child: Icon(Icons.person, color: accent)),
+                      title: Text(group.key, style: const TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: Text('${group.value.length} 首歌曲'),
+                      children: [for (final song in group.value) ListTile(
+                        leading: const Icon(Icons.music_note, color: orangeSoft),
+                        title: Text(song.title), subtitle: Text(song.category),
+                        trailing: FilledButton.tonal(onPressed: () async {
+                          final job = await widget.store.addLibrarySong(song);
+                          await widget.store.startJob(job);
+                        }, child: const Text('AI处理')),
+                      )],
                     ));
                   },
                 ),
         ),
       ]);
+  }
 }
 
 class PipelinePage extends StatelessWidget {
   const PipelinePage({super.key, required this.store});
   final AppStore store;
-  static const stages = ['读取', '七轨', '分析', '和弦', '乐谱', '改编', '渲染', '入库'];
+  static const stages = ['读取', '六轨+电吉他', '分析', '和弦', '乐谱', '改编', '渲染', '入库'];
 
   @override
   Widget build(BuildContext context) => Column(children: [
