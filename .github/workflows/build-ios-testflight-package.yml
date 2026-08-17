@@ -36,10 +36,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
-          podfile = Path('ios/Podfile')
-          text = podfile.read_text()
-          text = re.sub(r"#?\s*platform :ios, '[^']+'", "platform :ios, '14.0'", text, count=1)
-          podfile.write_text(text)
           project = Path('ios/Runner.xcodeproj/project.pbxproj')
           text = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 14.0;', project.read_text())
           project.write_text(text)
