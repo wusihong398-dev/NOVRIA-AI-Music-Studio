@@ -5190,6 +5190,38 @@ class MainWindow(QMainWindow):
             out.append({**row,"chords":[self._transpose_chord(c,semis) for c in row.get("chords",[])]})
         return out
 
+    def _load_song_lyrics(self,path,duration=0):
+        try:
+            self.lyric_reference=load_synced_lyrics(path,duration)
+        except Exception:
+            self.lyric_reference=[]
+
+    def _extract_melody_reference(self,y,sr):
+        import librosa
+        f0,voiced_flag,_=librosa.pyin(
+            y,fmin=librosa.note_to_hz("C2"),fmax=librosa.note_to_hz("C7"),
+            sr=sr,frame_length=2048,hop_length=512,
+        )
+        times=librosa.times_like(f0,sr=sr,hop_length=512)
+        refs=[]
+        current_midi=None
+        start_index=0
+        for index,(hz,voiced) in enumerate(zip(f0,voiced_flag)):
+            midi=int(round(float(librosa.hz_to_midi(hz)))) if voiced and hz is not None and np.isfinite(hz) else None
+            if midi!=current_midi:
+                if current_midi is not None and index>start_index:
+                    start=float(times[start_index])
+                    end=float(times[index-1]+512/sr)
+                    if end-start>=0.08:
+                        refs.append({"start":start,"end":end,"midi":current_midi,"note":librosa.midi_to_note(current_midi,octave=True,cents=False)})
+                current_midi=midi
+                start_index=index
+        if current_midi is not None and len(times)>start_index:
+            start=float(times[start_index]); end=float(times[-1]+512/sr)
+            if end-start>=0.08:
+                refs.append({"start":start,"end":end,"midi":current_midi,"note":librosa.midi_to_note(current_midi,octave=True,cents=False)})
+        return refs[:4000]
+
     def _make_score_html(self, title, instrument="lead"):
         rows=self._score_rows_transposed()
         bpm=self.analysis_result.get("bpm","—")
@@ -6629,23 +6661,7 @@ class MainWindow(QMainWindow):
         try:
             import librosa
             y,sr=librosa.load(self.song_file,sr=22050,mono=True)
-            f0, voiced_flag, voiced_prob = librosa.pyin(
-                y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
-            )
-            times=librosa.times_like(f0,sr=sr)
-            refs=[]
-            last_note=None
-            start=None
-            for t,hz,voiced in zip(times,f0,voiced_flag):
-                note=None
-                if voiced and hz is not None and not np.isnan(hz):
-                    midi=int(round(librosa.hz_to_midi(hz)))
-                    note=librosa.midi_to_note(midi, octave=True, cents=False)
-                if note!=last_note:
-                    if last_note is not None and start is not None:
-                        refs.append({"start":float(start),"end":float(t),"note":last_note})
-                    start=float(t) if note else None
-                    last_note=note
+            refs=self._extract_melody_reference(y,sr)
             self.melody_reference=refs
             song=Path(self.song_file).stem
             p,_=QFileDialog.getSaveFileName(
