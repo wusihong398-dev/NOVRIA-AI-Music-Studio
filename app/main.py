@@ -1103,16 +1103,29 @@ class LiveProPage(QWidget):
         self.transpose.setRange(-12,12)
         self.transpose.setValue(0)
         self.transpose.setSuffix(" 半音")
+        self.transpose.valueChanged.connect(self.update_capo_label)
         self.speed = QDoubleSpinBox()
         self.speed.setRange(0.50,1.50)
         self.speed.setSingleStep(0.05)
         self.speed.setValue(1.00)
         self.speed.setSuffix(" x")
+        self.speed.valueChanged.connect(main.engine.set_speed)
+        self.delay_ms = QSpinBox()
+        self.delay_ms.setRange(0,1000)
+        self.delay_ms.setSingleStep(10)
+        self.delay_ms.setSuffix(" ms")
+        self.capo_label=QLabel("推荐变调夹：0 品")
+        apply_transpose=QPushButton("应用变调到全部音轨")
+        apply_transpose.clicked.connect(main.apply_live_transpose)
         tg.addWidget(QLabel("升降调"),0,0)
         tg.addWidget(self.transpose,0,1)
         tg.addWidget(QLabel("速度"),1,0)
         tg.addWidget(self.speed,1,1)
-        tg.addWidget(QLabel("当前版本保存升降调/速度参数；实时高质量变调/变速 DSP 将在下一阶段接入。"),2,0,1,2)
+        tg.addWidget(QLabel("节拍/谱面延时"),2,0)
+        tg.addWidget(self.delay_ms,2,1)
+        tg.addWidget(self.capo_label,3,0)
+        tg.addWidget(apply_transpose,3,1)
+        tg.addWidget(QLabel("速度实时作用于全部分轨；变调会生成并载入保持同步的新音轨。"),4,0,1,2)
         layout.addWidget(trans)
 
         met = QGroupBox("耳返 / 节拍器")
@@ -1150,6 +1163,11 @@ class LiveProPage(QWidget):
         self.status.setObjectName("StatusGood")
         layout.addWidget(self.status)
         layout.addStretch(1)
+
+    def update_capo_label(self,value):
+        semitones=int(value)
+        capo=semitones if 0 <= semitones <= 7 else 0
+        self.capo_label.setText(f"推荐变调夹：{capo} 品" if capo else "推荐变调夹：0 品/调整和弦指法")
 
     def toggle_lock(self, checked):
         if checked:
