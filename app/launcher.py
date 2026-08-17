@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 
 from app import main as m
 
-VERSION = "2.1.7"
+VERSION = "3.0.0"
 DISPLAY_NAME = "橘味儿音乐"
 
 
