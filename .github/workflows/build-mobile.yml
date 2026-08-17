@@ -92,9 +92,9 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
-      - name: Build iOS simulator app without signing
+      - name: Build iOS simulator validation app
         working-directory: mobile_build
-        run: flutter build ios --simulator --release
+        run: flutter build ios --simulator --debug
       - name: Package iOS simulator app
         shell: bash
         run: |
