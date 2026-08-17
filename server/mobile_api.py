@@ -490,7 +490,7 @@ def _run_job(job_id: str) -> None:
     )
     output_root.mkdir(parents=True, exist_ok=True)
     try:
-        _update(job_id, status="processing", stage="准备七轨兼容模型", progress=7)
+        _update(job_id, status="processing", stage="准备六轨模型与电吉他二次分离", progress=7)
         command = [
             sys.executable,
             "-m",
