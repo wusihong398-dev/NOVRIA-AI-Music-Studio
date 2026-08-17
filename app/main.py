@@ -1626,6 +1626,9 @@ class ScorePerformancePage(QWidget):
         self.now.setObjectName("StatusGood")
         layout.addWidget(self.now)
 
+        self.canvas=DesktopScoreCanvas(main)
+        layout.addWidget(self.canvas)
+
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(False)
         layout.addWidget(self.browser, 1)
@@ -1657,10 +1660,15 @@ class ScorePerformancePage(QWidget):
         mode=self.score_type.currentText()
         font="24px" if self.big_mode.isChecked() else "16px"
         blocks=[]
-        for row in rows:
+        for row_index,row in enumerate(rows):
             chord=" / ".join(row.get("chords") or ["N"])
             extra=""
             notes=[n for n in getattr(self.main,"melody_reference",[]) if row["seconds"] <= float(n.get("start",n.get("seconds",0))) < row["seconds"]+12]
+            next_seconds=rows[row_index+1]["seconds"] if row_index+1<len(rows) else row["seconds"]+12
+            lyric_lines=[
+                str(item.get("text","")) for item in getattr(self.main,"lyric_reference",[])
+                if row["seconds"] <= float(item.get("start",0)) < next_seconds
+            ]
             if mode=="五线谱":
                 pitches="  ".join(html.escape(str(n.get("note",""))) for n in notes[:16]) or "请点击“主旋律参考转写”生成实际音符"
                 extra=f"<div class='staff'><div>𝄞 ─────────────────────────</div><div>　──────── {pitches} ────────</div><div>　─────────────────────────</div><div>　─────────────────────────</div><div>　─────────────────────────</div></div>"
@@ -1690,6 +1698,8 @@ class ScorePerformancePage(QWidget):
                 extra="<div class='tab'>HH x-x-x-x-x-x-x-x-<br>SD ----o-------o---<br>BD o-------o-------</div>"
             elif mode=="键盘谱":
                 extra="<div class='hint'>左手：根音/五度 · 右手：和弦转位/分解</div>"
+            if lyric_lines:
+                extra += "<div class='lyrics'>"+"<br>".join(html.escape(line) for line in lyric_lines)+"</div>"
             blocks.append(
                 f"<div id='bar{row['bar']}' class='bar'>"
                 f"<div class='sec'>{html.escape(row.get('section',''))}</div>"
@@ -1704,10 +1714,12 @@ class ScorePerformancePage(QWidget):
         .tab{{font-family:Consolas,monospace;color:#f4c04c;font-size:0.75em}}
         .staff{{font-family:'Segoe UI Symbol',Consolas,monospace;color:#f4c04c;font-size:0.72em;line-height:1.0}}
         .hint{{color:#b8c4dc;font-size:0.72em}}
+        .lyrics{{color:#fff;font-size:0.9em;text-align:center;margin-top:12px;padding:8px;background:#251721;border-radius:8px}}
         .active{{border:2px solid #8b6cff;background:#21194a}}
         </style><body>{''.join(blocks)}</body></html>"""
 
     def refresh_score(self):
+        self.canvas.set_mode(self.score_type.currentText())
         self.browser.setHtml(self._html())
 
     def follow_playback(self):
@@ -1716,7 +1728,9 @@ class ScorePerformancePage(QWidget):
         rows=getattr(self.main,"chord_timeline",[])
         if not rows:
             return
-        pos=self.main.engine.position_seconds()
+        delay=(self.main.live_pro.delay_ms.value()/1000 if hasattr(self.main,"live_pro") else 0)
+        pos=max(0,self.main.engine.position_seconds()-delay)
+        self.canvas.set_position(pos)
         current=rows[0]["bar"]
         for row in rows:
             if pos >= row["seconds"]:
@@ -1725,7 +1739,13 @@ class ScorePerformancePage(QWidget):
                 break
         if current != self.current_bar:
             self.current_bar=current
-            self.now.setText(f"当前小节：{current}")
+            lyric=""
+            for item in getattr(self.main,"lyric_reference",[]):
+                if pos >= float(item.get("start",0)):
+                    lyric=str(item.get("text",""))
+                else:
+                    break
+            self.now.setText(f"当前小节：{current}" + (f"　歌词：{lyric}" if lyric else ""))
             self.browser.scrollToAnchor(f"bar{current}")
 
 
@@ -1835,7 +1855,8 @@ class InstrumentExperiencePage(QWidget):
         ql = QHBoxLayout(quick)
         self.instrument_buttons = {}
         items = [
-            ("🎸 吉他手","guitar"),
+            ("🎸 木吉他手","guitar"),
+            ("🎸 电吉他手","electric_guitar"),
             ("🎸 贝斯手","bass"),
             ("🥁 鼓手","drums"),
             ("🎹 键盘手","piano"),
@@ -1850,7 +1871,8 @@ class InstrumentExperiencePage(QWidget):
         layout.addWidget(quick)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_guitar_tab(), "吉他")
+        self.tabs.addTab(self._build_guitar_tab(), "木吉他")
+        self.tabs.addTab(self._build_electric_guitar_tab(), "电吉他")
         self.tabs.addTab(self._build_bass_tab(), "贝斯")
         self.tabs.addTab(self._build_drums_tab(), "鼓")
         self.tabs.addTab(self._build_piano_tab(), "键盘")
