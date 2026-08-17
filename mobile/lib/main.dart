@@ -1155,15 +1155,16 @@ class _ScorePreviewState extends State<ScorePreview> {
   Widget build(BuildContext context) => SizedBox(
         height: 180,
         child: CustomPaint(
-          painter: ScorePainter(notes: notes, tablature: widget.tablature, positionSeconds: widget.positionSeconds),
+          painter: ScorePainter(notes: notes, lyrics: lyrics, tablature: widget.tablature, positionSeconds: widget.positionSeconds),
           size: Size.infinite,
         ),
       );
 }
 
 class ScorePainter extends CustomPainter {
-  ScorePainter({required this.notes, required this.tablature, required this.positionSeconds});
+  ScorePainter({required this.notes, required this.lyrics, required this.tablature, required this.positionSeconds});
   final List<Map<String, dynamic>> notes;
+  final List<Map<String, dynamic>> lyrics;
   final bool tablature;
   final double positionSeconds;
 
