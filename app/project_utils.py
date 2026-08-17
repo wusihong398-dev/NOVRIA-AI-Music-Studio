@@ -108,3 +108,5 @@ def unique_import_candidates(
         candidates.append((fingerprint, str(path), str(path), path.stat().st_mtime))
 
     return candidates
+
+# v3.2 sync marker
