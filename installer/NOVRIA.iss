@@ -17,7 +17,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 
 [Files]
-Source: "..\dist\Juweier-Music\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; PyTorch ships thousands of duplicate third-party licence copies in very deep
+; metadata paths. Those exceed the classic Windows path limit during Inno
+; compilation. Keep the package's primary licences and omit only that duplicate
+; subtree; runtime binaries and the portable ZIP remain unchanged.
+Source: "..\dist\Juweier-Music\*"; DestDir: "{app}"; Excludes: "_internal\torch-*.dist-info\licenses\third_party\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
