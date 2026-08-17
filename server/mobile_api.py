@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.1.0.
+"""Mobile API companion for 橘味儿音乐 v3.2.0.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
