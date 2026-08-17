@@ -1,6 +1,6 @@
 {
   "app_name": "橘味儿音乐",
-  "version": "2.1.7",
+  "version": "3.0.0",
   "separation_model": "htdemucs_6s",
   "stems": [
     "vocals",
@@ -35,7 +35,7 @@
   "monitor_metronome_separate_device": true,
   "live_session_autosave": true,
   "live_session_restore": true,
-  "ui_theme": "Juweier Neon Dark",
+  "ui_theme": "Juweier Orange Dark",
   "app_icon": "assets/novria_app_icon.ico",
   "custom_navigation_icons": true,
   "design_reference": [

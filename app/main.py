@@ -14,6 +14,7 @@ import html
 import queue
 import wave
 import math
+import threading
 import time, json, subprocess, traceback, platform, urllib.request, hashlib, io, os
 from pathlib import Path
 
@@ -23,6 +24,14 @@ from app.project_utils import (
     repair_text,
     safe_file_stem,
     unique_import_candidates,
+)
+from app.library_catalog import (
+    AUDIO_EXTENSIONS,
+    connect_catalog,
+    default_library_root,
+    ensure_library_layout,
+    list_catalog,
+    scan_catalog,
 )
 
 import numpy as np
@@ -38,12 +47,13 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "2.1.7"
+VERSION = "3.1.0"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
     ("bass", "🎸", "贝斯 Bass"),
-    ("guitar", "🎸", "吉他 Guitar"),
+    ("guitar", "🎸", "木吉他 A.Guitar"),
+    ("electric_guitar", "🎸", "电吉他 E.Guitar"),
     ("piano", "🎹", "钢琴 Piano"),
     ("other", "🎻", "其他 Other"),
 ]
@@ -132,7 +142,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/2.1.7"}
+            headers={"User-Agent": "Juweier-Music/3.0.0"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -268,6 +278,7 @@ class MultiStemEngine:
         self.volume = {k: 0.9 for k, _, _ in STEM_ORDER}
         self.frames_played = 0
         self.total_frames = 0
+        self._io_lock = threading.RLock()
 
     def load(self, stem_dir: Path):
         self.close()
@@ -275,6 +286,8 @@ class MultiStemEngine:
         for key, _, _ in STEM_ORDER:
             p = stem_dir / f"{key}.wav"
             if not p.exists():
+                if key == "electric_guitar":
+                    continue
                 raise FileNotFoundError(f"缺少音轨：{p.name}")
             paths[key] = p
 
@@ -302,12 +315,13 @@ class MultiStemEngine:
         mix = np.zeros((frames, self.channels), dtype=np.float32)
         valid_frames = frames
 
-        for key, f in self.files.items():
-            data = f.read(frames, dtype="float32", always_2d=True)
-            n = len(data)
-            valid_frames = min(valid_frames, n)
-            if key in active and n:
-                mix[:n] += data * float(self.volume[key])
+        with self._io_lock:
+            for key, f in self.files.items():
+                data = f.read(frames, dtype="float32", always_2d=True)
+                n = len(data)
+                valid_frames = min(valid_frames, n)
+                if key in active and n:
+                    mix[:n] += data * float(self.volume[key])
 
         if valid_frames <= 0:
             outdata.fill(0)
@@ -384,9 +398,10 @@ class MultiStemEngine:
         if not self.files or self.total_frames <= 0:
             return
         pos = int(max(0.0, min(1.0, ratio)) * self.total_frames)
-        for f in self.files.values():
-            f.seek(pos)
-        self.frames_played = pos
+        with self._io_lock:
+            for f in self.files.values():
+                f.seek(pos)
+            self.frames_played = pos
 
     def position_seconds(self):
         return self.frames_played / self.sample_rate if self.sample_rate else 0
@@ -403,7 +418,7 @@ class TrackRow(QWidget):
         layout.setContentsMargins(8, 5, 8, 5)
 
         label = QLabel(f"{icon}  {name}")
-        track_colors = {"vocals":"#B071FF","drums":"#FF8B3D","bass":"#3CA8FF","guitar":"#75E44C","piano":"#35D6D0","other":"#F4C04C"}
+        track_colors = {"vocals":"#B071FF","drums":"#FF8B3D","bass":"#3CA8FF","guitar":"#75E44C","electric_guitar":"#FF5B65","piano":"#35D6D0","other":"#F4C04C"}
         label.setStyleSheet(f"font-weight:700;color:{track_colors.get(key, '#EAF0FF')};")
         label.setMinimumWidth(170)
         self.mute = QPushButton("M")
@@ -439,7 +454,7 @@ class StudioPage(QWidget):
         self.main = main
         layout = QVBoxLayout(self)
 
-        title = QLabel("AI 六轨分离 / 多轨工作台")
+        title = QLabel("AI 七轨兼容分离 / 多轨工作台")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
@@ -447,7 +462,7 @@ class StudioPage(QWidget):
         self.file_label = QLabel("尚未导入歌曲")
         btn_import = QPushButton(QIcon(icon_path("import")), "导入歌曲")
         btn_import.clicked.connect(main.import_song)
-        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 六轨分离")
+        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 七轨兼容分离")
         apply_button_accent(self.btn_split, "primary")
         self.btn_split.clicked.connect(main.start_separation)
         file_row.addWidget(self.file_label, 1)
@@ -464,6 +479,8 @@ class StudioPage(QWidget):
         stop_btn.clicked.connect(main.stop)
         self.timeline = QSlider(Qt.Horizontal)
         self.timeline.setRange(0, 1000)
+        self.timeline.sliderPressed.connect(main.begin_timeline_seek)
+        self.timeline.sliderMoved.connect(main.preview_timeline_seek)
         self.timeline.sliderReleased.connect(main.seek_from_slider)
         self.time_label = QLabel("00:00 / 00:00")
         transport.addWidget(self.play_btn)
@@ -503,7 +520,7 @@ class StudioPage(QWidget):
 
         model_box = QGroupBox("AI 模型")
         model_l = QVBoxLayout(model_box)
-        self.model_status = QLabel("首次使用时会下载 htdemucs_6s 六轨模型")
+        self.model_status = QLabel("首次使用时会下载 htdemucs_6s；电吉他轨支持二次识别结果")
         self.model_progress = QProgressBar()
         self.model_progress.setRange(0, 100)
         self.model_progress.setValue(0)
@@ -512,13 +529,13 @@ class StudioPage(QWidget):
         model_l.addWidget(self.model_progress)
         layout.addWidget(model_box)
 
-        split_box = QGroupBox("六轨分离进度")
+        split_box = QGroupBox("七轨兼容分离进度")
         split_l = QVBoxLayout(split_box)
         self.split_status = QLabel("等待开始")
         self.split_progress = QProgressBar()
         self.split_progress.setRange(0, 100)
         self.split_progress.setValue(0)
-        self.split_progress.setFormat("六轨分离 %p%")
+        self.split_progress.setFormat("分轨处理 %p%")
         split_l.addWidget(self.split_status)
         split_l.addWidget(self.split_progress)
         layout.addWidget(split_box)
@@ -1446,7 +1463,7 @@ class ScorePerformancePage(QWidget):
 
         top = QHBoxLayout()
         self.score_type = QComboBox()
-        self.score_type.addItems(["Lead Sheet","吉他 TAB","贝斯谱","鼓谱","键盘谱"])
+        self.score_type.addItems(["Lead Sheet","五线谱","六线谱","贝斯谱","鼓谱","键盘谱"])
         self.score_type.currentIndexChanged.connect(self.refresh_score)
         self.auto_follow = QCheckBox("跟随播放头自动翻谱")
         self.auto_follow.setChecked(True)
@@ -1501,7 +1518,27 @@ class ScorePerformancePage(QWidget):
         for row in rows:
             chord=" / ".join(row.get("chords") or ["N"])
             extra=""
-            if mode=="吉他 TAB":
+            notes=[n for n in getattr(self.main,"melody_reference",[]) if row["seconds"] <= float(n.get("start",n.get("seconds",0))) < row["seconds"]+12]
+            if mode=="五线谱":
+                pitches="  ".join(html.escape(str(n.get("note",""))) for n in notes[:16]) or "请点击“主旋律参考转写”生成实际音符"
+                extra=f"<div class='staff'><div>𝄞 ─────────────────────────</div><div>　──────── {pitches} ────────</div><div>　─────────────────────────</div><div>　─────────────────────────</div><div>　─────────────────────────</div></div>"
+            elif mode=="六线谱":
+                tuning=[("e",64),("B",59),("G",55),("D",50),("A",45),("E",40)]
+                lanes={name:[] for name,_ in tuning}
+                for note in notes[:16]:
+                    raw=str(note.get("note","C4"))
+                    match=re.match(r"^([A-G])([#b]?)(-?\d+)$",raw)
+                    pitch={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}.get(match.group(1),0) if match else 0
+                    if match and match.group(2)=="#": pitch+=1
+                    if match and match.group(2)=="b": pitch-=1
+                    midi=int(note.get("midi",12*(int(match.group(3))+1)+pitch if match else 60))
+                    choices=[(midi-open_note,name) for name,open_note in tuning if 0<=midi-open_note<=24]
+                    fret,string=min(choices,default=(0,"e"),key=lambda x:x[0])
+                    for name,_ in tuning:
+                        lanes[name].append(str(fret) if name==string else "-")
+                tab="<br>".join(f"{name}|"+"-".join(lanes[name] or ["-"])+"|" for name,_ in tuning)
+                extra=f"<div class='tab'>{tab}</div>"
+            elif mode=="吉他 TAB":
                 first=(row.get("chords") or ["C"])[0]
                 extra=f"<div class='tab'>Chord Shape: {self._tab_for_chord(first)}<br>E A D G B e</div>"
             elif mode=="贝斯谱":
@@ -1523,6 +1560,7 @@ class ScorePerformancePage(QWidget):
         .sec{{color:#8ca0c5;font-size:0.65em}} .num{{color:#6f82a5;font-size:0.6em}}
         .chord{{color:#65e1ce;font-weight:800;font-size:1.35em;margin:8px 0}}
         .tab{{font-family:Consolas,monospace;color:#f4c04c;font-size:0.75em}}
+        .staff{{font-family:'Segoe UI Symbol',Consolas,monospace;color:#f4c04c;font-size:0.72em;line-height:1.0}}
         .hint{{color:#b8c4dc;font-size:0.72em}}
         .active{{border:2px solid #8b6cff;background:#21194a}}
         </style><body>{''.join(blocks)}</body></html>"""
@@ -1824,7 +1862,7 @@ class InstrumentExperiencePage(QWidget):
             b.setChecked(k==key)
         self.main.apply_live_preset(key)
         if hasattr(self.main,"score_performance"):
-            mapping={"guitar":"吉他 TAB","bass":"贝斯谱","drums":"鼓谱","piano":"键盘谱"}
+            mapping={"guitar":"六线谱","bass":"贝斯谱","drums":"鼓谱","piano":"键盘谱"}
             idx=self.main.score_performance.score_type.findText(mapping[key])
             if idx>=0:
                 self.main.score_performance.score_type.setCurrentIndex(idx)
@@ -2278,7 +2316,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/2.1.7"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.0.0"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2355,8 +2393,9 @@ class MusicLibraryPage(QWidget):
     def __init__(self, main):
         super().__init__()
         self.main = main
-        self.db_path = BASE_DIR/"library"/"novria_music_library.sqlite3"
-        self.cover_dir = BASE_DIR/"library"/"covers"
+        self.library_paths = ensure_library_layout(default_library_root())
+        self.db_path = self.library_paths["database"]/"juweier_music_library.sqlite3"
+        self.cover_dir = self.library_paths["covers"]
         self.batch_queue = []
         self.batch_index = -1
         self.batch_worker = None
@@ -2388,15 +2427,15 @@ class MusicLibraryPage(QWidget):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        hint=QLabel("已导入素材按“歌手 → 专辑 → 歌曲”整理，并保存 BPM、调性、封面、音质与六轨状态。")
+        hint=QLabel(f"歌曲目录：{self.library_paths['originals']}。按歌手、榜单和歌曲检索，并保存 BPM、调性、封面、音质与七轨状态。")
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         top=QHBoxLayout()
-        scan=QPushButton("扫描已导入音乐")
+        scan=QPushButton("扫描 G 盘歌曲库")
         analyze=QPushButton("批量 BPM / 调性分析")
-        stems=QPushButton("建立六轨队列")
+        stems=QPushButton("建立七轨兼容队列")
         refresh=QPushButton("刷新音乐库")
         apply_button_accent(scan,"primary")
         scan.clicked.connect(self.scan_imports)
@@ -2407,6 +2446,17 @@ class MusicLibraryPage(QWidget):
             top.addWidget(b)
         top.addStretch(1)
         layout.addLayout(top)
+
+        search_row=QHBoxLayout()
+        self.library_search=QLineEdit()
+        self.library_search.setPlaceholderText("搜索歌曲、歌手或专辑")
+        self.library_category=QComboBox()
+        self.library_category.addItems(["全部","本地导入","抖音流行","酷狗排行榜"])
+        self.library_search.textChanged.connect(self.refresh_library)
+        self.library_category.currentTextChanged.connect(self.refresh_library)
+        search_row.addWidget(self.library_search,1)
+        search_row.addWidget(self.library_category)
+        layout.addLayout(search_row)
 
         batch_box=QGroupBox("批量 AI 处理器")
         bgl=QGridLayout(batch_box)
@@ -2460,7 +2510,7 @@ class MusicLibraryPage(QWidget):
         self.pipeline_output=QComboBox()
         self.pipeline_output.addItems(["WAV","WAV + MP3"])
 
-        self.pipe_stems=QCheckBox("六轨")
+        self.pipe_stems=QCheckBox("七轨兼容")
         self.pipe_analysis=QCheckBox("BPM/调性")
         self.pipe_chords=QCheckBox("和弦/段落")
         self.pipe_score=QCheckBox("乐谱")
@@ -2485,7 +2535,7 @@ class MusicLibraryPage(QWidget):
 
         self.pipeline_table=QTableWidget(0,10)
         self.pipeline_table.setHorizontalHeaderLabels(
-            ["优先级","歌曲","六轨","分析","和弦","乐谱","改编","渲染","入库","状态"]
+            ["优先级","歌曲","七轨","分析","和弦","乐谱","改编","渲染","入库","状态"]
         )
         self.pipeline_table.horizontalHeader().setStretchLastSection(True)
 
@@ -2604,9 +2654,7 @@ class MusicLibraryPage(QWidget):
         self.refresh_pipeline_table()
 
     def _db(self):
-        con=sqlite3.connect(self.db_path)
-        con.row_factory=sqlite3.Row
-        return con
+        return connect_catalog(self.db_path)
 
     def _ensure_db(self):
         self.db_path.parent.mkdir(parents=True,exist_ok=True)
@@ -2757,6 +2805,22 @@ class MusicLibraryPage(QWidget):
         return h.hexdigest()
 
     def scan_imports(self):
+        self.progress.setValue(2)
+        QApplication.processEvents()
+        result=scan_catalog(
+            self.library_paths["originals"], self.db_path, self.cover_dir,
+            lambda i,total,path: (
+                self.progress.setValue(int(i/max(1,total)*95)),
+                QApplication.processEvents(),
+            ),
+        )
+        self.progress.setValue(100)
+        self.refresh_library()
+        QMessageBox.information(
+            self,"歌曲库扫描完成",
+            f"目录：{self.library_paths['originals']}\n新增 {result['added']} 首，更新 {result['updated']} 首，跳过 {result['skipped']} 首，失败 {result['failed']} 首。"
+        )
+        return
         candidates=[]
         fpfile=BASE_DIR/"imports"/"fingerprints.json"
         if fpfile.exists():
@@ -2843,9 +2907,9 @@ class MusicLibraryPage(QWidget):
 
     def refresh_library(self):
         self.tree.clear()
-        con=self._db()
-        rows=con.execute("SELECT * FROM tracks ORDER BY artist,album,title").fetchall()
-        con.close()
+        query=self.library_search.text() if hasattr(self,"library_search") else ""
+        category=self.library_category.currentText() if hasattr(self,"library_category") else "全部"
+        rows=list_catalog(self.db_path,query,category)
         artists={}
         for row in rows:
             artist=row["artist"] or "未知歌手"
@@ -3895,7 +3959,16 @@ class MusicLibraryPage(QWidget):
         sf_path=str(job.get("render_soundfont","") or "")
 
         if not sf_path or not Path(sf_path).exists():
-            raise RuntimeError("未设置 SoundFont。请先在 AI 改编页面选择 SoundFont。")
+            # MIDI 编配已经是可交付成果。SoundFont 是可选的本地音色库，
+            # 未配置时跳过音频渲染，不再让整条 AI 流水线失败。
+            job["artifacts"]["render_notice"] = "未配置 SoundFont，已保留 MIDI 并跳过音频渲染"
+            con=self._db()
+            con.execute(
+                "UPDATE tracks SET render_status='已跳过（未配置 SoundFont）' WHERE id=?",
+                (job["track_id"],),
+            )
+            con.commit();con.close()
+            return
 
         fluidsynth=self.main._find_fluidsynth()
         if not fluidsynth:
@@ -3953,6 +4026,191 @@ class MusicLibraryPage(QWidget):
             self.main.load_imported_working_file(row["working_path"])
 
 
+class CommunityPage(QWidget):
+    """Desktop account and beta community client backed by mobile_api.py."""
+
+    CONFIG_FILE = BASE_DIR / "config" / "community.json"
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.token = ""
+        self.username = ""
+        self.nickname = ""
+
+        root = QVBoxLayout(self)
+        title = QLabel("账号 / 内测群聊")
+        title.setObjectName("PageTitle")
+        root.addWidget(title)
+        hint = QLabel("Windows、Android 与 iOS 使用同一账号和群聊；服务器可填写电脑局域网地址或 Cloudflare HTTPS 域名。")
+        hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        account_box = QGroupBox("橘味儿账号")
+        form = QGridLayout(account_box)
+        self.server_edit = QLineEdit("http://192.168.1.100:8000")
+        self.server_edit.setPlaceholderText("例如 http://电脑IP:8000 或 https://api.example.com")
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("账号（至少 3 位）")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setPlaceholderText("密码（至少 6 位）")
+        self.nickname_edit = QLineEdit()
+        self.nickname_edit.setPlaceholderText("昵称（注册时可选）")
+        login_btn = QPushButton("登录")
+        register_btn = QPushButton("注册")
+        apply_button_accent(login_btn, "primary")
+        login_btn.clicked.connect(lambda: self.authenticate(False))
+        register_btn.clicked.connect(lambda: self.authenticate(True))
+        self.logout_btn = QPushButton("退出登录")
+        self.logout_btn.clicked.connect(self.logout)
+        self.account_status = QLabel("未登录")
+        self.account_status.setObjectName("SectionHint")
+        form.addWidget(QLabel("AI 服务器"), 0, 0)
+        form.addWidget(self.server_edit, 0, 1, 1, 4)
+        form.addWidget(QLabel("账号"), 1, 0)
+        form.addWidget(self.user_edit, 1, 1)
+        form.addWidget(QLabel("密码"), 1, 2)
+        form.addWidget(self.password_edit, 1, 3)
+        form.addWidget(QLabel("昵称"), 2, 0)
+        form.addWidget(self.nickname_edit, 2, 1)
+        form.addWidget(login_btn, 2, 2)
+        form.addWidget(register_btn, 2, 3)
+        form.addWidget(self.logout_btn, 2, 4)
+        form.addWidget(self.account_status, 3, 0, 1, 5)
+        root.addWidget(account_box)
+
+        chat_box = QGroupBox("v3.0 内测群聊")
+        chat_layout = QVBoxLayout(chat_box)
+        self.messages = QTextBrowser()
+        self.messages.setPlaceholderText("登录后可与三端内测用户交流。")
+        chat_layout.addWidget(self.messages, 1)
+        send_row = QHBoxLayout()
+        self.message_edit = QLineEdit()
+        self.message_edit.setPlaceholderText("输入消息，最多 500 字")
+        self.message_edit.returnPressed.connect(self.send_message)
+        refresh_btn = QPushButton("刷新")
+        send_btn = QPushButton("发送")
+        apply_button_accent(send_btn, "primary")
+        refresh_btn.clicked.connect(self.refresh_messages)
+        send_btn.clicked.connect(self.send_message)
+        send_row.addWidget(self.message_edit, 1)
+        send_row.addWidget(refresh_btn)
+        send_row.addWidget(send_btn)
+        chat_layout.addLayout(send_row)
+        root.addWidget(chat_box, 1)
+        self._load_config()
+
+    def _base_url(self):
+        return self.server_edit.text().strip().rstrip("/")
+
+    def _request(self, method, path, payload=None):
+        base = self._base_url()
+        if not base.startswith(("http://", "https://")):
+            raise RuntimeError("服务器地址必须以 http:// 或 https:// 开头")
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(detail) from exc
+        except Exception as exc:
+            raise RuntimeError(f"无法连接服务器：{exc}") from exc
+
+    def _load_config(self):
+        try:
+            data = json.loads(self.CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        self.server_edit.setText(str(data.get("server", self.server_edit.text())))
+        self.token = str(data.get("token", ""))
+        self.username = str(data.get("username", ""))
+        self.nickname = str(data.get("nickname", ""))
+        self.user_edit.setText(self.username)
+        self._update_status()
+        if self.token:
+            QTimer.singleShot(700, self.refresh_messages)
+
+    def _save_config(self):
+        self.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.CONFIG_FILE, {
+            "server": self._base_url(), "token": self.token,
+            "username": self.username, "nickname": self.nickname,
+        })
+
+    def _update_status(self):
+        text = f"已登录：{self.nickname or self.username}（{self.username}）" if self.token else "未登录"
+        self.account_status.setText(text)
+        self.logout_btn.setEnabled(bool(self.token))
+
+    def authenticate(self, register):
+        payload = {
+            "username": self.user_edit.text().strip(),
+            "password": self.password_edit.text(),
+            "nickname": self.nickname_edit.text().strip(),
+        }
+        try:
+            data = self._request("POST", "/api/v1/auth/register" if register else "/api/v1/auth/login", payload)
+            self.token = str(data.get("token", ""))
+            self.username = str(data.get("username", payload["username"]))
+            self.nickname = str(data.get("nickname", self.username))
+            self.password_edit.clear()
+            self._save_config()
+            self._update_status()
+            self.refresh_messages()
+        except Exception as exc:
+            QMessageBox.warning(self, "账号操作失败", str(exc))
+
+    def logout(self):
+        self.token = ""
+        self._save_config()
+        self._update_status()
+        self.messages.clear()
+
+    def refresh_messages(self):
+        if not self.token:
+            return
+        try:
+            data = self._request("GET", "/api/v1/community/messages?limit=100")
+            rows = []
+            for item in data.get("messages", []):
+                stamp = time.strftime("%m-%d %H:%M", time.localtime(float(item.get("created_at", 0))))
+                name = html.escape(str(item.get("nickname") or item.get("username") or "用户"))
+                content = html.escape(str(item.get("content", ""))).replace("\n", "<br>")
+                rows.append(f"<p><b style='color:#FF8A2A'>{name}</b> <span style='color:#A995A6'>{stamp}</span><br>{content}</p>")
+            self.messages.setHtml("".join(rows) or "<p>群里还没有消息，来发第一条吧。</p>")
+            bar = self.messages.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        except Exception as exc:
+            self.account_status.setText(f"群聊刷新失败：{exc}")
+
+    def send_message(self):
+        content = self.message_edit.text().strip()
+        if not self.token:
+            QMessageBox.information(self, "提示", "请先登录账号。")
+            return
+        if not content:
+            return
+        try:
+            self._request("POST", "/api/v1/community/messages", {"content": content[:500]})
+            self.message_edit.clear()
+            self.refresh_messages()
+        except Exception as exc:
+            QMessageBox.warning(self, "发送失败", str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3988,6 +4246,7 @@ class MainWindow(QMainWindow):
         self.midi_worker = None
         self._auto_next_fired = False
         self.is_playing_ui = False
+        self._timeline_dragging = False
 
         central = QWidget()
         root = QHBoxLayout(central)
@@ -4028,7 +4287,7 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("统一音乐导入","import"),
             ("音乐库","projects"),
-            ("AI 六轨分离","split"),
+            ("AI 七轨分离","split"),
             ("AI 改编 / 乐谱","arrange"),
             ("演出谱面","arrange"),
             ("乐手演奏中心","live"),
@@ -4036,6 +4295,7 @@ class MainWindow(QMainWindow):
             ("Setlist 歌单","setlist"),
             ("AI 歌声","voice"),
             ("作品中心","projects"),
+            ("账号 / 内测群聊","projects"),
             ("设置","settings"),
         ]
         for text, ico in nav_items:
@@ -4069,6 +4329,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.setlist)
         self.stack.addWidget(self.voice_lab)
         self.stack.addWidget(Placeholder("作品中心：工程管理继续完善中"))
+        self.community = CommunityPage(self)
+        self.stack.addWidget(self.community)
         self.settings_page = SettingsPage(self)
         self.stack.addWidget(self.settings_page)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
@@ -4128,7 +4390,7 @@ class MainWindow(QMainWindow):
             self.arrangement.song_label.setText(Path(p).name)
             self.arrangement.analysis_status.setText("已导入歌曲，等待和弦/乐谱分析")
         self.load_live_preset_file()
-        self.studio.log.setText("歌曲已导入。点击“AI 六轨分离”。")
+        self.studio.log.setText("歌曲已导入。点击“AI 七轨兼容分离”。")
         self.studio.model_progress.setValue(0)
         self.studio.split_progress.setValue(0)
         self.studio.model_status.setText("等待检测 AI 模型")
@@ -4146,7 +4408,7 @@ class MainWindow(QMainWindow):
         self.studio.split_progress.setRange(0, 100)
         self.studio.model_progress.setValue(0)
         self.studio.split_progress.setValue(0)
-        self.studio.log.setText("正在准备 AI 模型与六轨分离...")
+        self.studio.log.setText("正在准备 AI 模型与七轨兼容分离...")
         self.worker = SeparationWorker(self.song_file)
         self.worker.log.connect(self.on_split_log)
         self.worker.model_progress.connect(self.on_model_progress)
@@ -4169,15 +4431,19 @@ class MainWindow(QMainWindow):
     def on_split_done(self, stem_dir):
         self.studio.model_progress.setValue(100)
         self.studio.split_progress.setValue(100)
-        self.studio.split_status.setText("六轨分离完成")
+        self.studio.split_status.setText("基础六轨完成 · 电吉他轨按识别结果载入")
         self.studio.btn_split.setEnabled(True)
         self.stem_dir = Path(stem_dir)
         try:
             self.engine.load(self.stem_dir)
             self.load_waveform_if_ready()
             self.sync_mix_controls()
-            self.studio.log.setText(f"六轨分离完成：{self.stem_dir}")
-            QMessageBox.information(self, "完成", "AI 六轨分离完成，可以真实 Mute/Solo 和现场播放。")
+            electric = self.stem_dir / "electric_guitar.wav"
+            self.studio.log.setText(
+                f"分轨完成：{self.stem_dir}\n"
+                + ("已载入独立电吉他轨。" if electric.exists() else "电吉他轨等待二次识别，未伪造空音频。")
+            )
+            QMessageBox.information(self, "完成", "AI 分轨完成，可以进行多轨 Mute/Solo 和现场播放。")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
@@ -4226,7 +4492,7 @@ class MainWindow(QMainWindow):
     def update_timeline(self):
         dur = self.engine.duration_seconds()
         pos = self.engine.position_seconds()
-        if dur > 0:
+        if dur > 0 and not self._timeline_dragging:
             self.studio.timeline.blockSignals(True)
             self.studio.timeline.setValue(int(min(1, pos/dur)*1000))
             self.studio.timeline.blockSignals(False)
@@ -4244,10 +4510,28 @@ class MainWindow(QMainWindow):
             self.is_playing_ui = False
             self.studio.play_btn.setText("播放")
 
+    def begin_timeline_seek(self):
+        self._timeline_dragging = True
+
+    def preview_timeline_seek(self, value):
+        self._timeline_dragging = True
+        dur = self.engine.duration_seconds()
+        if dur <= 0:
+            return
+        target = dur * max(0, min(1000, int(value))) / 1000.0
+        def fmt(seconds):
+            seconds = max(0, int(seconds))
+            return f"{seconds//60:02d}:{seconds%60:02d}"
+        self.studio.time_label.setText(f"{fmt(target)} / {fmt(dur)}")
+
     def seek_from_slider(self):
         if not self.engine.files:
+            self._timeline_dragging = False
             return
-        self.engine.seek_ratio(self.studio.timeline.value()/1000.0)
+        ratio = self.studio.timeline.value()/1000.0
+        self.engine.seek_ratio(ratio)
+        self.studio.waveform.set_position(ratio)
+        self._timeline_dragging = False
 
     def apply_live_preset(self, muted_key):
         for key, row in self.studio.rows.items():
@@ -4524,6 +4808,8 @@ class MainWindow(QMainWindow):
                 self.arrangement.progress.setValue(int(idx/len(stems)*90))
                 QApplication.processEvents()
                 src=Path(self.stem_dir)/f"{key}.wav"
+                if not src.is_file():
+                    continue
                 data,sr=sf.read(str(src),dtype="float32",always_2d=True)
                 shifted=[]
                 for ch in range(data.shape[1]):
@@ -6204,7 +6490,10 @@ class MainWindow(QMainWindow):
             for key, _, _ in STEM_ORDER:
                 if key not in active:
                     continue
-                data, this_sr = sf.read(str(self.stem_dir/f"{key}.wav"), dtype="float32", always_2d=True)
+                stem_path=self.stem_dir/f"{key}.wav"
+                if not stem_path.is_file():
+                    continue
+                data, this_sr = sf.read(str(stem_path), dtype="float32", always_2d=True)
                 sr = sr or this_sr
                 stems[key] = data * self.engine.volume[key]
                 max_frames = max(max_frames, len(data))
