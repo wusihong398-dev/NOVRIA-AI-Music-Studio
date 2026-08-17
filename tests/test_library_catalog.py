@@ -3,7 +3,7 @@ import unittest
 import wave
 from pathlib import Path
 
-from app.library_catalog import ensure_library_layout, list_catalog, scan_catalog
+from app.library_catalog import ensure_library_layout, list_catalog, scan_catalog, scan_catalog_roots
 
 
 class LibraryCatalogTests(unittest.TestCase):
