@@ -1001,7 +1001,7 @@ class _SettingsPageState extends State<SettingsPage> {
             Row(children: [
               Expanded(child: FilledButton(onPressed: () async {
                 await widget.store.saveServer(server.text, token.text);
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('服务器设置已保存')));
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('服务器设置已保存')));
               }, child: const Text('保存'))),
               const SizedBox(width: 10),
               Expanded(child: OutlinedButton(onPressed: () async {
