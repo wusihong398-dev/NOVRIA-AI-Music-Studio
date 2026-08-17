@@ -13,7 +13,7 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.1.0"', launcher)
+        self.assertIn('VERSION = "3.2.0"', launcher)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_v3_account_community_and_soundfont_fallback(self):
