@@ -3128,18 +3128,29 @@ class MusicLibraryPage(QWidget):
     def scan_imports(self):
         self.progress.setValue(2)
         QApplication.processEvents()
-        result=scan_catalog(
-            self.library_paths["originals"], self.db_path, self.cover_dir,
+        result=scan_catalog_roots(
+            self.scan_roots, self.db_path, self.cover_dir,
             lambda i,total,path: (
                 self.progress.setValue(int(i/max(1,total)*95)),
+                self.library_scan_status.setText(f"正在扫描 {i}/{total}：{path.name}"),
                 QApplication.processEvents(),
             ),
         )
         self.progress.setValue(100)
         self.refresh_library()
+        roots="\n".join(f"• {root}" for root in result.get("roots",[]))
+        errors="\n".join(result.get("error_samples",[])[:5])
+        self.library_scan_status.setText(
+            f"扫描完成：{result['folders']} 个文件夹，发现 {result['total']} 首；"
+            f"新增 {result['added']}、更新 {result['updated']}、已有 {result['skipped']}、失败 {result['failed']}。"
+        )
         QMessageBox.information(
             self,"歌曲库扫描完成",
-            f"目录：{self.library_paths['originals']}\n新增 {result['added']} 首，更新 {result['updated']} 首，跳过 {result['skipped']} 首，失败 {result['failed']} 首。"
+            f"实际扫描目录：\n{roots}\n\n"
+            f"扫描 {result['folders']} 个文件夹，发现 {result['total']} 个完整音频文件。\n"
+            f"新增 {result['added']} 首，更新 {result['updated']} 首，已有 {result['skipped']} 首，失败 {result['failed']} 首。\n"
+            f"忽略未下载完成文件 {result.get('ignored_partial',0)} 个。"
+            + (f"\n\n目录读取提示：\n{errors}" if errors else "")
         )
         return
         candidates=[]
@@ -3234,30 +3245,27 @@ class MusicLibraryPage(QWidget):
         artists={}
         for row in rows:
             artist=row["artist"] or "未知歌手"
-            album=row["album"] or "未分类专辑"
             if artist not in artists:
                 ai=QTreeWidgetItem([artist,""])
                 ai.setData(0,Qt.UserRole,("artist",artist))
                 self.tree.addTopLevelItem(ai)
-                artists[artist]=(ai,{})
-            ai,albums=artists[artist]
-            if album not in albums:
-                alb=QTreeWidgetItem([album,""])
-                alb.setData(0,Qt.UserRole,("album",artist,album))
-                ai.addChild(alb)
-                albums[album]=alb
+                artists[artist]=ai
+            ai=artists[artist]
             ti=QTreeWidgetItem([
                 row["title"] or Path(row["working_path"]).stem,
-                f'{row["duration"]:.0f}s · {row["quality"]}'
+                f'{row["category"]} · {row["album"] or "未分类专辑"} · {row["duration"]:.0f}s · {row["quality"]}'
             ])
             ti.setData(0,Qt.UserRole,("track",int(row["id"])))
-            albums[album].addChild(ti)
+            ai.addChild(ti)
 
-        for artist,(ai,albums) in artists.items():
-            count=sum(alb.childCount() for alb in albums.values())
-            ai.setText(1,f"{count} 首")
-            for alb in albums.values():
-                alb.setText(1,f"{alb.childCount()} 首")
+        for index,(artist,ai) in enumerate(artists.items()):
+            ai.setText(1,f"{ai.childCount()} 首")
+            if index < 30:
+                ai.setExpanded(True)
+        self.library_scan_status.setText(
+            f"当前显示 {len(artists)} 位歌手、{len(rows)} 首歌曲 · "
+            + "扫描目录："+"；".join(str(item) for item in self.scan_roots)
+        )
 
     def _selected_track_id(self):
         items=self.tree.selectedItems()
@@ -4541,6 +4549,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 760)
         self.song_file = None
         self.stem_dir = None
+        self.base_stem_dir = None
         self.markers = []
         self.analysis_result = {}
         self.chord_timeline = []
