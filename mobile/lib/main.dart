@@ -1094,7 +1094,7 @@ class _PerformancePageState extends State<PerformancePage> {
             ListTile(
               leading: CircleAvatar(backgroundColor: i == 0 ? accent : const Color(0xFF432B39), child: Text('${i + 1}')),
               title: Text(widget.store.jobs[i].fileName, maxLines: 1, overflow: TextOverflow.ellipsis),
-              subtitle: Text(widget.store.jobs[i].isDone ? '七轨兼容与谱面就绪' : widget.store.jobs[i].stage),
+              subtitle: Text(widget.store.jobs[i].isDone ? '六轨、电吉他与谱面就绪' : widget.store.jobs[i].stage),
               trailing: IconButton(onPressed: () => setState(() => selectedId = widget.store.jobs[i].id), icon: const Icon(Icons.play_arrow)),
             ),
         ])),
