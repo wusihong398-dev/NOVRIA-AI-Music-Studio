@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from app.project_utils import atomic_write_json, safe_file_stem
+from app.project_utils import atomic_write_json, safe_file_stem, load_synced_lyrics
 from app.library_catalog import (
     catalog_track,
     connect_catalog,
