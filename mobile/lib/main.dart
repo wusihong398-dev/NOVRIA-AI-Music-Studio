@@ -689,7 +689,7 @@ class DashboardPage extends StatelessWidget {
         const Text('核心能力', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
         const SizedBox(height: 10),
         const Wrap(spacing: 10, runSpacing: 10, children: [
-          FeatureChip(icon: Icons.multitrack_audio, text: 'AI 七轨兼容'),
+          FeatureChip(icon: Icons.multitrack_audio, text: 'AI 六轨+电吉他'),
           FeatureChip(icon: Icons.music_note, text: '自动和弦与段落'),
           FeatureChip(icon: Icons.queue_music, text: '五线谱 / 六线谱'),
           FeatureChip(icon: Icons.tune, text: '升降调与 Capo'),
