@@ -738,6 +738,7 @@ def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) ->
         "title": title, "bpm": analysis.get("bpm", 120), "key": analysis.get("key", "C"),
         "duration": analysis.get("duration", 0), "bars": rows,
         "staff_notes": analysis.get("melody_notes", []), "tab_notes": tab_notes,
+        "lyrics": analysis.get("lyrics", []),
     })
     result["score_data"] = str(score_data)
     return result
