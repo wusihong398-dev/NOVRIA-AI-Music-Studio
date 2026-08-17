@@ -1116,6 +1116,7 @@ class ScorePreview extends StatefulWidget {
 
 class _ScorePreviewState extends State<ScorePreview> {
   List<Map<String, dynamic>> notes = const [];
+  List<Map<String, dynamic>> lyrics = const [];
 
   @override
   void initState() {
