@@ -741,18 +741,68 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  Future<void> importLink() async {
+    final controller = TextEditingController();
+    final url = await showDialog<String>(context: context, builder: (context) => AlertDialog(
+      title: const Text('粘贴分享链接'),
+      content: TextField(
+        controller: controller,
+        minLines: 2,
+        maxLines: 5,
+        decoration: const InputDecoration(
+          hintText: '粘贴公开音频直链或平台公开分享链接',
+          helperText: '不支持需要登录、会员、付费或 DRM 的内容',
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
+        FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('下载并导入')),
+      ],
+    ));
+    controller.dispose();
+    if (url == null || url.isEmpty) return;
+    setState(() => loading = true);
+    try {
+      await widget.store.importPublicLink(url);
+      if (!mounted) return;
+      setState(() => category = '临时歌曲库');
+      await refresh();
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('歌曲已导入服务器临时歌曲库')));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('链接导入失败：$error')));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => Column(children: [
+  Widget build(BuildContext context) {
+    final grouped = <String, List<LibrarySong>>{};
+    for (final song in widget.store.catalog) {
+      grouped.putIfAbsent(song.artist, () => <LibrarySong>[]).add(song);
+    }
+    final artists = grouped.entries.toList();
+    return Column(children: [
         PageHeader(title: '歌曲库', subtitle: '${widget.store.catalog.length} 首服务器歌曲 · ${widget.store.jobs.length} 个任务', action: IconButton(onPressed: widget.onImport, icon: const Icon(Icons.add))),
-        Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 8), child: Row(children: [
+        Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 8), child: Column(children: [
+          Row(children: [
           Expanded(child: TextField(
             controller: search,
             textInputAction: TextInputAction.search,
             onSubmitted: (_) => refresh(),
-            decoration: InputDecoration(hintText: '搜索歌手或歌曲', prefixIcon: const Icon(Icons.search), suffixIcon: IconButton(onPressed: refresh, icon: const Icon(Icons.arrow_forward))),
+            decoration: const InputDecoration(hintText: '搜索歌手、歌曲或专辑', prefixIcon: Icon(Icons.search)),
           )),
           const SizedBox(width: 8),
-          DropdownButton<String>(value: category, items: const ['全部','本地导入','抖音流行','酷狗排行榜'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) { setState(() => category = value); unawaited(refresh()); } }),
+          FilledButton.icon(onPressed: refresh, icon: const Icon(Icons.search), label: const Text('搜索')),
+          ]),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(child: DropdownButtonFormField<String>(value: category, decoration: const InputDecoration(labelText: '歌曲分类'), items: const ['全部','本地导入','临时歌曲库','抖音流行','酷狗排行榜'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) { setState(() => category = value); unawaited(refresh()); } })),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(onPressed: widget.onImport, icon: const Icon(Icons.audio_file), label: const Text('本地导入')),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(onPressed: importLink, icon: const Icon(Icons.link), label: const Text('链接导入')),
+          ]),
         ])),
         if (loading) const LinearProgressIndicator(minHeight: 2),
         Expanded(
