@@ -1,6 +1,16 @@
-# 橘味儿音乐 v3.2.0（三端新版）
+# 橘味儿音乐 v3.2.1（三端新版）
 
 这是在稳定版 v2.1.7 上继续升级的三端完整版，包含 Windows 桌面端、Android 客户端、iOS 客户端，以及供手机调用的 Windows/GPU AI 服务。
+
+## v3.2.1 扫描与统一歌曲源修复
+
+- Windows 扫描器支持百度网盘同步目录常见的链接、联接和重解析目录，可进入 `按歌手分类(MP3)/字母目录/真实歌手` 的完整层级。
+- 歌手分类取真实歌手文件夹，不再把“A 字母开头歌手”等字母目录误显示为歌手。
+- 歌手歌曲树移到音乐库首屏，允许显示全部已下载歌曲，并提供搜索按钮和双击载入。
+- 左侧新增“全局 G 盘歌曲”，一次选歌后 AI 分轨、改编/乐谱、演出谱面、演奏中心、现场演出、Setlist、AI 歌声和作品流程共用同一源文件。
+- 内部转换产生的 `*_work.wav` 不再入库；升级后重新扫描会自动清除旧重复记录及其失效任务，因此导入一首只显示一首。
+- 仅扫描已下载完整的音频，暂停下载产生的临时文件不会进入歌曲库。
+- Windows 启用长路径支持；Android、iOS 与服务器接口使用同一歌手分类规则。
 
 ## v3.2.0 新增与修复
 
@@ -42,7 +52,7 @@
 3. 双击 `Check-GPU.bat` 检查 CUDA。
 4. 双击 `Run-Juweier-Music.bat`。
 
-第一次分轨会下载并校验 `htdemucs_6s` 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.0-Windows-x64`，其中含安装程序和便携 ZIP。
+第一次分轨会下载并校验 `htdemucs_6s` 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.1-Windows-x64`，其中含安装程序和便携 ZIP。
 
 ## Android / iOS 使用
 
