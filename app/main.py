@@ -1975,6 +1975,28 @@ class InstrumentExperiencePage(QWidget):
         l.addWidget(tips,5,0,1,2)
         return w
 
+    def _build_electric_guitar_tab(self):
+        w=QWidget()
+        l=QGridLayout(w)
+        self.electric_difficulty=self._common_difficulty()
+        self.electric_tuning=QComboBox()
+        self.electric_tuning.addItems(["标准 EADGBE","Drop D","降半音 Eb","Drop C"])
+        self.electric_role=QComboBox()
+        self.electric_role.addItems(["自动识别","节奏吉他","主音吉他","Power Chord","清音铺底","Solo"])
+        self.electric_tone=QComboBox()
+        self.electric_tone.addItems(["跟随原曲","Clean","Crunch","Overdrive","High Gain"])
+        self.electric_density=QSlider(Qt.Horizontal)
+        self.electric_density.setRange(1,10); self.electric_density.setValue(5)
+        l.addWidget(QLabel("演奏难度"),0,0); l.addWidget(self.electric_difficulty,0,1)
+        l.addWidget(QLabel("调弦"),1,0); l.addWidget(self.electric_tuning,1,1)
+        l.addWidget(QLabel("演奏角色"),2,0); l.addWidget(self.electric_role,2,1)
+        l.addWidget(QLabel("音色建议"),3,0); l.addWidget(self.electric_tone,3,1)
+        l.addWidget(QLabel("演奏密度"),4,0); l.addWidget(self.electric_density,4,1)
+        tips=QLabel("六轨模型先分离综合吉他轨，再通过二次频谱识别生成独立木吉他与电吉他轨；排练时选择电吉他手会自动关闭电吉他原轨。")
+        tips.setWordWrap(True); tips.setObjectName("SectionHint")
+        l.addWidget(tips,5,0,1,2)
+        return w
+
     def _build_drums_tab(self):
         w=QWidget()
         l=QGridLayout(w)
@@ -2020,13 +2042,13 @@ class InstrumentExperiencePage(QWidget):
         return w
 
     def select_instrument(self,key):
-        index={"guitar":0,"bass":1,"drums":2,"piano":3}.get(key,0)
+        index={"guitar":0,"electric_guitar":1,"bass":2,"drums":3,"piano":4}.get(key,0)
         self.tabs.setCurrentIndex(index)
         for k,b in self.instrument_buttons.items():
             b.setChecked(k==key)
         self.main.apply_live_preset(key)
         if hasattr(self.main,"score_performance"):
-            mapping={"guitar":"六线谱","bass":"贝斯谱","drums":"鼓谱","piano":"键盘谱"}
+            mapping={"guitar":"六线谱","electric_guitar":"六线谱","bass":"贝斯谱","drums":"鼓谱","piano":"键盘谱"}
             idx=self.main.score_performance.score_type.findText(mapping[key])
             if idx>=0:
                 self.main.score_performance.score_type.setCurrentIndex(idx)
@@ -2092,7 +2114,7 @@ class InstrumentExperiencePage(QWidget):
         self.main.score_performance.refresh_score()
 
     def _profile_data(self):
-        key=["guitar","bass","drums","piano"][self.tabs.currentIndex()]
+        key=["guitar","electric_guitar","bass","drums","piano"][self.tabs.currentIndex()]
         data={"instrument":key,"practice_speed":self.practice_speed.currentText()}
         if key=="guitar":
             data.update({
@@ -2101,6 +2123,14 @@ class InstrumentExperiencePage(QWidget):
                 "capo":self.guitar_capo.value(),
                 "style":self.guitar_style.currentText(),
                 "density":self.guitar_density.value()
+            })
+        elif key=="electric_guitar":
+            data.update({
+                "difficulty":self.electric_difficulty.currentText(),
+                "tuning":self.electric_tuning.currentText(),
+                "role":self.electric_role.currentText(),
+                "tone":self.electric_tone.currentText(),
+                "density":self.electric_density.value()
             })
         elif key=="bass":
             data.update({
