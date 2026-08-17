@@ -37,11 +37,13 @@ from app.library_catalog import (
     ensure_library_layout,
     list_catalog,
     scan_catalog,
+    scan_catalog_roots,
+    download_public_audio,
 )
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
