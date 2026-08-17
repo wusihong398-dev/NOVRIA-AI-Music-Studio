@@ -1418,7 +1418,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ])),
           const SizedBox(height: 12),
           const Card(child: Padding(padding: EdgeInsets.all(16), child: Text(
-            '服务器接口：健康检查、歌曲库搜索、账号登录注册、内测群聊、上传任务、七轨兼容/五线谱/六线谱/MIDI 结果下载。移动端由 Windows/GPU 服务器执行 Demucs 与智能编配。',
+            '服务器接口：健康检查、歌曲库搜索、账号登录注册、内测群聊、上传任务、六轨基础分离、电吉他二次分离、五线谱/六线谱/歌词同步与 MIDI 结果下载。移动端由 Windows/GPU 服务器执行 Demucs 与智能编配。',
             style: TextStyle(color: Color(0xFFBDAAB5)),
           ))),
         ])),
