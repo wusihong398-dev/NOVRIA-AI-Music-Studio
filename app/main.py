@@ -2885,6 +2885,95 @@ class MusicLibraryPage(QWidget):
         self._load_pipeline_jobs()
         self.refresh_pipeline_table()
 
+    def _load_scan_roots(self):
+        defaults=[self.library_paths["originals"],self.library_paths["temp"]]
+        try:
+            rows=json.loads(self.scan_roots_file.read_text(encoding="utf-8"))
+            saved=[Path(row) for row in rows if str(row).strip()]
+        except Exception:
+            saved=[]
+        result=[]
+        for path in [*defaults,*saved]:
+            key=normalized_path(path)
+            if key not in {normalized_path(item) for item in result}:
+                result.append(Path(path))
+        return result
+
+    def _save_scan_roots(self):
+        atomic_write_json(self.scan_roots_file,[str(path) for path in self.scan_roots])
+
+    def choose_scan_folder(self):
+        selected=QFileDialog.getExistingDirectory(
+            self,"选择包含歌手分类的音乐目录",str(self.library_paths["originals"])
+        )
+        if not selected:
+            return
+        path=Path(selected)
+        if normalized_path(path) not in {normalized_path(item) for item in self.scan_roots}:
+            self.scan_roots.append(path)
+            self._save_scan_roots()
+        self.library_scan_status.setText("扫描目录："+"；".join(str(item) for item in self.scan_roots))
+        self.scan_imports()
+
+    def import_local_music(self):
+        files,_=QFileDialog.getOpenFileNames(
+            self,"导入本地音乐","",
+            "音频文件 (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aiff *.aif *.alac)"
+        )
+        if not files:
+            return
+        target=self.library_paths["originals"]/"本地导入"
+        target.mkdir(parents=True,exist_ok=True)
+        copied=0
+        for raw in files:
+            source=Path(raw)
+            destination=target/source.name
+            if destination.exists() and source.resolve()!=destination.resolve():
+                destination=target/f"{safe_file_stem(source.stem)}_{int(time.time()*1000)}{source.suffix}"
+            if source.resolve()!=destination.resolve():
+                shutil.copy2(source,destination)
+            copied+=1
+        self.scan_imports()
+        self.library_scan_status.setText(f"本地导入完成：{copied} 首 · 保存到 {target}")
+
+    def import_share_link(self):
+        value,ok=QInputDialog.getMultiLineText(
+            self,"粘贴分享链接",
+            "支持公开音频直链及平台公开分享页；不会绕过登录、会员、付费或 DRM。",
+            QApplication.clipboard().text().strip(),
+        )
+        if not ok or not value.strip():
+            return
+        match=re.search(r"https?://[^\s<>\"']+",value)
+        if not match:
+            QMessageBox.warning(self,"分享链接","没有识别到 http/https 链接。")
+            return
+        url=match.group(0).rstrip("，。；;）)]}")
+        if self.link_worker and self.link_worker.isRunning():
+            QMessageBox.information(self,"分享链接","已有下载任务正在进行。")
+            return
+        self.progress.setValue(1)
+        self.link_worker=LinkDownloadWorker(
+            url,self.library_paths["temp"]/"链接导入",self.main._find_ffmpeg()
+        )
+        self.link_worker.progress.connect(self._link_progress)
+        self.link_worker.done.connect(self._link_done)
+        self.link_worker.failed.connect(self._link_failed)
+        self.link_worker.start()
+
+    def _link_progress(self,value,text):
+        self.progress.setValue(max(0,min(100,int(value))))
+        self.library_scan_status.setText(text)
+
+    def _link_done(self,path):
+        self.library_scan_status.setText(f"分享歌曲已下载到临时歌曲库：{path}")
+        self.scan_imports()
+
+    def _link_failed(self,error):
+        self.progress.setValue(0)
+        self.library_scan_status.setText("分享链接导入失败")
+        QMessageBox.critical(self,"分享链接导入失败",str(error))
+
     def _db(self):
         return connect_catalog(self.db_path)
 
