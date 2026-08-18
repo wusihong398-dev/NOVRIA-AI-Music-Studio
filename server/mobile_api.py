@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.2.
+"""Mobile API companion for 橘味儿音乐 v3.2.3.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -47,13 +47,18 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
 STATE_FILE = ROOT / "jobs.json"
 ACCOUNT_DB = ROOT / "accounts.sqlite3"
 TOKEN = os.environ.get("JUWEIER_API_TOKEN", "").strip()
+SMS_ACCESS_KEY_ID = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "").strip()
+SMS_ACCESS_KEY_SECRET = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "").strip()
+SMS_SIGN_NAME = os.environ.get("ALIYUN_SMS_SIGN_NAME", "").strip()
+SMS_TEMPLATE_CODE = os.environ.get("ALIYUN_SMS_TEMPLATE_CODE", "").strip()
+SMS_CODE_PEPPER = os.environ.get("ADMIN_KEY", "").strip()
 LIBRARY_PATHS = ensure_library_layout(default_library_root())
 LIBRARY_DB = LIBRARY_PATHS["database"] / "juweier_music_library.sqlite3"
 SERVER_LIBRARY_ROOT = Path(os.environ.get(
@@ -70,9 +75,32 @@ executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JUWEIER_WOR
 
 
 class AuthPayload(BaseModel):
-    username: str = Field(min_length=3, max_length=32)
+    username: str = Field(default="", max_length=32)
+    phone: str = Field(default="", max_length=24)
+    code: str = Field(default="", max_length=8)
     password: str = Field(min_length=6, max_length=128)
     nickname: str = Field(default="", max_length=32)
+
+
+class SmsCodePayload(BaseModel):
+    phone: str = Field(min_length=6, max_length=24)
+    purpose: str = Field(default="register", max_length=16)
+
+
+class PasswordResetPayload(BaseModel):
+    phone: str = Field(min_length=6, max_length=24)
+    code: str = Field(min_length=4, max_length=8)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class ProfilePayload(BaseModel):
+    avatar_url: str = Field(default="", max_length=1024)
+    nickname: str = Field(default="", max_length=32)
+    gender: str = Field(default="保密", max_length=8)
+    bio: str = Field(default="", max_length=300)
+    origin: str = Field(default="", max_length=80)
+    address: str = Field(default="", max_length=160)
+    wechat: str = Field(default="", max_length=80)
 
 
 class ChatPayload(BaseModel):
@@ -125,6 +153,16 @@ def _init_accounts() -> None:
                 password_hash TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS verification_codes (
+                phone TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                last_sent_at REAL NOT NULL,
+                consumed_at REAL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(phone, purpose)
+            );
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
@@ -154,6 +192,26 @@ def _init_accounts() -> None:
             );
             """
         )
+        existing_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        profile_columns = {
+            "phone": "TEXT",
+            "avatar_url": "TEXT NOT NULL DEFAULT ''",
+            "gender": "TEXT NOT NULL DEFAULT '保密'",
+            "bio": "TEXT NOT NULL DEFAULT ''",
+            "origin": "TEXT NOT NULL DEFAULT ''",
+            "address": "TEXT NOT NULL DEFAULT ''",
+            "wechat": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "REAL NOT NULL DEFAULT 0",
+        }
+        for column, definition in profile_columns.items():
+            if column not in existing_columns:
+                connection.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique "
+            "ON users(phone) WHERE phone IS NOT NULL AND phone<>''"
+        )
         connection.commit()
     finally:
         connection.close()
@@ -172,6 +230,82 @@ def _password_matches(password: str, stored: str) -> bool:
         return hmac.compare_digest(actual, expected)
     except Exception:
         return False
+
+
+def _normalize_phone(value: str) -> str:
+    phone = re.sub(r"[\s\-()]", "", value or "")
+    if phone.startswith("+86"):
+        phone = phone[3:]
+    elif phone.startswith("0086"):
+        phone = phone[4:]
+    if not re.fullmatch(r"1[3-9]\d{9}", phone):
+        raise HTTPException(status_code=400, detail="请输入正确的中国大陆手机号")
+    return phone
+
+
+def _verification_hash(phone: str, purpose: str, code: str) -> str:
+    pepper = SMS_CODE_PEPPER or TOKEN
+    if not pepper:
+        raise HTTPException(status_code=503, detail="短信验证码服务尚未配置")
+    return hmac.new(
+        pepper.encode("utf-8"), f"{phone}:{purpose}:{code}".encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+
+
+def _verify_sms_code(
+    connection: sqlite3.Connection, phone: str, purpose: str, code: str, *, consume: bool = True,
+) -> None:
+    row = connection.execute(
+        "SELECT code_hash,expires_at,consumed_at,attempts FROM verification_codes "
+        "WHERE phone=? AND purpose=?",
+        (phone, purpose),
+    ).fetchone()
+    if not row or row["consumed_at"] is not None:
+        raise HTTPException(status_code=400, detail="请先获取短信验证码")
+    if float(row["expires_at"]) < time.time():
+        raise HTTPException(status_code=400, detail="验证码已过期，请重新获取")
+    if int(row["attempts"]) >= 5:
+        raise HTTPException(status_code=429, detail="验证码错误次数过多，请重新获取")
+    actual = _verification_hash(phone, purpose, code.strip())
+    if not hmac.compare_digest(actual, str(row["code_hash"])):
+        connection.execute(
+            "UPDATE verification_codes SET attempts=attempts+1 WHERE phone=? AND purpose=?",
+            (phone, purpose),
+        )
+        connection.commit()
+        raise HTTPException(status_code=400, detail="验证码错误")
+    if consume:
+        connection.execute(
+            "UPDATE verification_codes SET consumed_at=? WHERE phone=? AND purpose=?",
+            (time.time(), phone, purpose),
+        )
+
+
+def _send_sms(phone: str, code: str) -> None:
+    if not all((SMS_ACCESS_KEY_ID, SMS_ACCESS_KEY_SECRET, SMS_SIGN_NAME, SMS_TEMPLATE_CODE, SMS_CODE_PEPPER)):
+        raise HTTPException(status_code=503, detail="短信验证码服务尚未完整配置")
+    try:
+        from alibabacloud_dysmsapi20170525.client import Client as SmsClient
+        from alibabacloud_dysmsapi20170525.models import SendSmsRequest
+        from alibabacloud_tea_openapi.models import Config
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="服务器尚未安装阿里云短信 SDK") from exc
+    try:
+        config = Config(access_key_id=SMS_ACCESS_KEY_ID, access_key_secret=SMS_ACCESS_KEY_SECRET)
+        config.endpoint = "dysmsapi.aliyuncs.com"
+        response = SmsClient(config).send_sms(SendSmsRequest(
+            phone_numbers=phone,
+            sign_name=SMS_SIGN_NAME,
+            template_code=SMS_TEMPLATE_CODE,
+            template_param=json.dumps({"code": code}, ensure_ascii=False),
+        ))
+        body = response.body
+        if str(getattr(body, "code", "")) != "OK":
+            raise RuntimeError(str(getattr(body, "message", "短信平台发送失败")))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"短信发送失败：{exc}") from exc
 
 
 def _new_session(connection: sqlite3.Connection, user_id: int) -> str:
@@ -194,7 +328,8 @@ def _session_user(authorization: str | None) -> sqlite3.Row | None:
     connection = _db()
     try:
         return connection.execute(
-            """SELECT users.id,users.username,users.nickname
+            """SELECT users.id,users.username,users.nickname,users.phone,users.avatar_url,
+                      users.gender,users.bio,users.origin,users.address,users.wechat
                FROM sessions JOIN users ON users.id=sessions.user_id
                WHERE sessions.token=? AND sessions.expires_at>?""",
             (value, time.time()),
@@ -268,6 +403,7 @@ def _gpu_name() -> str:
 
 @app.get("/health")
 @app.get("/api/health")
+@app.get("/api/v1/library/mobile/health")
 def health(_: None = Depends(authorize)) -> dict:
     return {
         "status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name(),
@@ -278,15 +414,17 @@ def health(_: None = Depends(authorize)) -> dict:
 
 
 @app.get("/api/v1/app/config")
+@app.get("/api/v1/library/mobile/app/config")
 def app_config(_: None = Depends(authorize)) -> dict:
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.2",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.3",
         "service": "online",
         "notice": "本软件目前仅供学习与研究使用，不提供歌曲下载服务。",
     }
 
 
 @app.post("/api/v1/lyrics/generate")
+@app.post("/api/v1/library/mobile/lyrics/generate")
 def lyrics_generate(payload: LyricsGeneratePayload, _: None = Depends(authorize)) -> dict:
     variants = generate_lyrics(payload.theme, payload.language, payload.style, payload.mood, payload.variants)
     for item in variants:
@@ -295,6 +433,7 @@ def lyrics_generate(payload: LyricsGeneratePayload, _: None = Depends(authorize)
 
 
 @app.post("/api/v1/feedback", status_code=201)
+@app.post("/api/v1/library/mobile/feedback", status_code=201)
 def submit_feedback(payload: FeedbackPayload, authorization: str | None = Header(default=None)) -> dict:
     user = _session_user(authorization)
     connection = _db()
@@ -311,35 +450,88 @@ def submit_feedback(payload: FeedbackPayload, authorization: str | None = Header
         connection.close()
 
 
+@app.post("/api/v1/auth/sms/send", status_code=202)
+@app.post("/api/v1/library/mobile/auth/sms/send", status_code=202)
+def send_verification_code(payload: SmsCodePayload) -> dict:
+    purpose = payload.purpose.strip().lower()
+    if purpose not in {"register", "reset"}:
+        raise HTTPException(status_code=400, detail="不支持的验证码用途")
+    phone = _normalize_phone(payload.phone)
+    now = time.time()
+    connection = _db()
+    try:
+        row = connection.execute(
+            "SELECT last_sent_at FROM verification_codes WHERE phone=? AND purpose=?",
+            (phone, purpose),
+        ).fetchone()
+        if row:
+            wait = 60 - int(now - float(row["last_sent_at"]))
+            if wait > 0:
+                raise HTTPException(status_code=429, detail=f"请 {wait} 秒后再获取验证码")
+        if purpose == "register" and connection.execute(
+            "SELECT 1 FROM users WHERE phone=?", (phone,),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="该手机号已经注册")
+        if purpose == "reset" and not connection.execute(
+            "SELECT 1 FROM users WHERE phone=?", (phone,),
+        ).fetchone():
+            raise HTTPException(status_code=404, detail="该手机号尚未注册")
+    finally:
+        connection.close()
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _send_sms(phone, code)
+    connection = _db()
+    try:
+        connection.execute(
+            """INSERT INTO verification_codes(phone,purpose,code_hash,expires_at,last_sent_at,consumed_at,attempts)
+               VALUES(?,?,?,?,?,NULL,0)
+               ON CONFLICT(phone,purpose) DO UPDATE SET code_hash=excluded.code_hash,
+               expires_at=excluded.expires_at,last_sent_at=excluded.last_sent_at,
+               consumed_at=NULL,attempts=0""",
+            (phone, purpose, _verification_hash(phone, purpose, code), now + 300, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "retry_after": 60, "expires_in": 300, "message": "验证码已发送"}
+
+
 @app.post("/api/v1/auth/register", status_code=201)
+@app.post("/api/v1/library/mobile/auth/register", status_code=201)
 def register(payload: AuthPayload) -> dict:
-    username = payload.username.strip()
+    phone = _normalize_phone(payload.phone)
+    username = payload.username.strip() or phone
     nickname = payload.nickname.strip() or username
     if not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff]{3,32}", username):
         raise HTTPException(status_code=400, detail="账号只能使用中文、字母、数字、下划线或短横线")
     connection = _db()
     try:
+        _verify_sms_code(connection, phone, "register", payload.code)
         try:
             cursor = connection.execute(
-                "INSERT INTO users(username,nickname,password_hash,created_at) VALUES(?,?,?,?)",
-                (username, nickname, _password_hash(payload.password), time.time()),
+                """INSERT INTO users(username,phone,nickname,password_hash,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (username, phone, nickname, _password_hash(payload.password), time.time(), time.time()),
             )
         except sqlite3.IntegrityError as exc:
-            raise HTTPException(status_code=409, detail="该账号已经注册") from exc
+            raise HTTPException(status_code=409, detail="该账号或手机号已经注册") from exc
         token = _new_session(connection, int(cursor.lastrowid))
         connection.commit()
-        return {"token": token, "username": username, "nickname": nickname, "expires_in": 30 * 24 * 3600}
+        return {"token": token, "username": username, "phone": phone, "nickname": nickname, "expires_in": 30 * 24 * 3600}
     finally:
         connection.close()
 
 
 @app.post("/api/v1/auth/login")
+@app.post("/api/v1/library/mobile/auth/login")
 def login(payload: AuthPayload) -> dict:
+    account = payload.username.strip()
     connection = _db()
     try:
         row = connection.execute(
-            "SELECT id,username,nickname,password_hash FROM users WHERE username=? COLLATE NOCASE",
-            (payload.username.strip(),),
+            """SELECT id,username,phone,nickname,password_hash FROM users
+               WHERE username=? COLLATE NOCASE OR phone=?""",
+            (account, re.sub(r"\D", "", account)),
         ).fetchone()
         if not row or not _password_matches(payload.password, str(row["password_hash"])):
             raise HTTPException(status_code=401, detail="账号或密码错误")
@@ -348,6 +540,7 @@ def login(payload: AuthPayload) -> dict:
         return {
             "token": token,
             "username": str(row["username"]),
+            "phone": str(row["phone"] or ""),
             "nickname": str(row["nickname"]),
             "expires_in": 30 * 24 * 3600,
         }
@@ -355,12 +548,66 @@ def login(payload: AuthPayload) -> dict:
         connection.close()
 
 
+@app.post("/api/v1/auth/password/reset")
+@app.post("/api/v1/library/mobile/auth/password/reset")
+def reset_password(payload: PasswordResetPayload) -> dict:
+    phone = _normalize_phone(payload.phone)
+    connection = _db()
+    try:
+        _verify_sms_code(connection, phone, "reset", payload.code)
+        cursor = connection.execute(
+            "UPDATE users SET password_hash=?,updated_at=? WHERE phone=?",
+            (_password_hash(payload.new_password), time.time(), phone),
+        )
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=404, detail="该手机号尚未注册")
+        connection.execute("DELETE FROM sessions WHERE user_id=(SELECT id FROM users WHERE phone=?)", (phone,))
+        connection.commit()
+        return {"ok": True, "message": "密码已重置，请重新登录"}
+    finally:
+        connection.close()
+
+
+def _profile(user: sqlite3.Row) -> dict:
+    return {
+        "id": int(user["id"]), "username": str(user["username"]),
+        "phone": str(user["phone"] or ""), "nickname": str(user["nickname"]),
+        "avatar_url": str(user["avatar_url"] or ""), "gender": str(user["gender"] or "保密"),
+        "bio": str(user["bio"] or ""), "origin": str(user["origin"] or ""),
+        "address": str(user["address"] or ""), "wechat": str(user["wechat"] or ""),
+    }
+
+
 @app.get("/api/v1/account/me")
+@app.get("/api/v1/library/mobile/account/me")
 def account_me(user: sqlite3.Row = Depends(current_user)) -> dict:
-    return {"id": int(user["id"]), "username": str(user["username"]), "nickname": str(user["nickname"])}
+    return _profile(user)
+
+
+@app.put("/api/v1/account/me")
+@app.put("/api/v1/library/mobile/account/me")
+def update_account(payload: ProfilePayload, user: sqlite3.Row = Depends(current_user)) -> dict:
+    nickname = payload.nickname.strip() or str(user["username"])
+    gender = payload.gender.strip() or "保密"
+    if gender not in {"男", "女", "保密", "其他"}:
+        raise HTTPException(status_code=400, detail="性别选项无效")
+    connection = _db()
+    try:
+        connection.execute(
+            """UPDATE users SET avatar_url=?,nickname=?,gender=?,bio=?,origin=?,address=?,wechat=?,updated_at=?
+               WHERE id=?""",
+            (payload.avatar_url.strip(), nickname, gender, payload.bio.strip(), payload.origin.strip(),
+             payload.address.strip(), payload.wechat.strip(), time.time(), int(user["id"])),
+        )
+        connection.commit()
+        refreshed = connection.execute("SELECT * FROM users WHERE id=?", (int(user["id"]),)).fetchone()
+        return _profile(refreshed)
+    finally:
+        connection.close()
 
 
 @app.get("/api/v1/community/messages")
+@app.get("/api/v1/library/mobile/community/messages")
 def community_messages(limit: int = 100, _: sqlite3.Row = Depends(current_user)) -> dict:
     count = max(1, min(200, int(limit)))
     connection = _db()
@@ -389,6 +636,7 @@ def community_messages(limit: int = 100, _: sqlite3.Row = Depends(current_user))
 
 
 @app.post("/api/v1/community/messages", status_code=201)
+@app.post("/api/v1/library/mobile/community/messages", status_code=201)
 def send_community_message(payload: ChatPayload, user: sqlite3.Row = Depends(current_user)) -> dict:
     content = payload.content.strip()
     if not content:
@@ -413,6 +661,7 @@ def send_community_message(payload: ChatPayload, user: sqlite3.Row = Depends(cur
 
 
 @app.post("/api/v1/jobs", status_code=202)
+@app.post("/api/v1/library/mobile/jobs", status_code=202)
 async def create_job(
     file: UploadFile = File(...),
     arrangement_mode: str = Form("乐队现场版"),
@@ -943,12 +1192,13 @@ def _public_job(job: dict, request: Request) -> dict:
     result.pop("input_path", None)
     public = {}
     for key, value in result.get("artifacts", {}).items():
-        public[key] = str(request.url_for("artifact", job_id=result["id"], name=Path(value).name))
+        public[key] = str(request.url_for("library_artifact", job_id=result["id"], name=Path(value).name))
     result["artifacts"] = public
     return result
 
 
 @app.get("/api/v1/jobs/{job_id}")
+@app.get("/api/v1/library/jobs/{job_id}")
 def get_job(job_id: str, request: Request, _: None = Depends(authorize)) -> dict:
     with lock:
         job = jobs.get(job_id)
@@ -958,6 +1208,7 @@ def get_job(job_id: str, request: Request, _: None = Depends(authorize)) -> dict
 
 
 @app.get("/api/v1/artifacts/{job_id}/{name}", name="artifact")
+@app.get("/api/v1/library/artifacts/{job_id}/{name}", name="library_artifact")
 def artifact(job_id: str, name: str, _: None = Depends(authorize)):
     with lock:
         job = jobs.get(job_id)

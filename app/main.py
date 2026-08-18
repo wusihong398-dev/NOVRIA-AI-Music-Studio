@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -155,7 +155,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/3.2.2"}
+            headers={"User-Agent": "Juweier-Music/3.2.3"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -2733,7 +2733,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.2"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.3"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0

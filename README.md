@@ -1,8 +1,8 @@
-# 橘味儿音乐 v3.2.2（三端新版）
+# 橘味儿音乐 v3.2.3（三端新版）
 
 > 本软件目前仅供学习与研究使用，不提供歌曲下载服务。
 
-## v3.2.2 更新
+## v3.2.3 更新
 
 - Windows 曲库改为只调用服务器 API；`G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）` 由服务器进程扫描，客户端不再打开或回退扫描本机 G 盘。
 - 服务器谱面统一输出歌词时间轴；五线谱、木吉他、电吉他、贝斯、鼓、键盘谱共用同步歌词。优先使用同名 LRC/内嵌歌词，可选 faster-whisper 转写普通话、粤语和英语，AI 结果须人工校对。
@@ -64,7 +64,7 @@
 3. 双击 `Check-GPU.bat` 检查 CUDA。
 4. 双击 `Run-Juweier-Music.bat`。
 
-第一次分轨会安装并校验 `htdemucs_6s` AI 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.2-Windows-x64`，其中含安装程序和便携 ZIP。
+第一次分轨会安装并校验 `htdemucs_6s` AI 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.3-Windows-x64`，其中含安装程序和便携 ZIP。
 
 ## Android / iOS 使用
 

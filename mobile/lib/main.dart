@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.2';
+const appVersion = '3.2.3';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -103,12 +103,13 @@ class PipelineJob {
 }
 
 class LibrarySong {
-  const LibrarySong({required this.id, required this.title, required this.artist, required this.category, required this.audioUrl});
+  const LibrarySong({required this.id, required this.title, required this.artist, required this.category, required this.audioUrl, required this.coverUrl});
   final int id;
   final String title;
   final String artist;
   final String category;
   final String audioUrl;
+  final String coverUrl;
 
   factory LibrarySong.fromJson(Map<String, dynamic> json) => LibrarySong(
         id: (json['id'] as num?)?.toInt() ?? 0,
@@ -116,6 +117,7 @@ class LibrarySong {
         artist: '${json['artist'] ?? '未知歌手'}',
         category: '${json['category'] ?? '本地导入'}',
         audioUrl: '${json['audio_url'] ?? ''}',
+        coverUrl: '${json['cover_url'] ?? ''}',
       );
 }
 
@@ -158,6 +160,13 @@ class AppStore extends ChangeNotifier {
   String accountToken = '';
   String username = '';
   String nickname = '';
+  String phone = '';
+  String avatarUrl = '';
+  String gender = '保密';
+  String bio = '';
+  String origin = '';
+  String address = '';
+  String wechat = '';
   String accountState = '未登录';
   String serverState = '待检测';
   String serverDetail = 'AI 服务由应用自动连接';
@@ -187,6 +196,7 @@ class AppStore extends ChangeNotifier {
       }
     }
     unawaited(testServer());
+    if (accountToken.isNotEmpty) unawaited(refreshProfile());
   }
 
   Future<void> _save() async {
@@ -401,21 +411,29 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> authenticate({required String account, required String password, required bool register, String nicknameValue = ''}) async {
+  Future<void> authenticate({required String account, required String phoneValue, required String password, required bool register, String nicknameValue = '', String code = ''}) async {
     if (serverBase.isEmpty) throw const FormatException('请先配置 AI 服务器地址');
     accountState = register ? '注册中' : '登录中';
     notifyListeners();
     try {
       final result = await ApiClient(serverBase, apiToken).postJson(
-        register ? '/api/v1/auth/register' : '/api/v1/auth/login',
-        {'username': account.trim(), 'password': password, 'nickname': nicknameValue.trim()},
+        register ? '/api/v1/library/mobile/auth/register' : '/api/v1/library/mobile/auth/login',
+        {
+          'username': account.trim(),
+          'phone': phoneValue.trim(),
+          'password': password,
+          'nickname': nicknameValue.trim(),
+          'code': code.trim(),
+        },
       );
       accountToken = '${result['token'] ?? ''}';
       if (accountToken.isEmpty) throw const FormatException('服务器没有返回登录令牌');
       username = '${result['username'] ?? account.trim()}';
       nickname = '${result['nickname'] ?? username}';
+      phone = '${result['phone'] ?? phoneValue.trim()}';
       accountState = '已登录';
       await _save();
+      await refreshProfile();
       await refreshCommunity();
     } catch (_) {
       accountState = '登录失败';
@@ -424,10 +442,66 @@ class AppStore extends ChangeNotifier {
     }
   }
 
+  Future<void> sendSmsCode(String phoneValue, String purpose) async {
+    await ApiClient(serverBase, apiToken).postJson('/api/v1/library/mobile/auth/sms/send', {
+      'phone': phoneValue.trim(),
+      'purpose': purpose,
+    });
+  }
+
+  Future<void> resetPassword(String phoneValue, String code, String newPassword) async {
+    await ApiClient(serverBase, apiToken).postJson('/api/v1/library/mobile/auth/password/reset', {
+      'phone': phoneValue.trim(),
+      'code': code.trim(),
+      'new_password': newPassword,
+    });
+  }
+
+  Future<void> refreshProfile() async {
+    if (accountToken.isEmpty) return;
+    try {
+      final result = await ApiClient(serverBase, accountToken).getJson('/api/v1/library/mobile/account/me');
+      username = '${result['username'] ?? username}';
+      nickname = '${result['nickname'] ?? nickname}';
+      phone = '${result['phone'] ?? ''}';
+      avatarUrl = '${result['avatar_url'] ?? ''}';
+      gender = '${result['gender'] ?? '保密'}';
+      bio = '${result['bio'] ?? ''}';
+      origin = '${result['origin'] ?? ''}';
+      address = '${result['address'] ?? ''}';
+      wechat = '${result['wechat'] ?? ''}';
+      accountState = '已登录';
+      await _save();
+      notifyListeners();
+    } catch (error) {
+      if ('$error'.contains('请先登录') || '$error'.contains('访问令牌')) await logout();
+    }
+  }
+
+  Future<void> updateProfile(Map<String, dynamic> payload) async {
+    final result = await ApiClient(serverBase, accountToken).putJson('/api/v1/library/mobile/account/me', payload);
+    nickname = '${result['nickname'] ?? nickname}';
+    avatarUrl = '${result['avatar_url'] ?? ''}';
+    gender = '${result['gender'] ?? '保密'}';
+    bio = '${result['bio'] ?? ''}';
+    origin = '${result['origin'] ?? ''}';
+    address = '${result['address'] ?? ''}';
+    wechat = '${result['wechat'] ?? ''}';
+    await _save();
+    notifyListeners();
+  }
+
   Future<void> logout() async {
     accountToken = '';
     username = '';
     nickname = '';
+    phone = '';
+    avatarUrl = '';
+    gender = '保密';
+    bio = '';
+    origin = '';
+    address = '';
+    wechat = '';
     accountState = '未登录';
     communityMessages.clear();
     await _save();
@@ -436,7 +510,7 @@ class AppStore extends ChangeNotifier {
 
   Future<void> refreshCommunity() async {
     if (accountToken.isEmpty || serverBase.isEmpty) return;
-    final result = await ApiClient(serverBase, accountToken).getJson('/api/v1/community/messages?limit=100');
+    final result = await ApiClient(serverBase, accountToken).getJson('/api/v1/library/mobile/community/messages?limit=100');
     final rows = result['messages'];
     communityMessages
       ..clear()
@@ -450,7 +524,7 @@ class AppStore extends ChangeNotifier {
     final value = content.trim();
     if (value.isEmpty) return;
     if (accountToken.isEmpty) throw const FormatException('请先登录账号');
-    await ApiClient(serverBase, accountToken).postJson('/api/v1/community/messages', {'content': value});
+    await ApiClient(serverBase, accountToken).postJson('/api/v1/library/mobile/community/messages', {'content': value});
     await refreshCommunity();
   }
 }
@@ -462,7 +536,7 @@ class ApiClient {
 
   Future<Map<String, dynamic>> health() async {
     Object? lastError;
-    for (final path in const ['/health', '/api/health']) {
+    for (final path in const ['/api/v1/library/mobile/health', '/health', '/api/health']) {
       try {
         return await _jsonRequest('GET', path);
       } catch (error) {
@@ -473,7 +547,7 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> submit(PipelineJob job) async {
-    final uri = Uri.parse('$base/api/v1/jobs');
+    final uri = Uri.parse('$base/api/v1/library/mobile/jobs');
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       final request = await client.postUrl(uri);
@@ -501,7 +575,7 @@ class ApiClient {
     }
   }
 
-  Future<Map<String, dynamic>> job(String id) async => _jsonRequest('GET', '/api/v1/jobs/$id');
+  Future<Map<String, dynamic>> job(String id) async => _jsonRequest('GET', '/api/v1/library/jobs/$id');
 
   Future<Map<String, dynamic>> library(String query, String category) => _jsonRequest(
         'GET',
@@ -517,15 +591,18 @@ class ApiClient {
       postJson('/api/v1/library/import-url', {'url': url});
 
   Future<Map<String, dynamic>> generateLyrics(Map<String, dynamic> payload) =>
-      postJson('/api/v1/lyrics/generate', payload);
+      postJson('/api/v1/library/mobile/lyrics/generate', payload);
 
   Future<Map<String, dynamic>> submitFeedback(Map<String, dynamic> payload) =>
-      postJson('/api/v1/feedback', payload);
+      postJson('/api/v1/library/mobile/feedback', payload);
 
   Future<Map<String, dynamic>> getJson(String path) => _jsonRequest('GET', path);
 
   Future<Map<String, dynamic>> postJson(String path, Map<String, dynamic> payload) =>
       _jsonRequest('POST', path, payload: payload);
+
+  Future<Map<String, dynamic>> putJson(String path, Map<String, dynamic> payload) =>
+      _jsonRequest('PUT', path, payload: payload);
 
   Future<Map<String, dynamic>> _jsonRequest(String method, String path, {Map<String, dynamic>? payload}) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
@@ -552,7 +629,14 @@ class ApiClient {
   Future<Map<String, dynamic>> _decode(HttpClientResponse response) async {
     final body = await response.transform(utf8.decoder).join();
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpException('HTTP ${response.statusCode}: ${body.length > 240 ? body.substring(0, 240) : body}');
+      var message = '服务器请求失败（${response.statusCode}）';
+      try {
+        final decoded = jsonDecode(body);
+        if (decoded is Map && decoded['detail'] != null) message = '${decoded['detail']}';
+      } catch (_) {
+        if (body.trim().isNotEmpty) message = body.length > 240 ? body.substring(0, 240) : body;
+      }
+      throw FormatException(message);
     }
     if (body.trim().isEmpty) return <String, dynamic>{};
     return Map<String, dynamic>.from(jsonDecode(body) as Map);
@@ -566,7 +650,9 @@ class JuweierMusicApp extends StatelessWidget {
   final AppStore store;
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: store,
+    builder: (context, _) => MaterialApp(
         debugShowCheckedModeBanner: false,
         title: appName,
         theme: ThemeData(
@@ -594,8 +680,130 @@ class JuweierMusicApp extends StatelessWidget {
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
           ),
         ),
-        home: MainShell(store: store),
-      );
+        home: store.accountToken.isEmpty ? AuthGatePage(store: store) : MainShell(store: store),
+      ),
+  );
+}
+
+class AuthGatePage extends StatefulWidget {
+  const AuthGatePage({super.key, required this.store});
+  final AppStore store;
+
+  @override
+  State<AuthGatePage> createState() => _AuthGatePageState();
+}
+
+class _AuthGatePageState extends State<AuthGatePage> {
+  final account = TextEditingController();
+  final phone = TextEditingController();
+  final nickname = TextEditingController();
+  final password = TextEditingController();
+  final code = TextEditingController();
+  String mode = '登录';
+  bool busy = false;
+  int countdown = 0;
+  Timer? timer;
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    account.dispose(); phone.dispose(); nickname.dispose(); password.dispose(); code.dispose();
+    super.dispose();
+  }
+
+  Future<void> sendCode() async {
+    if (phone.text.trim().isEmpty || countdown > 0) return;
+    setState(() => busy = true);
+    try {
+      await widget.store.sendSmsCode(phone.text, mode == '找回密码' ? 'reset' : 'register');
+      if (!mounted) return;
+      setState(() => countdown = 60);
+      timer?.cancel();
+      timer = Timer.periodic(const Duration(seconds: 1), (value) {
+        if (!mounted || countdown <= 1) {
+          value.cancel();
+          if (mounted) setState(() => countdown = 0);
+        } else {
+          setState(() => countdown--);
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('验证码已发送，5 分钟内有效')));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> submit() async {
+    setState(() => busy = true);
+    try {
+      if (mode == '找回密码') {
+        await widget.store.resetPassword(phone.text, code.text, password.text);
+        if (!mounted) return;
+        setState(() { mode = '登录'; code.clear(); password.clear(); });
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('密码已重置，请使用手机号或账号登录')));
+      } else {
+        await widget.store.authenticate(
+          account: account.text,
+          phoneValue: phone.text,
+          password: password.text,
+          register: mode == '注册',
+          nicknameValue: nickname.text,
+          code: code.text,
+        );
+      }
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final register = mode == '注册';
+    final reset = mode == '找回密码';
+    return Scaffold(body: SafeArea(child: Center(child: SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 520), child: Card(
+        child: Padding(padding: const EdgeInsets.all(24), child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            Container(width: 64, height: 64, padding: const EdgeInsets.all(6), decoration: BoxDecoration(color: const Color(0xFF2C1024), borderRadius: BorderRadius.circular(18)), child: Image.asset('assets/juweier_brand_mark_v322.png')),
+            const SizedBox(width: 14),
+            const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(appName, style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)), Text('登录后使用音乐库、AI 处理和内测群聊')])),
+          ]),
+          const SizedBox(height: 22),
+          SegmentedButton<String>(
+            segments: const [ButtonSegment(value: '登录', label: Text('登录')), ButtonSegment(value: '注册', label: Text('注册')), ButtonSegment(value: '找回密码', label: Text('找回密码'))],
+            selected: {mode}, onSelectionChanged: (value) => setState(() => mode = value.first),
+          ),
+          const SizedBox(height: 18),
+          if (!reset) TextField(controller: account, decoration: InputDecoration(labelText: register ? '自选账号（可留空，使用手机号注册）' : '账号或手机号')),
+          if (!reset) const SizedBox(height: 10),
+          if (register || reset) ...[
+            TextField(controller: phone, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: '手机号', prefixText: '+86 ')),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: TextField(controller: code, keyboardType: TextInputType.number, maxLength: 6, decoration: const InputDecoration(labelText: '短信验证码', counterText: ''))),
+              const SizedBox(width: 10),
+              OutlinedButton(onPressed: busy || countdown > 0 ? null : sendCode, child: Text(countdown > 0 ? '${countdown}秒' : '获取验证码')),
+            ]),
+            const SizedBox(height: 10),
+          ],
+          if (register) ...[
+            TextField(controller: nickname, decoration: const InputDecoration(labelText: '昵称（可选）')),
+            const SizedBox(height: 10),
+          ],
+          TextField(controller: password, obscureText: true, decoration: InputDecoration(labelText: reset ? '设置新密码（至少 6 位）' : '密码（至少 6 位）')),
+          const SizedBox(height: 18),
+          FilledButton.icon(onPressed: busy ? null : submit, icon: busy ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.login), label: Text(reset ? '重置密码' : register ? '注册并进入' : '登录')),
+          const SizedBox(height: 12),
+          const Text('验证码 60 秒内只能发送 1 次，5 分钟内有效。注册即表示同意用户协议与隐私政策。', style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
+        ])),
+      )),
+    ))));
+  }
 }
 
 class MainShell extends StatefulWidget {
@@ -625,7 +833,7 @@ class _MainShellState extends State<MainShell> {
         builder: (context, _) {
           final pages = [
             DashboardPage(store: widget.store, onImport: pickAudio, onNavigate: (i) => setState(() => index = i)),
-            LibraryPage(store: widget.store, onImport: pickAudio),
+            LibraryPage(store: widget.store, onImport: pickAudio, onOpenPipeline: () => setState(() => index = 2)),
             PipelinePage(store: widget.store),
             PerformancePage(store: widget.store),
             CommunityPage(store: widget.store),
@@ -677,6 +885,10 @@ class DashboardPage extends StatelessWidget {
             Text(appName, style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)),
             Text('AI 分轨 · 智能改编 · 乐手谱面', style: TextStyle(color: Color(0xFFBDAAB5))),
           ])),
+          IconButton.filledTonal(
+            tooltip: '个人资料', icon: const Icon(Icons.person),
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => ProfilePage(store: store))),
+          ),
         ]),
         const SizedBox(height: 18),
         ServerCard(store: store),
@@ -737,9 +949,10 @@ class DashboardPage extends StatelessWidget {
 }
 
 class LibraryPage extends StatefulWidget {
-  const LibraryPage({super.key, required this.store, required this.onImport});
+  const LibraryPage({super.key, required this.store, required this.onImport, required this.onOpenPipeline});
   final AppStore store;
   final VoidCallback onImport;
+  final VoidCallback onOpenPipeline;
 
   @override
   State<LibraryPage> createState() => _LibraryPageState();
@@ -748,6 +961,7 @@ class LibraryPage extends StatefulWidget {
 class _LibraryPageState extends State<LibraryPage> {
   final search = TextEditingController();
   String category = '全部';
+  String initial = '全部';
   bool loading = false;
 
   @override
@@ -808,13 +1022,76 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  String artistInitial(String value) {
+    final text = value.trim();
+    if (text.isEmpty) return '#';
+    final first = text.substring(0, 1).toUpperCase();
+    return RegExp(r'[A-Z]').hasMatch(first) ? first : '#';
+  }
+
+  ImageProvider<Object>? artistImage(LibrarySong song) {
+    if (song.coverUrl.isEmpty) return null;
+    final token = widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken;
+    return NetworkImage(song.coverUrl, headers: token.isEmpty ? null : {'Authorization': 'Bearer $token'});
+  }
+
+  Future<void> processSong(LibrarySong song) async {
+    final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+      title: const Text('确认开始 AI 处理？'),
+      content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(song.title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+        Text(song.artist, style: const TextStyle(color: Color(0xFFBDAAB5))),
+        const SizedBox(height: 14),
+        const Text('将从服务器曲库读取原曲，依次完成六轨+电吉他、BPM/调性、和弦、歌词与乐谱、智能改编和渲染。处理时间取决于歌曲长度和服务器负载。'),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
+        FilledButton.icon(onPressed: () => Navigator.pop(context, true), icon: const Icon(Icons.auto_awesome), label: const Text('加入处理队列')),
+      ],
+    ));
+    if (confirmed != true || !mounted) return;
+    final job = await widget.store.addLibrarySong(song);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: const Text('已加入 AI 处理队列，可在流水线查看实时进度'),
+      action: SnackBarAction(label: '查看', onPressed: widget.onOpenPipeline),
+    ));
+    unawaited(widget.store.startJob(job));
+  }
+
+  void openArtist(MapEntry<String, List<LibrarySong>> group) {
+    showModalBottomSheet<void>(
+      context: context, isScrollControlled: true, showDragHandle: true,
+      builder: (context) => DraggableScrollableSheet(
+        expand: false, initialChildSize: .78, maxChildSize: .95, minChildSize: .45,
+        builder: (context, controller) => Column(children: [
+          Padding(padding: const EdgeInsets.fromLTRB(20, 4, 20, 14), child: Row(children: [
+            CircleAvatar(radius: 34, backgroundColor: const Color(0xFF432B39), foregroundImage: artistImage(group.value.first), child: Text(group.key.substring(0, 1), style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w900))),
+            const SizedBox(width: 14),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(group.key, style: const TextStyle(fontSize: 23, fontWeight: FontWeight.w900)), Text('${group.value.length} 首服务器歌曲', style: const TextStyle(color: Color(0xFFBDAAB5)))])),
+          ])),
+          Expanded(child: ListView.builder(controller: controller, itemCount: group.value.length, itemBuilder: (context, index) {
+            final song = group.value[index];
+            return ListTile(
+              leading: CircleAvatar(backgroundColor: accent.withValues(alpha: .16), child: Text('${index + 1}')),
+              title: Text(song.title), subtitle: Text(song.category),
+              trailing: FilledButton.tonal(onPressed: () { Navigator.pop(context); unawaited(processSong(song)); }, child: const Text('AI 处理')),
+            );
+          })),
+        ]),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final grouped = <String, List<LibrarySong>>{};
     for (final song in widget.store.catalog) {
       grouped.putIfAbsent(song.artist, () => <LibrarySong>[]).add(song);
     }
-    final artists = grouped.entries.toList();
+    final artists = grouped.entries.where((entry) => initial == '全部' || artistInitial(entry.key) == initial).toList()
+      ..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase()));
+    final featured = grouped.entries.take(8).toList();
     return Column(children: [
         PageHeader(title: '歌曲库', subtitle: '${widget.store.catalog.length} 首服务器歌曲 · ${widget.store.jobs.length} 个任务', action: IconButton(onPressed: widget.onImport, icon: const Icon(Icons.add))),
         Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 8), child: Column(children: [
@@ -838,6 +1115,26 @@ class _LibraryPageState extends State<LibraryPage> {
           ]),
         ])),
         if (loading) const LinearProgressIndicator(minHeight: 2),
+        if (widget.store.catalog.isNotEmpty) ...[
+          SizedBox(height: 116, child: ListView.separated(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 10), scrollDirection: Axis.horizontal,
+            itemCount: featured.length, separatorBuilder: (_, __) => const SizedBox(width: 14),
+            itemBuilder: (context, index) {
+              final group = featured[index];
+              return InkWell(onTap: () => openArtist(group), borderRadius: BorderRadius.circular(44), child: SizedBox(width: 76, child: Column(children: [
+                CircleAvatar(radius: 32, backgroundColor: const Color(0xFF432B39), foregroundImage: artistImage(group.value.first), child: Text(group.key.substring(0, 1), style: const TextStyle(fontWeight: FontWeight.w900))),
+                const SizedBox(height: 6),
+                Text(group.key, maxLines: 1, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center),
+              ])));
+            },
+          )),
+          SizedBox(height: 48, child: ListView(
+            padding: const EdgeInsets.symmetric(horizontal: 16), scrollDirection: Axis.horizontal,
+            children: [for (final value in const ['全部','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','#'])
+              Padding(padding: const EdgeInsets.only(right: 7), child: ChoiceChip(label: Text(value), selected: initial == value, onSelected: (_) => setState(() => initial = value))),
+            ],
+          )),
+        ],
         Expanded(
           child: widget.store.catalog.isEmpty
               ? EmptyState(icon: Icons.library_music, title: '服务器歌曲库暂无结果', detail: '把歌曲放进 G:\\JuweierMusicLibrary\\01_Originals，再在 Windows 端扫描；也可直接导入手机文件。', action: widget.onImport)
@@ -846,19 +1143,12 @@ class _LibraryPageState extends State<LibraryPage> {
                   itemCount: artists.length,
                   itemBuilder: (context, i) {
                     final group = artists[i];
-                    return Card(child: ExpansionTile(
-                      initiallyExpanded: i < 3,
-                      leading: const CircleAvatar(backgroundColor: Color(0xFF432B39), child: Icon(Icons.person, color: accent)),
+                    return Card(child: ListTile(
+                      onTap: () => openArtist(group),
+                      leading: CircleAvatar(radius: 26, backgroundColor: const Color(0xFF432B39), foregroundImage: artistImage(group.value.first), child: Text(group.key.substring(0, 1), style: const TextStyle(fontWeight: FontWeight.w900))),
                       title: Text(group.key, style: const TextStyle(fontWeight: FontWeight.w800)),
-                      subtitle: Text('${group.value.length} 首歌曲'),
-                      children: [for (final song in group.value) ListTile(
-                        leading: const Icon(Icons.music_note, color: orangeSoft),
-                        title: Text(song.title), subtitle: Text(song.category),
-                        trailing: FilledButton.tonal(onPressed: () async {
-                          final job = await widget.store.addLibrarySong(song);
-                          await widget.store.startJob(job);
-                        }, child: const Text('AI处理')),
-                      )],
+                      subtitle: Text('${group.value.length} 首服务器歌曲'),
+                      trailing: const Icon(Icons.chevron_right),
                     ));
                   },
                 ),
@@ -1293,6 +1583,7 @@ class _CommunityPageState extends State<CommunityPage> {
     try {
       await widget.store.authenticate(
         account: account.text,
+        phoneValue: '',
         password: password.text,
         register: registerMode,
         nicknameValue: nickname.text,
@@ -1386,6 +1677,90 @@ class _CommunityPageState extends State<CommunityPage> {
           ]),
         )),
       ]);
+}
+
+class ProfilePage extends StatefulWidget {
+  const ProfilePage({super.key, required this.store});
+  final AppStore store;
+
+  @override
+  State<ProfilePage> createState() => _ProfilePageState();
+}
+
+class _ProfilePageState extends State<ProfilePage> {
+  late final TextEditingController avatar;
+  late final TextEditingController nickname;
+  late final TextEditingController bio;
+  late final TextEditingController origin;
+  late final TextEditingController address;
+  late final TextEditingController wechat;
+  late String gender;
+  bool busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    avatar = TextEditingController(text: widget.store.avatarUrl);
+    nickname = TextEditingController(text: widget.store.nickname);
+    bio = TextEditingController(text: widget.store.bio);
+    origin = TextEditingController(text: widget.store.origin);
+    address = TextEditingController(text: widget.store.address);
+    wechat = TextEditingController(text: widget.store.wechat);
+    gender = widget.store.gender;
+  }
+
+  @override
+  void dispose() {
+    avatar.dispose(); nickname.dispose(); bio.dispose(); origin.dispose(); address.dispose(); wechat.dispose();
+    super.dispose();
+  }
+
+  Future<void> save() async {
+    setState(() => busy = true);
+    try {
+      await widget.store.updateProfile({
+        'avatar_url': avatar.text.trim(), 'nickname': nickname.text.trim(), 'gender': gender,
+        'bio': bio.text.trim(), 'origin': origin.text.trim(), 'address': address.text.trim(), 'wechat': wechat.text.trim(),
+      });
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('个人资料已保存')));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('个人设置')),
+    body: ListView(padding: const EdgeInsets.all(18), children: [
+      Center(child: CircleAvatar(
+        radius: 50, backgroundColor: const Color(0xFF432B39),
+        foregroundImage: avatar.text.trim().isEmpty ? null : NetworkImage(avatar.text.trim()),
+        child: Text(widget.store.nickname.isEmpty ? '橘' : widget.store.nickname.substring(0, 1), style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w900)),
+      )),
+      const SizedBox(height: 10),
+      Center(child: Text('${widget.store.username} · ${widget.store.phone}', style: const TextStyle(color: Color(0xFFBDAAB5)))),
+      const SizedBox(height: 18),
+      TextField(controller: avatar, decoration: const InputDecoration(labelText: '头像图片地址（可选）')),
+      const SizedBox(height: 10),
+      TextField(controller: nickname, decoration: const InputDecoration(labelText: '昵称')),
+      const SizedBox(height: 10),
+      DropdownButtonFormField<String>(value: gender, decoration: const InputDecoration(labelText: '性别'), items: const ['保密','男','女','其他'].map((value) => DropdownMenuItem(value: value, child: Text(value))).toList(), onChanged: (value) { if (value != null) setState(() => gender = value); }),
+      const SizedBox(height: 10),
+      TextField(controller: bio, minLines: 3, maxLines: 5, decoration: const InputDecoration(labelText: '个人资料 / 简介')),
+      const SizedBox(height: 10),
+      TextField(controller: origin, decoration: const InputDecoration(labelText: '籍贯')),
+      const SizedBox(height: 10),
+      TextField(controller: address, decoration: const InputDecoration(labelText: '住址')),
+      const SizedBox(height: 10),
+      TextField(controller: wechat, decoration: const InputDecoration(labelText: '微信号')),
+      const SizedBox(height: 18),
+      FilledButton.icon(onPressed: busy ? null : save, icon: const Icon(Icons.save), label: const Text('保存个人资料')),
+      const SizedBox(height: 10),
+      OutlinedButton.icon(onPressed: busy ? null : () async { await widget.store.logout(); if (mounted) Navigator.pop(context); }, icon: const Icon(Icons.logout), label: const Text('退出登录')),
+    ]),
+  );
 }
 
 class LyricsStudioPage extends StatefulWidget {
@@ -1492,7 +1867,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.2
+橘味儿音乐 v3.2.3
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。

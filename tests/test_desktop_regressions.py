@@ -13,7 +13,7 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.2.2"', launcher)
+        self.assertIn('VERSION = "3.2.3"', launcher)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -32,6 +32,17 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('已跳过（未配置 SoundFont）', desktop)
         self.assertIn('/api/v1/auth/register', server)
         self.assertIn('/api/v1/community/messages', server)
+        self.assertIn('/api/v1/auth/sms/send', server)
+        self.assertIn('/api/v1/auth/password/reset', server)
+        self.assertIn('ALIBABA_CLOUD_ACCESS_KEY_ID', server)
+        self.assertNotIn('LTAI', server)
+
+    def test_library_job_routes_stay_inside_cloudflare_library_route(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        self.assertIn('/api/v1/library/jobs/{job_id}', server)
+        self.assertIn('/api/v1/library/artifacts/{job_id}/{name}', server)
+        self.assertIn("'/api/v1/library/jobs/$id'", mobile)
 
     def test_g_drive_library_is_global_and_visible_before_processors(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
