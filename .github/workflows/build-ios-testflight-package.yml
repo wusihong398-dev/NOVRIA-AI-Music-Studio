@@ -3,7 +3,7 @@ name: Build Juweier Music iOS TestFlight Package
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.3"]
+    branches: ["main", "agent/juweier-v3.2.4"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-ios-testflight-package.yml"
@@ -86,12 +86,12 @@ jobs:
       - name: Package iOS Xcode project
         shell: bash
         run: |
-          zip -qry Juweier-Music-v3.2.3-iOS-TestFlight-Xcode-Project.zip mobile_ios
+          zip -qry Juweier-Music-v3.2.4-iOS-TestFlight-Xcode-Project.zip mobile_ios
       - name: Upload iOS TestFlight project package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.3-iOS-TestFlight-Xcode-Project
-          path: Juweier-Music-v3.2.3-iOS-TestFlight-Xcode-Project.zip
+          name: Juweier-Music-v3.2.4-iOS-TestFlight-Xcode-Project
+          path: Juweier-Music-v3.2.4-iOS-TestFlight-Xcode-Project.zip
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
