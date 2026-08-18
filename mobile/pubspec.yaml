@@ -1,15 +1,16 @@
 name: juweier_music
-version: 2.1.7+217
+version: 3.2.2+322
 description: 橘味儿音乐 Android/iOS 正式客户端
 publish_to: 'none'
 environment:
-  sdk: '>=3.3.0 <4.0.0'
+  sdk: '>=3.10.0 <4.0.0'
 dependencies:
   flutter:
     sdk: flutter
   file_picker: ^12.0.0
   cupertino_icons: ^1.0.8
   shared_preferences: ^2.5.3
+  just_audio: ^0.10.5
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -19,6 +20,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/juweier_icon.png
+    - assets/juweier_brand_mark_v322.png
 flutter_launcher_icons:
   android: true
   ios: true

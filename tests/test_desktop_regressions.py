@@ -13,8 +13,33 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "2.1.7"', launcher)
+        self.assertIn('VERSION = "3.2.2"', launcher)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
+
+    def test_sidebar_pages_are_real_and_server_library_isolated(self):
+        desktop = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+        server = (ROOT / "server" / "mobile_api.py").read_text(encoding="utf-8")
+        self.assertIn("class WorksCenterPage", desktop)
+        self.assertIn("self.stack.addWidget(self.works_center)", desktop)
+        self.assertNotIn('Placeholder("作品中心', desktop)
+        self.assertIn(r'G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）', server)
+        self.assertIn('"source_scope": "server"', server)
+
+    def test_v3_account_community_and_soundfont_fallback(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('class CommunityPage', desktop)
+        self.assertIn('已跳过（未配置 SoundFont）', desktop)
+        self.assertIn('/api/v1/auth/register', server)
+        self.assertIn('/api/v1/community/messages', server)
+
+    def test_g_drive_library_is_global_and_visible_before_processors(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        self.assertLess(desktop.index('G 盘歌手歌曲库'), desktop.index('批量 AI 处理器'))
+        self.assertIn('全局 G 盘歌曲', desktop)
+        self.assertIn('def load_library_track', desktop)
+        self.assertIn('self.main.load_library_track(tid)', desktop)
+        self.assertIn('加入当前 G 盘歌曲', desktop)
 
     def test_done_handlers_do_not_destroy_running_qthreads(self):
         source = (ROOT / 'app/main.py').read_text(encoding='utf-8')

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.dart_tool/
+build/
+dist/
+release/
+release-artifacts/
+mobile_build/
+mobile_ios/
+*.part
