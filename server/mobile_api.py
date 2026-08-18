@@ -47,7 +47,7 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.3"
+VERSION = "3.2.4"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -105,6 +105,11 @@ class ProfilePayload(BaseModel):
 
 class ChatPayload(BaseModel):
     content: str = Field(min_length=1, max_length=500)
+
+
+def _normalize_arrangement_mode(value: str) -> str:
+    normalized = (value or "").strip()
+    return {"live_band": "乐队现场版", "studio": "录音室版"}.get(normalized.lower(), normalized or "乐队现场版")
 
 
 class LibraryProcessPayload(BaseModel):
@@ -417,7 +422,7 @@ def health(_: None = Depends(authorize)) -> dict:
 @app.get("/api/v1/library/mobile/app/config")
 def app_config(_: None = Depends(authorize)) -> dict:
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.3",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.4",
         "service": "online",
         "notice": "本软件目前仅供学习与研究使用，不提供歌曲下载服务。",
     }
@@ -712,7 +717,7 @@ def _queue_job(
             "file_name": file_name,
             "input_path": str(input_path),
             "library_track_id": library_track_id,
-            "arrangement_mode": arrangement_mode,
+            "arrangement_mode": _normalize_arrangement_mode(arrangement_mode),
             "transpose": max(-12, min(12, int(transpose))),
             "output": output,
             "status": "queued",
