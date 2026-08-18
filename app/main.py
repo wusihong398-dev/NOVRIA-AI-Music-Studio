@@ -33,14 +33,18 @@ from app.library_catalog import (
     AUDIO_EXTENSIONS,
     catalog_artist_name,
     connect_catalog,
-    default_library_root,
-    ensure_library_layout,
     list_catalog,
     scan_catalog,
     scan_catalog_roots,
     download_public_audio,
 )
 from app.lyrics_ai import generate_lyrics, lyrics_to_lrc
+from app.server_library_client import (
+    DEFAULT_SERVER_URL,
+    ServerLibraryClient,
+    ServerLibraryError,
+    load_desktop_server_config,
+)
 
 import numpy as np
 import sounddevice as sd
@@ -70,6 +74,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STEMS_DIR = BASE_DIR / "stems"
 PROJECTS_DIR = BASE_DIR / "projects"
 EXPORTS_DIR = BASE_DIR / "exports"
+DESKTOP_SERVER_CONFIG = BASE_DIR / "config" / "desktop_server.json"
 
 ASSETS_DIR = BASE_DIR / "assets"
 ICONS_DIR = ASSETS_DIR / "icons"
@@ -296,6 +301,40 @@ class LinkDownloadWorker(QThread):
                 lambda value, text: self.progress.emit(int(value), str(text)),
             )
             self.done.emit(str(path))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class RemoteLibraryJobWorker(QThread):
+    """Queue and monitor one server-owned library processing job."""
+
+    progress = Signal(int, str)
+    done = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, client, track_id, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.track_id = int(track_id)
+
+    def run(self):
+        try:
+            queued = self.client.queue_processing(self.track_id)
+            job_id = str(queued.get("job_id") or queued.get("id") or "")
+            if not job_id:
+                raise RuntimeError("服务器未返回 job_id")
+            while not self.isInterruptionRequested():
+                result = self.client.job(job_id)
+                status = str(result.get("status") or "processing").lower()
+                value = int(float(result.get("progress") or 0))
+                stage = str(result.get("stage") or "服务器处理中")
+                self.progress.emit(max(0, min(100, value)), stage)
+                if status in {"completed", "complete", "done", "success", "succeeded"}:
+                    self.done.emit(job_id, dict(result.get("artifacts") or {}))
+                    return
+                if status in {"failed", "error", "cancelled", "canceled"}:
+                    raise RuntimeError(str(result.get("error") or result.get("message") or "服务器任务失败"))
+                self.msleep(2000)
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
@@ -739,12 +778,26 @@ class SettingsPage(QWidget):
         ll.addWidget(self.prevent_sleep)
         layout.addWidget(live_box)
 
-        server_box = QGroupBox("AI 服务器（电脑端可修改）")
-        server_layout = QHBoxLayout(server_box)
-        self.server_edit = QLineEdit("https://api.db0888.com")
+        server_box = QGroupBox("AI 服务器（服务器 G 盘曲库来源）")
+        server_layout = QGridLayout(server_box)
+        server_config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
+        self.server_edit = QLineEdit(server_config["server"])
         self.server_edit.setPlaceholderText("https://api.example.com")
-        server_layout.addWidget(self.server_edit, 1)
-        server_layout.addWidget(QLabel("手机端已隐藏此配置；更换服务器时再发布更新。"))
+        self.server_token_edit = QLineEdit(server_config["token"])
+        self.server_token_edit.setEchoMode(QLineEdit.Password)
+        self.server_token_edit.setPlaceholderText("访问令牌（服务器未设置时可留空）")
+        save_server = QPushButton("保存并刷新曲库")
+        test_server = QPushButton("测试服务器曲库")
+        apply_button_accent(save_server, "primary")
+        save_server.clicked.connect(self.save_server)
+        test_server.clicked.connect(self.test_server)
+        server_layout.addWidget(QLabel("服务器地址"), 0, 0)
+        server_layout.addWidget(self.server_edit, 0, 1, 1, 3)
+        server_layout.addWidget(QLabel("访问令牌"), 1, 0)
+        server_layout.addWidget(self.server_token_edit, 1, 1, 1, 3)
+        server_layout.addWidget(save_server, 2, 1)
+        server_layout.addWidget(test_server, 2, 2)
+        server_layout.addWidget(QLabel("曲库必须由服务器 API 读取，不会扫描客户端 G 盘。"), 3, 0, 1, 4)
         layout.addWidget(server_box)
 
         legal_box = QGroupBox("协议、帮助与关于")
@@ -765,6 +818,34 @@ class SettingsPage(QWidget):
         study_notice.setObjectName("SectionHint")
         layout.addWidget(study_notice)
         layout.addStretch(1)
+
+    def save_server(self):
+        server = self.server_edit.text().strip().rstrip("/") or DEFAULT_SERVER_URL
+        token = self.server_token_edit.text().strip()
+        atomic_write_json(DESKTOP_SERVER_CONFIG, {"server": server, "token": token})
+        self.server_edit.setText(server)
+        if hasattr(self.main, "music_library"):
+            self.main.music_library.refresh_library()
+        QMessageBox.information(self, "AI 服务器", "服务器地址已保存，已刷新服务器 G 盘曲库。")
+
+    def test_server(self):
+        try:
+            server = self.server_edit.text().strip().rstrip("/") or DEFAULT_SERVER_URL
+            token = self.server_token_edit.text().strip()
+            client = ServerLibraryClient(server, token, timeout=12)
+            health = client.health()
+            catalog = client.songs()
+            root = catalog.get("server_library_root", "未返回路径")
+            lyric_asr = "已安装" if health.get("lyrics_asr_available") else "未安装（仅使用同名 LRC/内嵌歌词）"
+            QMessageBox.information(
+                self, "服务器曲库连接成功",
+                f"服务状态：{health.get('status', 'online')}\n"
+                f"服务器曲库：{root}\n"
+                f"已入库歌曲：{catalog.get('count', 0)} 首\n"
+                f"歌词识别模型：{lyric_asr}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "服务器曲库连接失败", str(exc))
 
     def show_document(self, title, text):
         dialog = QDialog(self)
@@ -2731,11 +2812,23 @@ class MusicLibraryPage(QWidget):
     def __init__(self, main):
         super().__init__()
         self.main = main
-        self.library_paths = ensure_library_layout(default_library_root())
-        self.db_path = self.library_paths["database"]/"juweier_music_library.sqlite3"
-        self.cover_dir = self.library_paths["covers"]
-        self.scan_roots_file = self.library_paths["database"]/"scan_roots.json"
-        self.scan_roots = self._load_scan_roots()
+        self.remote_rows = {}
+        self.server_library_root = r"G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）"
+        # Client state must stay inside the application data directory.  The
+        # G: path belongs to the AI server and is never opened by this process.
+        client_state = BASE_DIR / "library" / "client_state"
+        client_state.mkdir(parents=True, exist_ok=True)
+        self.library_paths = {
+            "originals": BASE_DIR / "imports" / "local_test",
+            "temp": BASE_DIR / "imports" / "local_test",
+            "covers": client_state / "covers",
+            "database": client_state,
+        }
+        self.db_path = client_state / "desktop_local_test.sqlite3"
+        self.cover_dir = client_state / "covers"
+        self.cover_dir.mkdir(parents=True, exist_ok=True)
+        self.scan_roots_file = client_state / "legacy_scan_roots.json"
+        self.scan_roots = []
         self.link_worker = None
         self.batch_queue = []
         self.batch_index = -1
@@ -2769,7 +2862,7 @@ class MusicLibraryPage(QWidget):
         layout.addWidget(title)
 
         hint=QLabel(
-            f"主歌曲目录：{self.library_paths['originals']}。递归读取 MP3/FLAC 并按 G 盘歌手文件夹显示；"
+            f"服务器歌曲目录：{self.server_library_root}。只通过服务器 API 读取，不扫描客户端 G 盘；"
             "基础模型保持六轨，吉他轨完成后再二次识别木吉他与电吉他。"
         )
         hint.setObjectName("SectionHint")
@@ -2777,8 +2870,8 @@ class MusicLibraryPage(QWidget):
         layout.addWidget(hint)
 
         top=QHBoxLayout()
-        scan=QPushButton("扫描全部歌曲目录")
-        choose_root=QPushButton("选择/增加歌曲目录")
+        scan=QPushButton("扫描服务器 G 盘曲库")
+        choose_root=QPushButton("设置服务器")
         import_local=QPushButton("导入本地音乐")
         import_link=QPushButton("导入授权音频链接")
         analyze=QPushButton("批量 BPM / 调性分析")
@@ -2786,7 +2879,7 @@ class MusicLibraryPage(QWidget):
         refresh=QPushButton("刷新音乐库")
         apply_button_accent(scan,"primary")
         scan.clicked.connect(self.scan_imports)
-        choose_root.clicked.connect(self.choose_scan_folder)
+        choose_root.clicked.connect(self.open_server_settings)
         import_local.clicked.connect(self.import_local_music)
         import_link.clicked.connect(self.import_share_link)
         analyze.clicked.connect(self.batch_analyze)
@@ -2815,14 +2908,12 @@ class MusicLibraryPage(QWidget):
         search_row.addWidget(clear_button)
         layout.addLayout(search_row)
 
-        self.library_scan_status=QLabel(
-            "扫描目录：" + "；".join(str(path) for path in self.scan_roots)
-        )
+        self.library_scan_status=QLabel("服务器曲库：等待连接")
         self.library_scan_status.setObjectName("SectionHint")
         self.library_scan_status.setWordWrap(True)
         layout.addWidget(self.library_scan_status)
 
-        library_box=QGroupBox("G 盘歌手歌曲库（展开歌手即可查看全部歌曲）")
+        library_box=QGroupBox("服务器 G 盘歌手歌曲库（展开歌手即可查看全部歌曲）")
         library_layout=QHBoxLayout(library_box)
         self.tree=QTreeWidget()
         self.tree.setHeaderLabels(["歌手分类 / 歌曲","数量 · 分类 · 专辑 · 音质"])
@@ -2898,7 +2989,7 @@ class MusicLibraryPage(QWidget):
         pgl=QGridLayout(pipeline_box)
 
         self.pipeline_executor=QComboBox()
-        self.pipeline_executor.addItems(["本地执行器","云端执行器（接口预留）"])
+        self.pipeline_executor.addItems(["服务器执行器（推荐）","本地测试执行器"])
         self.pipeline_output=QComboBox()
         self.pipeline_output.addItems(["WAV","WAV + MP3"])
 
@@ -3013,11 +3104,25 @@ class MusicLibraryPage(QWidget):
         self.progress.setValue(0)
         layout.addWidget(self.progress)
 
-        self.refresh_library()
+        self.library_scan_status.setText("服务器曲库：程序启动后自动连接…")
+        QTimer.singleShot(800, self.refresh_library)
         self._load_batch_queue()
         self.refresh_task_table()
         self._load_pipeline_jobs()
         self.refresh_pipeline_table()
+
+    def _server_client(self, timeout=30):
+        config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
+        settings = getattr(self.main, "settings_page", None)
+        if settings is not None:
+            config["server"] = settings.server_edit.text().strip().rstrip("/") or config["server"]
+            config["token"] = settings.server_token_edit.text().strip()
+        return ServerLibraryClient(config["server"], config["token"], timeout=timeout)
+
+    def open_server_settings(self):
+        if hasattr(self.main, "nav"):
+            self.main.nav.setCurrentRow(12)
+        self.main.statusBar().showMessage("请配置服务器 API 地址；此页面不会扫描客户端 G 盘")
 
     def _load_scan_roots(self):
         defaults=[self.library_paths["originals"],self.library_paths["temp"]/"链接导入"]
@@ -3059,9 +3164,12 @@ class MusicLibraryPage(QWidget):
         )
         if not files:
             return
-        target=self.library_paths["originals"]/"本地导入"
+        # A local import is a one-song test input only.  Never copy it to a
+        # client G: path or mix it into the server-owned catalog.
+        target=BASE_DIR/"imports"/"local_test"
         target.mkdir(parents=True,exist_ok=True)
         copied=0
+        imported_paths=[]
         for raw in files:
             source=Path(raw)
             destination=target/source.name
@@ -3070,8 +3178,18 @@ class MusicLibraryPage(QWidget):
             if source.resolve()!=destination.resolve():
                 shutil.copy2(source,destination)
             copied+=1
-        self.scan_imports()
-        self.library_scan_status.setText(f"本地导入完成：{copied} 首 · 保存到 {target}")
+            imported_paths.append(destination)
+        first = imported_paths[0]
+        if first.exists():
+            self.main.load_imported_working_file(first)
+            self.main.selected_library_source = "local_test"
+        self.library_scan_status.setText(
+            f"本地测试导入完成：{copied} 首 · 未加入服务器 G 盘曲库"
+        )
+        QMessageBox.information(
+            self, "本地测试音乐",
+            "本地歌曲只作为当前电脑的单曲测试输入，不会加入或替代服务器 G 盘曲库。",
+        )
 
     def import_share_link(self):
         value,ok=QInputDialog.getMultiLineText(
@@ -3086,17 +3204,18 @@ class MusicLibraryPage(QWidget):
             QMessageBox.warning(self,"分享链接","没有识别到 http/https 链接。")
             return
         url=match.group(0).rstrip("，。；;）)]}")
-        if self.link_worker and self.link_worker.isRunning():
-            QMessageBox.information(self,"分享链接","已有下载任务正在进行。")
-            return
-        self.progress.setValue(1)
-        self.link_worker=LinkDownloadWorker(
-            url,self.library_paths["temp"]/"链接导入",self.main._find_ffmpeg()
-        )
-        self.link_worker.progress.connect(self._link_progress)
-        self.link_worker.done.connect(self._link_done)
-        self.link_worker.failed.connect(self._link_failed)
-        self.link_worker.start()
+        self.progress.setValue(10)
+        try:
+            result = self._server_client(timeout=90).import_link(url)
+            self.progress.setValue(100)
+            self.refresh_library()
+            QMessageBox.information(
+                self, "服务器临时曲库",
+                f"已由服务器导入：{result.get('file_name', '音频')}",
+            )
+        except Exception as exc:
+            self.progress.setValue(0)
+            QMessageBox.critical(self, "链接导入失败", str(exc))
 
     def _link_progress(self,value,text):
         self.progress.setValue(max(0,min(100,int(value))))
@@ -3265,34 +3384,34 @@ class MusicLibraryPage(QWidget):
     def scan_imports(self):
         self.progress.setValue(2)
         QApplication.processEvents()
-        result=scan_catalog_roots(
-            self.scan_roots, self.db_path, self.cover_dir,
-            lambda i,total,path: (
-                self.progress.setValue(int(i/max(1,total)*95)),
-                self.library_scan_status.setText(f"正在扫描 {i}/{total}：{path.name}"),
-                QApplication.processEvents(),
-            ),
-        )
-        self.progress.setValue(100)
-        self._prune_stale_jobs()
-        self.refresh_library()
-        roots="\n".join(f"• {root}" for root in result.get("roots",[]))
-        errors="\n".join(result.get("error_samples",[])[:5])
-        self.library_scan_status.setText(
-            f"扫描完成：{result['folders']} 个文件夹，发现 {result['total']} 首；"
-            f"新增 {result['added']}、更新 {result['updated']}、已有 {result['skipped']}、失败 {result['failed']}。"
-            f" 已清理内部工作副本 {result.get('removed_generated',0)} 个。"
-        )
-        QMessageBox.information(
-            self,"歌曲库扫描完成",
-            f"实际扫描目录：\n{roots}\n\n"
-            f"扫描 {result['folders']} 个文件夹，发现 {result['total']} 个完整音频文件。\n"
-            f"已进入 Windows/网盘链接目录 {result.get('linked_folders',0)} 个。\n"
-            f"新增 {result['added']} 首，更新 {result['updated']} 首，已有 {result['skipped']} 首，失败 {result['failed']} 首。\n"
-            f"自动清理重复的内部工作副本 {result.get('removed_generated',0)} 个。\n"
-            f"忽略未下载完成文件 {result.get('ignored_partial',0)} 个。"
-            + (f"\n\n目录读取提示：\n{errors}" if errors else "")
-        )
+        self.library_scan_status.setText("正在请求 AI 服务器扫描服务器 G 盘…")
+        try:
+            result = self._server_client(timeout=300).scan()
+            self.server_library_root = str(result.get("root") or self.server_library_root)
+            self.progress.setValue(100)
+            self.refresh_library()
+            self.library_scan_status.setText(
+                f"服务器扫描完成：{self.server_library_root} · "
+                f"发现 {result.get('total', 0)} 首，新增 {result.get('added', 0)}、"
+                f"更新 {result.get('updated', 0)}、已有 {result.get('skipped', 0)}、"
+                f"失败 {result.get('failed', 0)}。"
+            )
+            QMessageBox.information(
+                self, "服务器 G 盘曲库扫描完成",
+                f"扫描位置（服务器）：\n{self.server_library_root}\n\n"
+                f"发现 {result.get('total', 0)} 个完整音频文件。\n"
+                "本次未读取、未扫描客户端 G 盘。",
+            )
+        except Exception as exc:
+            self.progress.setValue(0)
+            self.remote_rows.clear()
+            self.tree.clear()
+            self.library_scan_status.setText(f"服务器 G 盘扫描失败：{exc}")
+            QMessageBox.critical(
+                self, "服务器 G 盘曲库不可用",
+                f"{exc}\n\n请在‘设置’检查 AI 服务器地址。\n"
+                "为避免混入客户端歌曲，软件不会回退扫描客户端 G 盘。",
+            )
         return
         candidates=[]
         fpfile=BASE_DIR/"imports"/"fingerprints.json"
@@ -3391,7 +3510,10 @@ class MusicLibraryPage(QWidget):
         con.close()
         old_batch=len(self.batch_queue)
         old_pipeline=len(self.pipeline_jobs)
-        self.batch_queue=[item for item in self.batch_queue if int(item.get("id",-1)) in valid_ids]
+        self.batch_queue=[
+            item for item in self.batch_queue
+            if item.get("remote") or int(item.get("id",-1)) in valid_ids
+        ]
         self.pipeline_jobs=[item for item in self.pipeline_jobs if int(item.get("track_id",-1)) in valid_ids]
         if len(self.batch_queue)!=old_batch:
             self._save_batch_queue()
@@ -3405,19 +3527,34 @@ class MusicLibraryPage(QWidget):
         self.tree.clear()
         query=self.library_search.text() if hasattr(self,"library_search") else ""
         category=self.library_category.currentText() if hasattr(self,"library_category") else "全部"
-        rows=list_catalog(self.db_path,query,category)
+        try:
+            result = self._server_client(timeout=30).songs(query, category)
+            if result.get("source_scope") != "server":
+                raise ServerLibraryError("服务器未返回 server 曲库标识")
+            self.server_library_root = str(result.get("server_library_root") or self.server_library_root)
+            rows = [dict(row) for row in result.get("songs", [])]
+            self.remote_rows = {int(row["id"]): row for row in rows}
+        except Exception as exc:
+            rows = []
+            self.remote_rows = {}
+            self.library_scan_status.setText(
+                f"服务器曲库读取失败：{exc} · 已禁止回退扫描客户端 G 盘"
+            )
         artists={}
         for row in rows:
-            artist=catalog_artist_name(row)
+            artist=str(row.get("artist") or "未知歌手")
             if artist not in artists:
                 ai=QTreeWidgetItem([artist,""])
                 ai.setData(0,Qt.UserRole,("artist",artist))
                 self.tree.addTopLevelItem(ai)
                 artists[artist]=ai
             ai=artists[artist]
+            duration=float(row.get("duration") or 0)
             ti=QTreeWidgetItem([
-                row["title"] or Path(row["working_path"]).stem,
-                f'{row["category"]} · {row["album"] or "未分类专辑"} · {row["duration"]:.0f}s · {row["quality"]}'
+                str(row.get("title") or "未命名歌曲"),
+                f'{row.get("category") or "服务器曲库"} · '
+                f'{row.get("album") or "未分类专辑"} · {duration:.0f}s · '
+                f'{row.get("quality") or "待检测"}'
             ])
             ti.setData(0,Qt.UserRole,("track",int(row["id"])))
             ai.addChild(ti)
@@ -3426,10 +3563,11 @@ class MusicLibraryPage(QWidget):
             ai.setText(1,f"{ai.childCount()} 首")
             if index < 30:
                 ai.setExpanded(True)
-        self.library_scan_status.setText(
-            f"当前显示 {len(artists)} 位歌手、{len(rows)} 首歌曲 · "
-            + "扫描目录："+"；".join(str(item) for item in self.scan_roots)
-        )
+        if rows:
+            self.library_scan_status.setText(
+                f"当前显示 {len(artists)} 位歌手、{len(rows)} 首服务器歌曲 · "
+                f"服务器目录：{self.server_library_root} · 未扫描客户端 G 盘"
+            )
         self.tree.setUpdatesEnabled(True)
 
     def _selected_track_id(self):
@@ -3445,89 +3583,71 @@ class MusicLibraryPage(QWidget):
         tid=self._selected_track_id()
         if not tid:
             return
-        con=self._db()
-        row=con.execute("SELECT * FROM tracks WHERE id=?",(tid,)).fetchone()
-        con.close()
+        row=self.remote_rows.get(tid)
         if not row:
             return
 
-        dur=self.main._format_time(row["duration"])
-        br=f'{row["bitrate"]/1000:.0f} kbps' if row["bitrate"] else "-"
-        sr=f'{row["samplerate"]/1000:.1f} kHz' if row["samplerate"] else "-"
+        dur=self.main._format_time(float(row.get("duration") or 0))
+        bitrate=float(row.get("bitrate") or 0)
+        samplerate=float(row.get("samplerate") or 0)
+        br=f'{bitrate/1000:.0f} kbps' if bitrate else "-"
+        sr=f'{samplerate/1000:.1f} kHz' if samplerate else "-"
         self.detail.setText(
-            f'歌曲：{row["title"]}\n歌手：{row["artist"]}\n专辑：{row["album"]}\n'
-            f'时长：{dur}\n格式：{row["format"]}\n码率：{br}\n采样率：{sr}\n'
-            f'声道：{row["channels"] or "-"}\n音质：{row["quality"]}\n'
-            f'BPM：{row["bpm"] if row["bpm"] is not None else "未分析"}\n'
-            f'调性：{row["musical_key"] or "未分析"}\n六轨：{row["stems_status"]}'
+            f'来源：服务器 G 盘\n歌曲：{row.get("title", "")}\n'
+            f'歌手：{row.get("artist", "未知歌手")}\n专辑：{row.get("album") or "未分类专辑"}\n'
+            f'时长：{dur}\n格式：{row.get("format") or "-"}\n码率：{br}\n采样率：{sr}\n'
+            f'声道：{row.get("channels") or "-"}\n音质：{row.get("quality") or "待检测"}\n'
+            f'BPM：{row.get("bpm") if row.get("bpm") is not None else "未分析"}\n'
+            f'调性：{row.get("musical_key") or "未分析"}\n'
+            f'六轨：{row.get("stems_status") or "未分轨"}'
         )
-        cp=row["cover_path"]
-        if cp and Path(cp).exists():
-            pix=QPixmap(cp)
-            self.cover.setPixmap(pix.scaled(210,210,Qt.KeepAspectRatio,Qt.SmoothTransformation))
-        else:
-            self.cover.setPixmap(QPixmap())
-            self.cover.setText("无封面")
+        self.cover.setPixmap(QPixmap())
+        self.cover.setText("服务器曲库")
 
     def batch_analyze(self):
-        con=self._db()
-        rows=con.execute("SELECT id,working_path,title FROM tracks WHERE analysis_status<>'完成' OR analysis_status IS NULL").fetchall()
-        total=max(1,len(rows))
-        done=0
-        for i,row in enumerate(rows):
-            self.progress.setValue(int(i/total*95))
-            QApplication.processEvents()
-            try:
-                import librosa
-                y,sr=librosa.load(row["working_path"],sr=22050,mono=True,duration=240)
-                tempo,_=librosa.beat.beat_track(y=y,sr=sr)
-                bpm=float(np.asarray(tempo).reshape(-1)[0])
-                chroma=librosa.feature.chroma_cqt(y=y,sr=sr)
-                names=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-                key=names[int(np.argmax(np.mean(chroma,axis=1)))]
-                con.execute(
-                    "UPDATE tracks SET bpm=?,musical_key=?,analysis_status='完成' WHERE id=?",
-                    (round(bpm,1),key,row["id"])
-                )
-                done+=1
-            except Exception as e:
-                con.execute(
-                    "UPDATE tracks SET analysis_status=? WHERE id=?",
-                    (f"失败:{str(e)[:80]}",row["id"])
-                )
-        con.commit()
-        con.close()
-        self.progress.setValue(100)
-        self.refresh_library()
-        QMessageBox.information(self,"批量分析",f"完成 {done} 首歌曲的 BPM/调性分析。")
+        if not self.remote_rows:
+            self.refresh_library()
+        if not self.remote_rows:
+            QMessageBox.information(self, "批量分析", "服务器曲库中没有可处理歌曲。")
+            return
+        self.enqueue_stems(show_message=False)
+        QMessageBox.information(
+            self, "服务器批量分析",
+            "已按服务器 G 盘曲库建立任务。服务器流水线会依次完成分轨、BPM/调性、和弦、歌词时间轴和谱面。",
+        )
+        self.start_batch_processing()
 
-    def enqueue_stems(self):
-        con=self._db()
-        rows=con.execute(
-            "SELECT id,title,working_path,stems_status FROM tracks "
-            "WHERE stems_status<>'完成' OR stems_status IS NULL ORDER BY artist,album,title"
-        ).fetchall()
+    def enqueue_stems(self, show_message=True):
+        rows=sorted(
+            self.remote_rows.values(),
+            key=lambda row: (str(row.get("artist") or ""), str(row.get("album") or ""), str(row.get("title") or "")),
+        )
         self.batch_queue=[]
         for row in rows:
+            artist = str(row.get("artist") or "未知歌手")
+            title = str(row.get("title") or f"服务器歌曲 {row.get('id')}")
             self.batch_queue.append({
                 "id":int(row["id"]),
-                "title":row["title"],
-                "path":row["working_path"],
+                "library_id":int(row["id"]),
+                "remote":True,
+                "title":f"{artist} - {title}",
+                "path":"",
                 "status":"待处理",
                 "progress":0,
                 "attempts":0,
                 "error":"",
                 "stem_dir":""
             })
-            con.execute("UPDATE tracks SET stems_status='已排队' WHERE id=?",(row["id"],))
-        con.commit()
-        con.close()
         self._save_batch_queue()
         self.refresh_task_table()
         self.total_progress.setValue(0)
         self.current_progress.setValue(0)
         self.batch_status.setText(f"批处理：已排队 {len(self.batch_queue)} 首")
-        QMessageBox.information(self,"六轨队列",f"已建立 {len(self.batch_queue)} 首歌曲的六轨任务队列。")
+        if show_message:
+            QMessageBox.information(
+                self,"服务器处理队列",
+                f"已从服务器 G 盘曲库建立 {len(self.batch_queue)} 首歌曲的处理任务。",
+            )
 
     def _batch_queue_file(self):
         return BASE_DIR/"library"/"stem_queue.json"
@@ -3660,7 +3780,7 @@ class MusicLibraryPage(QWidget):
         item=self.batch_queue[idx]
         item["status"]="处理中"
         item["attempts"]=int(item.get("attempts",0))+1
-        item["device"]=self._device_for_batch().upper()
+        item["device"]="SERVER" if item.get("remote") else self._device_for_batch().upper()
         item["progress"]=0
         item["error"]=""
         self.current_progress.setValue(0)
@@ -3670,7 +3790,19 @@ class MusicLibraryPage(QWidget):
         self.refresh_task_table()
         self._save_batch_queue()
 
-        # Use the stable single-song worker already proven by the main six-track page.
+        if item.get("remote"):
+            self.batch_worker=RemoteLibraryJobWorker(
+                self._server_client(timeout=60), item.get("library_id", item["id"]), self,
+            )
+            active_worker=self.batch_worker
+            self.batch_worker.progress.connect(self._on_batch_song_progress)
+            self.batch_worker.done.connect(self._on_remote_batch_done)
+            self.batch_worker.failed.connect(self._on_batch_song_failed)
+            self.batch_worker.finished.connect(lambda w=active_worker:self._release_batch_worker(w))
+            self.batch_worker.start()
+            return
+
+        # Local test imports can still use the single-song worker explicitly.
         self.batch_worker=SeparationWorker(item["path"])
         active_worker=self.batch_worker
         self.batch_worker.model_progress.connect(self._on_batch_model_progress)
@@ -3716,12 +3848,13 @@ class MusicLibraryPage(QWidget):
         item["error"]=""
         self.batch_completed+=1
 
-        con=self._db()
-        con.execute("UPDATE tracks SET stems_status='完成' WHERE id=?",(item["id"],))
-        con.commit()
-        con.close()
+        if not item.get("remote"):
+            con=self._db()
+            con.execute("UPDATE tracks SET stems_status='完成' WHERE id=?",(item["id"],))
+            con.commit()
+            con.close()
 
-        if self.after_analysis.isChecked():
+        if self.after_analysis.isChecked() and not item.get("remote"):
             self._post_analyze_track(item)
         if self.after_score.isChecked():
             item["score_status"]="待出谱"
@@ -3731,6 +3864,26 @@ class MusicLibraryPage(QWidget):
         self._update_total_progress()
         if self.batch_paused:
             self.batch_status.setText("批处理：当前歌曲完成，已暂停")
+        else:
+            QTimer.singleShot(250,self._start_next_batch_task)
+
+    def _on_remote_batch_done(self, job_id, artifacts):
+        if not (0<=self.batch_index<len(self.batch_queue)):
+            return
+        item=self.batch_queue[self.batch_index]
+        item["status"]="完成"
+        item["progress"]=100
+        item["device"]="SERVER"
+        item["server_job_id"]=str(job_id)
+        item["artifacts"]=dict(artifacts or {})
+        item["stem_dir"]=f"server://{job_id}"
+        item["error"]=""
+        self.batch_completed+=1
+        self._save_batch_queue()
+        self.refresh_task_table()
+        self._update_total_progress()
+        if self.batch_paused:
+            self.batch_status.setText("批处理：当前服务器任务完成，已暂停")
         else:
             QTimer.singleShot(250,self._start_next_batch_task)
 
@@ -3749,13 +3902,14 @@ class MusicLibraryPage(QWidget):
             item["error"]=str(error).splitlines()[0][:180]
             item["progress"]=0
             self.batch_failed+=1
-            con=self._db()
-            con.execute(
-                "UPDATE tracks SET stems_status=? WHERE id=?",
-                (f"失败:{item['error'][:80]}",item["id"])
-            )
-            con.commit()
-            con.close()
+            if not item.get("remote"):
+                con=self._db()
+                con.execute(
+                    "UPDATE tracks SET stems_status=? WHERE id=?",
+                    (f"失败:{item['error'][:80]}",item["id"])
+                )
+                con.commit()
+                con.close()
 
         self._save_batch_queue()
         self.refresh_task_table()
@@ -3993,12 +4147,17 @@ class MusicLibraryPage(QWidget):
                 self.pipeline_table.setItem(r,c,QTableWidgetItem(str(v)))
 
     def start_auto_pipeline(self):
-        if self.pipeline_executor.currentText().startswith("云端"):
-            QMessageBox.information(
-                self,"云端执行器",
-                "v2.0.0 已预留云端执行器接口，但当前 Windows 测试版尚未绑定服务器 API。\n"
-                "请先使用“本地执行器”。"
+        if self.pipeline_executor.currentText().startswith("服务器"):
+            if not self.remote_rows:
+                self.refresh_library()
+            if not self.remote_rows:
+                QMessageBox.information(self, "服务器流水线", "服务器曲库中没有可处理歌曲。")
+                return
+            self.enqueue_stems(show_message=False)
+            self.pipeline_status.setText(
+                f"服务器流水线：已提交 {len(self.batch_queue)} 首服务器 G 盘歌曲"
             )
+            self.start_batch_processing()
             return
 
         if not self.pipeline_jobs:
@@ -4513,7 +4672,11 @@ class MusicLibraryPage(QWidget):
         tid=self._selected_track_id()
         if not tid:
             return
-        self.main.load_library_track(tid)
+        row=self.remote_rows.get(tid)
+        if not row:
+            QMessageBox.warning(self, "服务器曲库", "请先刷新服务器曲库。")
+            return
+        self.main.load_server_library_track(tid, row)
 
 
 class WorksCenterPage(QWidget):
@@ -4815,6 +4978,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 760)
         self.song_file = None
         self.selected_library_track_id = None
+        self.selected_library_source = "none"
         self.stem_dir = None
         self.base_stem_dir = None
         self.markers = []
@@ -4997,12 +5161,42 @@ class MainWindow(QMainWindow):
         self.current_song_label.setText(f"{artist}\n{row['title']}")
         self.statusBar().showMessage(f"当前 G 盘歌曲：{artist} - {row['title']}")
 
+    def load_server_library_track(self, track_id, row=None):
+        row = dict(row or self.music_library.remote_rows.get(int(track_id)) or {})
+        if not row:
+            QMessageBox.warning(self, "服务器曲库", "找不到这首服务器歌曲，请刷新曲库。")
+            return
+        audio_url = str(row.get("audio_url") or "")
+        if not audio_url:
+            QMessageBox.warning(self, "服务器曲库", "服务器未返回歌曲音频地址。")
+            return
+        format_name = str(row.get("format") or "mp3").lower().lstrip(".")
+        if format_name not in {"mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "aif", "alac"}:
+            format_name = "mp3"
+        artist = str(row.get("artist") or "未知歌手")
+        title = str(row.get("title") or f"服务器歌曲_{track_id}")
+        cache_dir = BASE_DIR / "library" / "server_cache"
+        cache_path = cache_dir / f"{int(track_id)}_{safe_file_stem(artist)}_{safe_file_stem(title)}.{format_name}"
+        try:
+            self.statusBar().showMessage(f"正在从服务器加载：{artist} - {title}")
+            QApplication.processEvents()
+            if not cache_path.is_file() or cache_path.stat().st_size == 0:
+                self.music_library._server_client(timeout=120).download(audio_url, cache_path)
+            self.load_imported_working_file(cache_path, library_track_id=int(track_id))
+            self.selected_library_source = "server"
+            self.current_song_label.setText(f"服务器 · {artist}\n{title}")
+            self.statusBar().showMessage(f"当前服务器 G 盘歌曲：{artist} - {title}")
+        except Exception as exc:
+            QMessageBox.critical(self, "服务器歌曲加载失败", str(exc))
+
     def load_imported_working_file(self, path, library_track_id=None):
         p=Path(path)
         if not p.exists():
             return
         self.song_file=str(p)
         self.selected_library_track_id=library_track_id
+        if library_track_id is None:
+            self.selected_library_source="local_test"
         self.stem_dir=None
         self.engine.close()
         self.studio.file_label.setText(p.name)
@@ -5023,6 +5217,7 @@ class MainWindow(QMainWindow):
             return
         self.song_file = p
         self.selected_library_track_id = None
+        self.selected_library_source = "local_test"
         if hasattr(self,"current_song_label"):
             self.current_song_label.setText(Path(p).name)
         self.stem_dir = None

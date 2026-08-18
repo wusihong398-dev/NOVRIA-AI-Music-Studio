@@ -1036,7 +1036,7 @@ class _PerformancePageState extends State<PerformancePage> {
     }
     final currentKey = transpose(job.originalKey, job.semitones);
     final capo = capoFor(currentKey);
-    final artifactKey = {'和弦谱': 'lead_sheet', '五线谱': 'musicxml', '六线谱': 'guitar_tab', '贝斯谱': 'bass_score', '鼓谱': 'drum_score', '键盘谱': 'piano_score'}[scoreType];
+    final artifactKey = {'和弦谱': 'lead_sheet', '五线谱': 'musicxml', '六线谱': 'guitar_tab', '木吉他谱': 'acoustic_guitar_tab', '电吉他谱': 'electric_guitar_tab', '贝斯谱': 'bass_score', '鼓谱': 'drum_score', '键盘谱': 'piano_score'}[scoreType];
     final artifact = job.artifacts[artifactKey];
     const trackKeys = {'人声': 'stem_vocals', '鼓': 'stem_drums', '贝斯': 'stem_bass', '木吉他': 'stem_guitar', '电吉他': 'stem_electric_guitar', '钢琴': 'stem_piano', '其他': 'stem_other'};
     return Column(children: [
@@ -1102,7 +1102,7 @@ class _PerformancePageState extends State<PerformancePage> {
         const Text('乐手谱面', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
         Wrap(spacing: 7, runSpacing: 7, children: [
-          for (final type in const ['和弦谱', '五线谱', '六线谱', '贝斯谱', '鼓谱', '键盘谱'])
+          for (final type in const ['和弦谱', '五线谱', '六线谱', '木吉他谱', '电吉他谱', '贝斯谱', '鼓谱', '键盘谱'])
             ChoiceChip(label: Text(type), selected: scoreType == type, onSelected: (_) => setState(() => scoreType = type)),
         ]),
         const SizedBox(height: 10),
@@ -1110,9 +1110,9 @@ class _PerformancePageState extends State<PerformancePage> {
           Text(scoreType, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
           const SizedBox(height: 8),
           Text(artifact == null ? '流水线完成后，这里会显示服务器生成的$scoreType。' : '谱面已生成，可复制地址后打开或下载。', style: const TextStyle(color: Color(0xFFBDAAB5))),
-          if ((scoreType == '五线谱' || scoreType == '六线谱') && job.artifacts['score_data'] != null) ...[
+          if (job.artifacts['score_data'] != null) ...[
             const SizedBox(height: 12),
-            ScorePreview(url: job.artifacts['score_data']!, token: widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken, tablature: scoreType == '六线谱', positionSeconds: position.inMilliseconds / 1000),
+            ScorePreview(url: job.artifacts['score_data']!, token: widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken, tablature: scoreType == '六线谱' || scoreType == '木吉他谱' || scoreType == '电吉他谱', positionSeconds: position.inMilliseconds / 1000),
           ],
           if (artifact != null) ...[
             const SizedBox(height: 10),
@@ -1150,6 +1150,7 @@ class ScorePreview extends StatefulWidget {
 class _ScorePreviewState extends State<ScorePreview> {
   List<Map<String, dynamic>> notes = const [];
   List<Map<String, dynamic>> lyrics = const [];
+  String lyricsMessage = '';
 
   @override
   void initState() {
@@ -1177,6 +1178,7 @@ class _ScorePreviewState extends State<ScorePreview> {
         if (mounted) setState(() {
           notes = rows is List ? rows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
           lyrics = lyricRows is List ? lyricRows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
+          lyricsMessage = '${data['lyrics_message'] ?? ''}';
         });
       }
     } finally {
@@ -1188,16 +1190,17 @@ class _ScorePreviewState extends State<ScorePreview> {
   Widget build(BuildContext context) => SizedBox(
         height: 180,
         child: CustomPaint(
-          painter: ScorePainter(notes: notes, lyrics: lyrics, tablature: widget.tablature, positionSeconds: widget.positionSeconds),
+          painter: ScorePainter(notes: notes, lyrics: lyrics, lyricsMessage: lyricsMessage, tablature: widget.tablature, positionSeconds: widget.positionSeconds),
           size: Size.infinite,
         ),
       );
 }
 
 class ScorePainter extends CustomPainter {
-  ScorePainter({required this.notes, required this.lyrics, required this.tablature, required this.positionSeconds});
+  ScorePainter({required this.notes, required this.lyrics, required this.lyricsMessage, required this.tablature, required this.positionSeconds});
   final List<Map<String, dynamic>> notes;
   final List<Map<String, dynamic>> lyrics;
+  final String lyricsMessage;
   final bool tablature;
   final double positionSeconds;
 
@@ -1249,11 +1252,15 @@ class ScorePainter extends CustomPainter {
       text.text = TextSpan(text: currentLyric, style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700));
       text.layout(maxWidth: size.width - 28);
       text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 4));
+    } else if (lyrics.isEmpty && lyricsMessage.isNotEmpty) {
+      text.text = TextSpan(text: lyricsMessage, style: const TextStyle(color: Color(0xFFFFB45E), fontSize: 12));
+      text.layout(maxWidth: size.width - 28);
+      text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 4));
     }
   }
 
   @override
-  bool shouldRepaint(covariant ScorePainter oldDelegate) => oldDelegate.notes != notes || oldDelegate.lyrics != lyrics || oldDelegate.tablature != tablature || oldDelegate.positionSeconds != positionSeconds;
+  bool shouldRepaint(covariant ScorePainter oldDelegate) => oldDelegate.notes != notes || oldDelegate.lyrics != lyrics || oldDelegate.lyricsMessage != lyricsMessage || oldDelegate.tablature != tablature || oldDelegate.positionSeconds != positionSeconds;
 }
 
 class CommunityPage extends StatefulWidget {

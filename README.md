@@ -4,6 +4,8 @@
 
 ## v3.2.2 更新
 
+- Windows 曲库改为只调用服务器 API；`G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）` 由服务器进程扫描，客户端不再打开或回退扫描本机 G 盘。
+- 服务器谱面统一输出歌词时间轴；五线谱、木吉他、电吉他、贝斯、鼓、键盘谱共用同步歌词。优先使用同名 LRC/内嵌歌词，可选 faster-whisper 转写普通话、粤语和英语，AI 结果须人工校对。
 - Android / iOS 内置 AI 服务连接，不向普通用户显示服务器地址；Windows 端保留可见、可修改的配置。
 - 新增 AI 歌词初稿，支持普通话/粤语、3 个方案、TXT/LRC 导出；粤语发音和押韵会明确提示人工复核。
 - 新增开源软件声明、隐私政策、用户协议、帮助与反馈、关于软件。
@@ -68,8 +70,16 @@
 
 1. Windows/GPU 电脑先完成上面的 AI 环境安装。
 2. 双击 `Run-Mobile-Server.bat`，默认端口为 `8000`。
-3. 手机与电脑处于同一局域网；在 App 设置中填入 `http://电脑局域网IP:8000`；外网填写 Cloudflare HTTPS API 域名。
-4. 如设置了环境变量 `JUWEIER_API_TOKEN`，手机端同时填写相同令牌。
+3. 手机端使用应用内置的 HTTPS AI 服务；Windows 测试端可在“设置”查看或修改服务器地址。
+4. 如服务器设置了 `JUWEIER_API_TOKEN`，构建/部署时需为移动端提供相同令牌。
+
+服务器歌曲没有同名 LRC 时，可在服务器安装可选歌词识别组件：
+
+```bash
+pip install -r requirements-lyrics-server.txt
+```
+
+默认模型为 `large-v3-turbo`；可通过 `JUWEIER_LYRICS_MODEL` 修改。模型只安装在服务器，不会增加 Android、iOS 或 Windows 测试客户端安装包体积。
 
 GitHub Actions：
 

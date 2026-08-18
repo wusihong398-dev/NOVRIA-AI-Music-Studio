@@ -10,6 +10,7 @@ import copy
 import hashlib
 import hmac
 import html
+import importlib.util
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from app.project_utils import atomic_write_json, safe_file_stem, load_synced_lyrics
 from app.lyrics_ai import generate_lyrics, lyrics_to_lrc
+from app.lyrics_transcription import transcribe_synced_lyrics
 from app.library_catalog import (
     catalog_artist_name,
     catalog_track,
@@ -267,7 +269,12 @@ def _gpu_name() -> str:
 @app.get("/health")
 @app.get("/api/health")
 def health(_: None = Depends(authorize)) -> dict:
-    return {"status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name()}
+    return {
+        "status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name(),
+        "server_library_root": str(SERVER_LIBRARY_ROOT),
+        "lyrics_asr_available": importlib.util.find_spec("faster_whisper") is not None,
+        "lyrics_asr_model": os.environ.get("JUWEIER_LYRICS_MODEL", "large-v3-turbo"),
+    }
 
 
 @app.get("/api/v1/app/config")
@@ -623,8 +630,8 @@ def _run_job(job_id: str) -> None:
             raise RuntimeError(last_error or f"分轨 Worker 退出码 {code}")
 
         artifacts = {f"stem_{p.stem}": str(p) for p in Path(stem_dir).glob("*.wav")}
-        _update(job_id, stage="BPM / 调性 / 和弦分析", progress=58, artifacts=artifacts)
-        analysis, chord_rows = _analyze(input_path)
+        _update(job_id, stage="BPM / 调性 / 和弦 / 原唱歌词时间轴分析", progress=58, artifacts=artifacts)
+        analysis, chord_rows = _analyze(input_path, Path(stem_dir) / "vocals.wav")
         analysis, chord_rows = _transpose_analysis(analysis, chord_rows, int(job.get("transpose", 0)))
         artifacts["chords"] = str(_write_chords(output_root, chord_rows))
         _update(job_id, stage="生成五线谱、六线谱及各乐手谱面", progress=72, key=analysis["key"], artifacts=artifacts)
@@ -633,11 +640,23 @@ def _run_job(job_id: str) -> None:
         midi = _write_arrangement(output_root, analysis, chord_rows)
         artifacts["arrangement_midi"] = str(midi)
         _update(job_id, status="completed", stage="全部完成", progress=100, artifacts=artifacts)
+        if job.get("library_track_id"):
+            connection = connect_catalog(LIBRARY_DB)
+            try:
+                connection.execute(
+                    """UPDATE tracks SET bpm=?, musical_key=?, analysis_status='完成',
+                       stems_status='完成', chords_status='完成', score_status='完成',
+                       arrangement_status='完成' WHERE id=?""",
+                    (analysis.get("bpm"), analysis.get("key"), int(job["library_track_id"])),
+                )
+                connection.commit()
+            finally:
+                connection.close()
     except Exception as exc:
         _update(job_id, status="failed", stage="失败", error=f"{type(exc).__name__}: {exc}")
 
 
-def _analyze(path: Path) -> tuple[dict, list[dict]]:
+def _analyze(path: Path, vocals_path: Path | None = None) -> tuple[dict, list[dict]]:
     import librosa
 
     y, sample_rate = librosa.load(path, sr=22050, mono=True)
@@ -692,11 +711,29 @@ def _analyze(path: Path) -> tuple[dict, list[dict]]:
         melody_notes = melody_notes[:2000]
     except Exception:
         melody_notes = []
+    duration = float(librosa.get_duration(y=y, sr=sample_rate))
+    # First prefer a same-name LRC/embedded lyric beside the server original.
+    # If it is absent, transcribe the isolated vocal stem for better Mandarin,
+    # Cantonese and English recognition than the full instrumental mix.
+    existing_lyrics = load_synced_lyrics(path, duration)
+    if existing_lyrics:
+        lyric_result = {
+            "rows": existing_lyrics, "status": "ready", "source": "lrc_or_embedded",
+            "language": "", "message": "已读取同名 LRC 或音频内嵌歌词",
+        }
+    else:
+        lyric_result = transcribe_synced_lyrics(
+            vocals_path if vocals_path and vocals_path.is_file() else path, duration,
+        )
     return {
         "bpm": round(bpm, 1), "key": key,
-        "duration": float(librosa.get_duration(y=y, sr=sample_rate)),
+        "duration": duration,
         "melody_notes": melody_notes,
-        "lyrics": load_synced_lyrics(path, float(librosa.get_duration(y=y, sr=sample_rate))),
+        "lyrics": lyric_result["rows"],
+        "lyrics_status": lyric_result["status"],
+        "lyrics_source": lyric_result["source"],
+        "lyrics_language": lyric_result["language"],
+        "lyrics_message": lyric_result["message"],
     }, rows
 
 
@@ -744,6 +781,7 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
                   "G#": ("G", 1), "A": ("A", 0), "A#": ("A", 1), "B": ("B", 0)}
     measures = []
     melody = list(analysis.get("melody_notes", []))
+    lyrics = list(analysis.get("lyrics", []))
     measure_count = max(len(rows), (len(melody) + 3) // 4, 1)
     for index in range(1, measure_count + 1):
         row = rows[index - 1] if index <= len(rows) else {"chords": [analysis.get("key", "C")]}
@@ -760,6 +798,18 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
                 "<time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>"
             )
         alter_xml = f"<root-alter>{alter}</root-alter>" if alter else ""
+        measure_seconds = float(row.get("seconds", 0) or 0)
+        lyric_text = ""
+        for lyric_row in lyrics:
+            if float(lyric_row.get("start", 0) or 0) <= measure_seconds:
+                lyric_text = str(lyric_row.get("text", "") or "")
+            else:
+                break
+        lyric_direction = (
+            "<direction placement='below'><direction-type><words>"
+            + html.escape(lyric_text) + "</words></direction-type></direction>"
+            if lyric_text else ""
+        )
         note_xml = []
         for event in melody[(index - 1) * 4:index * 4]:
             midi = int(event.get("midi", 60))
@@ -775,7 +825,7 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
             note_xml.append("<note><rest/><duration>4</duration><type>whole</type></note>")
         measures.append(
             f'<measure number="{index}">{attributes}<harmony><root><root-step>{step}</root-step>{alter_xml}</root>'
-            f'<kind>{kind}</kind></harmony>{"".join(note_xml)}</measure>'
+            f'<kind>{kind}</kind></harmony>{lyric_direction}{"".join(note_xml)}</measure>'
         )
     path = folder / "lead_sheet.musicxml"
     document = (
@@ -791,21 +841,39 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
 
 
 def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) -> dict[str, str]:
+    lyrics = list(analysis.get("lyrics", []))
+
+    def lyric_at(seconds: float) -> str:
+        current = ""
+        for lyric_row in lyrics:
+            if float(lyric_row.get("start", 0) or 0) <= seconds:
+                current = str(lyric_row.get("text", "") or "")
+            else:
+                break
+        return current
+
     def table(kind: str, hint: str) -> str:
         body = "".join(
-            f"<tr><td>{row['bar']}</td><td>{html.escape(row['section'])}</td><td>{html.escape(' / '.join(row['chords']))}</td><td>{html.escape(hint)}</td></tr>"
+            f"<tr><td>{row['bar']}</td><td>{html.escape(row['section'])}</td>"
+            f"<td>{html.escape(' / '.join(row['chords']))}</td>"
+            f"<td>{html.escape(lyric_at(float(row.get('seconds', 0) or 0)))}</td>"
+            f"<td>{html.escape(hint)}</td></tr>"
             for row in rows
         )
+        lyric_notice = html.escape(str(analysis.get("lyrics_message") or ""))
         return (
             "<!doctype html><meta charset='utf-8'><style>body{font-family:sans-serif;background:#090d18;color:#fff;padding:24px}"
-            "table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #29354d}</style>"
+            "table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #29354d}.notice{color:#ffb45e}</style>"
             f"<h1>{html.escape(title)} · {kind}</h1><p>BPM {analysis['bpm']} · {analysis['key']} 调</p>"
-            f"<table><tr><th>小节</th><th>段落</th><th>和弦</th><th>演奏提示</th></tr>{body}</table>"
+            f"<p class='notice'>歌词：{lyric_notice}</p>"
+            f"<table><tr><th>小节</th><th>段落</th><th>和弦</th><th>同步歌词</th><th>演奏提示</th></tr>{body}</table>"
         )
 
     specs = {
         "lead_sheet": ("和弦谱", "按段落力度演奏"),
         "guitar_tab": ("吉他六线谱参考", "按和弦根音生成分解/扫弦"),
+        "acoustic_guitar_tab": ("木吉他六线谱参考", "木吉他分解和弦/扫弦"),
+        "electric_guitar_tab": ("电吉他六线谱参考", "电吉他节奏型、强拍与 Solo 提示"),
         "bass_score": ("贝斯谱参考", "根音、五度与八度连接"),
         "drum_score": ("鼓谱参考", "Kick / Snare / Hi-Hat，副歌加强"),
         "piano_score": ("键盘谱参考", "左手根音，右手和弦分解"),
@@ -829,8 +897,21 @@ def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) ->
         "duration": analysis.get("duration", 0), "bars": rows,
         "staff_notes": analysis.get("melody_notes", []), "tab_notes": tab_notes,
         "lyrics": analysis.get("lyrics", []),
+        "lyrics_status": analysis.get("lyrics_status", "empty"),
+        "lyrics_source": analysis.get("lyrics_source", "none"),
+        "lyrics_language": analysis.get("lyrics_language", ""),
+        "lyrics_message": analysis.get("lyrics_message", ""),
     })
     result["score_data"] = str(score_data)
+    lyrics_data = folder / "lyrics_timeline.json"
+    atomic_write_json(lyrics_data, {
+        "rows": analysis.get("lyrics", []),
+        "status": analysis.get("lyrics_status", "empty"),
+        "source": analysis.get("lyrics_source", "none"),
+        "language": analysis.get("lyrics_language", ""),
+        "message": analysis.get("lyrics_message", ""),
+    })
+    result["lyrics_timeline"] = str(lyrics_data)
     return result
 
 

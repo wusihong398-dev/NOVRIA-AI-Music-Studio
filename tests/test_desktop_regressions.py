@@ -37,9 +37,20 @@ class DesktopRegressionTests(unittest.TestCase):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
         self.assertLess(desktop.index('G 盘歌手歌曲库'), desktop.index('批量 AI 处理器'))
         self.assertIn('全局 G 盘歌曲', desktop)
-        self.assertIn('def load_library_track', desktop)
-        self.assertIn('self.main.load_library_track(tid)', desktop)
+        self.assertIn('def load_server_library_track', desktop)
+        self.assertIn('self.main.load_server_library_track(tid, row)', desktop)
+        self.assertIn('本次未读取、未扫描客户端 G 盘', desktop)
+        self.assertIn('ServerLibraryClient', desktop)
         self.assertIn('加入当前 G 盘歌曲', desktop)
+
+    def test_server_scores_share_one_synced_lyrics_timeline(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        self.assertIn('transcribe_synced_lyrics', server)
+        self.assertIn('lyrics_timeline.json', server)
+        self.assertIn('electric_guitar_tab', server)
+        self.assertIn('acoustic_guitar_tab', server)
+        self.assertIn("lyrics_message", mobile)
 
     def test_done_handlers_do_not_destroy_running_qthreads(self):
         source = (ROOT / 'app/main.py').read_text(encoding='utf-8')
