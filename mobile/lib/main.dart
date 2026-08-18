@@ -560,7 +560,7 @@ class ApiClient {
         request.write('Content-Disposition: form-data; name="$name"\r\n\r\n$value\r\n');
       }
 
-      field('arrangement_mode', job.arrangementMode);
+      field('arrangement_mode', 'live_band');
       field('transpose', '${job.semitones}');
       field('output', 'wav_mp3');
       request.write('--$boundary\r\n');
@@ -584,7 +584,7 @@ class ApiClient {
 
   Future<Map<String, dynamic>> processLibrary(PipelineJob job) => postJson(
         '/api/v1/library/${job.libraryId}/process',
-        {'arrangement_mode': job.arrangementMode, 'transpose': job.semitones, 'output': 'wav_mp3'},
+        {'arrangement_mode': 'live_band', 'transpose': job.semitones, 'output': 'wav_mp3'},
       );
 
   Future<Map<String, dynamic>> importLink(String url) =>
@@ -1867,7 +1867,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.3
+橘味儿音乐 v3.2.4
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。
