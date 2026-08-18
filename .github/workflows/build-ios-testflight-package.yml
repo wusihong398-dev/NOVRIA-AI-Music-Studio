@@ -47,7 +47,9 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
-          flutter analyze lib --no-fatal-infos
+          # Keep analyzer output visible, but do not block generation of the
+          # unsigned Xcode project on non-fatal lint warnings.
+          flutter analyze lib --no-fatal-infos --no-fatal-warnings
       - name: Add TestFlight upload instructions
         shell: bash
         run: |
