@@ -254,6 +254,18 @@ class AppStore extends ChangeNotifier {
     return client.importLink(url.trim());
   }
 
+  Future<Map<String, dynamic>> generateLyrics(Map<String, dynamic> payload) {
+    if (serverBase.isEmpty) throw const FormatException('AI 服务暂不可用');
+    return ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken)
+        .generateLyrics(payload);
+  }
+
+  Future<Map<String, dynamic>> submitFeedback(Map<String, dynamic> payload) {
+    if (serverBase.isEmpty) throw const FormatException('AI 服务暂不可用');
+    return ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken)
+        .submitFeedback(payload);
+  }
+
   Future<PipelineJob> addLibrarySong(LibrarySong song) async {
     final existing = jobs.where((job) => job.libraryId == song.id);
     if (existing.isNotEmpty) return existing.first;
@@ -1515,7 +1527,7 @@ class _FeedbackPageState extends State<FeedbackPage> {
   @override Widget build(BuildContext context)=>Scaffold(body:SafeArea(child:Column(children:[
     PageHeader(title:'帮助与反馈',subtitle:'问题、建议与隐私请求',action:IconButton(onPressed:()=>Navigator.pop(context),icon:const Icon(Icons.close))),
     Expanded(child:ListView(padding:const EdgeInsets.all(16),children:[
-      const Card(child:Padding(padding:EdgeInsets.all(16),child:Text('常见问题：手机端需要网络连接 AI 服务；谱面和歌词为 AI 识别/生成结果，请在演出前复核。\n\n本软件目前仅供学习与研究使用，不提供歌曲下载服务。')),
+      const Card(child:Padding(padding:EdgeInsets.all(16),child:Text('常见问题：手机端需要网络连接 AI 服务；谱面和歌词为 AI 识别/生成结果，请在演出前复核。\n\n本软件目前仅供学习与研究使用，不提供歌曲下载服务。'))),
       const SizedBox(height:12),
       DropdownButtonFormField(value:category,items:const ['功能建议','故障反馈','账号问题','隐私/删除请求'].map((e)=>DropdownMenuItem(value:e,child:Text(e))).toList(),onChanged:(v)=>setState(()=>category=v!)),
       const SizedBox(height:10),TextField(controller:content,minLines:5,maxLines:10,decoration:const InputDecoration(labelText:'详细内容')),
