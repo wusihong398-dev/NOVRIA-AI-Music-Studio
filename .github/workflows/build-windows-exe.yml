@@ -54,7 +54,7 @@ jobs:
 
           # Keep verification ASCII-only so Windows PowerShell code pages cannot corrupt Chinese UI text.
           $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
-          if ($launcher -notmatch 'VERSION\s*=\s*"3\.2\.3"') { throw "v3.2.4 launcher not found" }
+          if ($launcher -notmatch 'VERSION\s*=\s*"3\.2\.4"') { throw "v3.2.4 launcher not found" }
           if (!(Select-String -Path "app\library_catalog.py" -Pattern "scan_catalog_roots" -Quiet)) { throw "Recursive multi-root library scan missing" }
           if (!(Select-String -Path "app\project_utils.py" -Pattern "electric_guitar.wav" -Quiet)) { throw "Electric-guitar second-stage split missing" }
           if (!(Select-String -Path "app\main.py" -Pattern "DesktopScoreCanvas" -Quiet)) { throw "Desktop staff/tab score canvas missing" }
