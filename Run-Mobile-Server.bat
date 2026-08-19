@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Juweier Music Mobile API v2.1.7
+title Juweier Music Mobile API v3.0.0
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
@@ -10,5 +10,5 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 ".venv\Scripts\python.exe" -m pip install -r requirements-server.txt
-".venv\Scripts\python.exe" -m uvicorn server.mobile_api:app --host 0.0.0.0 --port 18120
+".venv\Scripts\python.exe" -m uvicorn server.mobile_api:app --host 0.0.0.0 --port 8000
 if errorlevel 1 pause

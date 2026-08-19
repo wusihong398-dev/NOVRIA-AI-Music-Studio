@@ -1,5 +1,5 @@
 #define MyAppName "橘味儿音乐"
-#define MyAppVersion "2.1.7"
+#define MyAppVersion "3.2.4"
 #define MyAppExeName "Juweier-Music.exe"
 
 [Setup]
@@ -9,7 +9,7 @@ AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\Juweier Music
 DefaultGroupName={#MyAppName}
 OutputDir=..\release
-OutputBaseFilename=Juweier_Music_v2.1.7_Setup_x64
+OutputBaseFilename=Juweier_Music_v3.2.4_Setup_x64
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -17,7 +17,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 
 [Files]
-Source: "..\dist\Juweier-Music\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; PyTorch ships thousands of duplicate third-party licence copies in very deep
+; metadata paths. Those exceed the classic Windows path limit during Inno
+; compilation. Keep the package's primary licences and omit only that duplicate
+; subtree; runtime binaries and the portable ZIP remain unchanged.
+Source: "..\dist\Juweier-Music\*"; DestDir: "{app}"; Excludes: "_internal\torch-*.dist-info\licenses\third_party\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -1,0 +1,3 @@
+# Optional server-only lyric transcription. This model is not bundled into
+# Windows/Android/iOS clients; install it only on the AI server.
+faster-whisper>=1.2,<2
