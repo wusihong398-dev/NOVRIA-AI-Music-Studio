@@ -8,6 +8,7 @@ torch>=2.6
 torchaudio>=2.6
 demucs>=4.0.1
 audio-separator>=0.44.5
+onnxruntime>=1.17
 soundfile>=0.12.1
 mutagen>=1.47.0
 yt-dlp>=2025.1.15
