@@ -12,6 +12,8 @@ on:
 permissions:
   contents: read
 
+# v3.2.7 final mobile build trigger after remote source verification.
+
 jobs:
   android:
     name: Android APK

@@ -12,6 +12,8 @@ on:
 permissions:
   contents: read
 
+# v3.2.7 final TestFlight build trigger after remote source verification.
+
 jobs:
   ios-project:
     name: iOS Xcode project for TestFlight
