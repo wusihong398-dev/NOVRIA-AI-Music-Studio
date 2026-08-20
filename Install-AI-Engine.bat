@@ -4,7 +4,7 @@ title 橘味儿音乐 - AI 引擎安装程序
 cd /d "%~dp0"
 
 echo ============================================================
-echo 橘味儿音乐 v3.2.6 AI 引擎安装
+echo 橘味儿音乐 v3.2.7 UVR AI 引擎安装
 echo ============================================================
 
 where py >nul 2>nul
@@ -31,11 +31,10 @@ if not exist ".venv\Scripts\python.exe" (
 echo [2/4] 更新 pip...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip setuptools wheel
 
-echo [3/4] 安装桌面和音频依赖...
-".venv\Scripts\python.exe" -m pip install -r requirements.txt
+echo [3/4] 安装桌面、服务器和 UVR 音频依赖...
+".venv\Scripts\python.exe" -m pip install -r requirements.txt -r requirements-server.txt
 
-echo [4/4] 安装 Demucs...
-".venv\Scripts\python.exe" -m pip install demucs
+echo [4/4] 检查 UVR/audio-separator 与 Demucs...
 
 echo.
 echo 检查 Demucs...
@@ -49,10 +48,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
+".venv\Scripts\python.exe" -c "from audio_separator.separator import Separator; print('UVR audio-separator ready')"
+if errorlevel 1 (
+  echo UVR audio-separator 安装检查失败。
+  pause
+  exit /b 1
+)
+
 echo.
 echo ============================================================
 echo 安装完成。
 echo 现在可以双击 Run-Juweier-Music.bat 启动。
-echo 第一次执行六轨分离时会自动下载 htdemucs_6s 模型。
+echo 第一次执行分轨时会由 UVR audio-separator 自动下载 htdemucs_6s 模型。
 echo ============================================================
 pause

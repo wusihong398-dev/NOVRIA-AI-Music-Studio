@@ -1,7 +1,7 @@
-# 橘味儿音乐 v3.2.6 手机测试顺序
+# 橘味儿音乐 v3.2.7 手机测试顺序
 
 1. 服务器安装 `requirements-server.txt` 后，双击 `Run-Mobile-Server.bat`。
-2. 双击 `Check-Mobile-Server-v326.bat`，确认版本为 3.2.6、`catalog_count` 大于 0。
+2. 双击 `Check-Mobile-Server-v327.bat`，确认版本为 3.2.7、`processing_ready=true`、`catalog_count` 大于 0。
 3. 确认 Cloudflare 将 `/api/v1/library` 路径转发到本机 8001 端口。
 4. 安装 Android APK 或运行 iOS 模拟器包。
 5. 如果短信暂未配置，点击“先进入测试（无需验证码）”。

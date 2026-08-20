@@ -30,7 +30,7 @@ class ServerLibraryClient:
             raise ServerLibraryError("AI 服务器地址必须以 http:// 或 https:// 开头")
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        headers = {"Accept": "application/json", "User-Agent": "Juweier-Music/3.2.6"}
+        headers = {"Accept": "application/json", "User-Agent": "Juweier-Music/3.2.7"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         body = None
@@ -53,8 +53,22 @@ class ServerLibraryClient:
         except Exception as exc:
             raise ServerLibraryError(f"无法连接服务器：{exc}") from exc
 
+    def _request_any(self, method: str, paths: list[str], payload: dict | None = None) -> dict:
+        last_error: Exception | None = None
+        for path in paths:
+            try:
+                return self._request(method, path, payload)
+            except ServerLibraryError as exc:
+                last_error = exc
+                text = str(exc).casefold()
+                if "not found" not in text and "404" not in text:
+                    raise
+        raise ServerLibraryError(str(last_error or "服务器没有可用的兼容接口"))
+
     def health(self) -> dict:
-        return self._request("GET", "/health")
+        return self._request_any("GET", [
+            "/api/v1/library/mobile/health", "/api/v1/library/health", "/health",
+        ])
 
     def scan(self) -> dict:
         return self._request("POST", "/api/v1/library/scan")
@@ -63,10 +77,14 @@ class ServerLibraryClient:
         return self._request("POST", "/api/v1/library/import-url", {"url": url})
 
     def songs(self, query: str = "", category: str = "全部") -> dict:
-        path = "/api/v1/library?" + urllib.parse.urlencode({
+        params = urllib.parse.urlencode({
             "q": query, "category": category, "limit": 100000,
         })
-        return self._request("GET", path)
+        return self._request_any("GET", [
+            f"/api/v1/library/mobile/catalog?{params}",
+            f"/api/v1/library/catalog?{params}",
+            f"/api/v1/library?{params}",
+        ])
 
     def queue_processing(
         self, track_id: int, arrangement_mode: str = "乐队现场版",
@@ -79,11 +97,15 @@ class ServerLibraryClient:
 
     def job(self, job_id: str) -> dict:
         safe_id = urllib.parse.quote(str(job_id), safe="")
-        return self._request("GET", f"/api/v1/jobs/{safe_id}")
+        return self._request_any("GET", [
+            f"/api/v1/library/mobile/jobs/{safe_id}",
+            f"/api/v1/library/jobs/{safe_id}",
+            f"/api/v1/jobs/{safe_id}",
+        ])
 
     def download(self, url: str, destination: Path) -> Path:
         absolute = urllib.parse.urljoin(self.base_url + "/", url)
-        headers = {"Accept": "*/*", "User-Agent": "Juweier-Music/3.2.6"}
+        headers = {"Accept": "*/*", "User-Agent": "Juweier-Music/3.2.7"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         destination.parent.mkdir(parents=True, exist_ok=True)

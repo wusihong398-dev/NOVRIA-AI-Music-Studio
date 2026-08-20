@@ -1,10 +1,10 @@
 name: Build Juweier Music Android and iOS
-run-name: Juweier Music v3.2.6 Android + iOS · ${{ github.ref_name }}
+run-name: Juweier Music v3.2.7 Android + iOS · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.6"]
+    branches: ["main", "agent/juweier-v3.2.7"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-mobile.yml"
@@ -57,7 +57,7 @@ jobs:
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.6-Android-Test-Pack
+          name: Juweier-Music-v3.2.7-Android-Test-Pack
           path: |
             mobile_build/build/app/outputs/flutter-apk/app-release.apk
             mobile_build/build/app/outputs/bundle/release/app-release.aab
@@ -101,16 +101,16 @@ jobs:
       - name: Build iOS simulator validation app
         working-directory: mobile_build
         run: flutter build ios --simulator --debug
-      - name: Package iOS simulator app
+      - name: Stage iOS simulator app without nested archive
         shell: bash
         run: |
-          cd mobile_build/build/ios/iphonesimulator
-          zip -0qry ../../../../Juweier-Music-v3.2.6-iOS-Simulator.zip Runner.app
+          mkdir -p ios-simulator
+          cp -R mobile_build/build/ios/iphonesimulator/Runner.app ios-simulator/Runner.app
       - name: Upload iOS simulator package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.6-iOS-Simulator
-          path: Juweier-Music-v3.2.6-iOS-Simulator.zip
+          name: Juweier-Music-v3.2.7-iOS-Simulator
+          path: ios-simulator
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

@@ -1,10 +1,10 @@
 name: Build Juweier Music Windows EXE
-run-name: Juweier Music v3.2.6 Windows · ${{ github.ref_name }}
+run-name: Juweier Music v3.2.7 Windows · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "agent/juweier-v3.2.6" ]
+    branches: [ "main", "agent/juweier-v3.2.7" ]
     paths:
       - "app/**"
       - "assets/**"
@@ -42,7 +42,7 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
 
-      - name: Verify v3.2.6 complete pipeline EXE
+      - name: Verify v3.2.7 complete pipeline EXE
         shell: powershell
         run: |
           $root = "dist\Juweier-Music"
@@ -55,7 +55,7 @@ jobs:
 
           # Keep verification ASCII-only so Windows PowerShell code pages cannot corrupt Chinese UI text.
           $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
-          if ($launcher -notmatch 'VERSION\s*=\s*"3\.2\.6"') { throw "v3.2.6 launcher not found" }
+          if ($launcher -notmatch 'VERSION\s*=\s*"3\.2\.7"') { throw "v3.2.7 launcher not found" }
           if (!(Select-String -Path "app\library_catalog.py" -Pattern "scan_catalog_roots" -Quiet)) { throw "Recursive multi-root library scan missing" }
           if (!(Select-String -Path "app\project_utils.py" -Pattern "electric_guitar.wav" -Quiet)) { throw "Electric-guitar second-stage split missing" }
           if (!(Select-String -Path "app\main.py" -Pattern "DesktopScoreCanvas" -Quiet)) { throw "Desktop staff/tab score canvas missing" }
@@ -69,11 +69,6 @@ jobs:
           & $ffmpeg -version | Select-Object -First 1
           Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
 
-      - name: Package Windows build
-        shell: powershell
-        run: |
-          Compress-Archive -Path "dist\Juweier-Music\*" -DestinationPath "Juweier_Music_v3.2.6_Windows_x64.zip" -Force
-
       - name: Build Windows installer
         shell: powershell
         run: |
@@ -81,14 +76,21 @@ jobs:
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (!(Test-Path $iscc)) { throw "Inno Setup compiler not found" }
           & $iscc "installer\NOVRIA.iss"
-          if (!(Test-Path "release\Juweier_Music_v3.2.6_Setup_x64.exe")) { throw "Installer was not created" }
+          if (!(Test-Path "release\Juweier_Music_v3.2.7_Setup_x64.exe")) { throw "Installer was not created" }
 
-      - name: Upload v3.2.6 Windows artifact
+      - name: Upload v3.2.7 Windows portable files without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.6-Windows-x64
-          path: |
-            Juweier_Music_v3.2.6_Windows_x64.zip
-            release/Juweier_Music_v3.2.6_Setup_x64.exe
+          name: Juweier-Music-v3.2.7-Windows-x64-Portable
+          path: dist/Juweier-Music
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload v3.2.7 Windows installer directly
+        uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.2.7-Windows-Setup
+          path: release/Juweier_Music_v3.2.7_Setup_x64.exe
           if-no-files-found: error
           retention-days: 30

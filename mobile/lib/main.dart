@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.6';
+const appVersion = '3.2.7';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -103,33 +103,39 @@ class PipelineJob {
 }
 
 class LibrarySong {
-  const LibrarySong({required this.id, required this.title, required this.artist, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl});
+  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl});
   final int id;
   final String title;
   final String artist;
+  final String album;
   final String artistInitial;
   final String category;
   final String audioUrl;
   final String coverUrl;
+  final String lyricsUrl;
 
   factory LibrarySong.fromJson(Map<String, dynamic> json) => LibrarySong(
         id: (json['id'] as num?)?.toInt() ?? 0,
         title: '${json['title'] ?? '未命名歌曲'}',
         artist: '${json['artist'] ?? '未知歌手'}',
+        album: '${json['album'] ?? ''}',
         artistInitial: '${json['artist_initial'] ?? '#'}'.toUpperCase(),
         category: '${json['category'] ?? '本地导入'}',
         audioUrl: '${json['audio_url'] ?? ''}',
         coverUrl: '${json['cover_url'] ?? ''}',
+        lyricsUrl: '${json['lyrics_url'] ?? ''}',
       );
 
   Map<String, dynamic> toJson() => {
         'id': id,
         'title': title,
         'artist': artist,
+        'album': album,
         'artist_initial': artistInitial,
         'category': category,
         'audio_url': audioUrl,
         'cover_url': coverUrl,
+        'lyrics_url': lyricsUrl,
       };
 }
 
@@ -162,6 +168,7 @@ class AppStore extends ChangeNotifier {
   static const _accountTokenKey = 'juweier_account_token';
   static const _usernameKey = 'juweier_username';
   static const _nicknameKey = 'juweier_nickname';
+  // Keep the existing catalog key so v3.2.6 users see cached songs immediately.
   static const _catalogKey = 'juweier_catalog_v326';
   static const _guestKey = 'juweier_guest_testing';
 
@@ -338,8 +345,14 @@ class AppStore extends ChangeNotifier {
     try {
       final token = accountToken.isNotEmpty ? accountToken : apiToken;
       final result = await ApiClient(serverBase, token).health();
-      serverState = '在线';
-      serverDetail = '${result['gpu'] ?? result['device'] ?? '服务器可用'} · ${result['catalog_count'] ?? catalog.length} 首歌曲';
+      final ready = result['processing_ready'] == true;
+      serverState = ready ? '在线 · AI就绪' : '在线 · AI未就绪';
+      final runtime = result['runtime'];
+      final issues = runtime is Map && runtime['issues'] is List
+          ? (runtime['issues'] as List).join('；')
+          : '';
+      serverDetail = '${result['gpu'] ?? result['device'] ?? '服务器可用'} · ${result['catalog_count'] ?? catalog.length} 首歌曲'
+          '${ready || issues.isEmpty ? '' : ' · $issues'}';
     } catch (error) {
       serverState = '离线';
       serverDetail = '$error';
@@ -366,6 +379,14 @@ class AppStore extends ChangeNotifier {
     }
     final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
     try {
+      final health = await client.health();
+      if (health['processing_ready'] == false) {
+        final runtime = health['runtime'];
+        final issues = runtime is Map && runtime['issues'] is List
+            ? (runtime['issues'] as List).join('；')
+            : '服务器 AI 分轨运行环境未安装完整';
+        throw FormatException(issues);
+      }
       job.status = job.libraryId > 0 ? '加载中' : '上传中';
       job.stage = job.libraryId > 0 ? '连接服务器歌曲库' : '上传音频';
       job.progress = job.libraryId > 0 ? .01 : .03;
@@ -375,7 +396,6 @@ class AppStore extends ChangeNotifier {
 
       Map<String, dynamic> response;
       if (job.libraryId > 0) {
-        await client.health();
         job.stage = '定位服务器歌曲';
         job.progress = .04;
         await _save();
@@ -459,6 +479,9 @@ class AppStore extends ChangeNotifier {
     }
     if (lower.contains("no module named 'demucs'") || lower.contains('缺少 demucs')) {
       return '服务器未安装 AI 分轨运行环境（缺少 Demucs）：请安装 requirements-server.txt 后重启服务。';
+    }
+    if (lower.contains('audio_separator') || lower.contains('audio-separator')) {
+      return '服务器未安装 UVR 分轨运行环境（audio-separator）：请重新运行 Install-AI-Engine.bat 后重启服务。';
     }
     if (lower.contains('ffmpeg') && (lower.contains('not found') || lower.contains('未找到'))) {
       return '服务器缺少 FFmpeg，暂时不能读取或处理歌曲。';
@@ -620,7 +643,7 @@ class ApiClient {
 
   Future<Map<String, dynamic>> health() async {
     Object? lastError;
-    for (final path in const ['/api/v1/library/mobile/health', '/health', '/api/health']) {
+    for (final path in const ['/api/v1/library/mobile/health', '/api/v1/library/health', '/health', '/api/health']) {
       try {
         return await _jsonRequest('GET', path);
       } catch (error) {
@@ -631,7 +654,20 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> submit(PipelineJob job) async {
-    final uri = Uri.parse('$base/api/v1/library/mobile/jobs');
+    Object? lastError;
+    for (final path in const ['/api/v1/library/mobile/jobs', '/api/v1/library/jobs', '/api/v1/jobs']) {
+      try {
+        return await _submitToPath(job, path);
+      } catch (error) {
+        lastError = error;
+        if (!_isRouteMissing(error)) rethrow;
+      }
+    }
+    throw FormatException('$lastError');
+  }
+
+  Future<Map<String, dynamic>> _submitToPath(PipelineJob job, String path) async {
+    final uri = Uri.parse('$base$path');
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       final request = await client.postUrl(uri);
@@ -647,9 +683,10 @@ class ApiClient {
       field('arrangement_mode', 'live_band');
       field('transpose', '${job.semitones}');
       field('output', 'wav_mp3');
+      field('original_filename', job.fileName);
       request.write('--$boundary\r\n');
-      request.write('Content-Disposition: form-data; name="file"; filename="${_safeHeader(job.fileName)}"\r\n');
-      request.write('Content-Type: audio/mpeg\r\n\r\n');
+      request.write('Content-Disposition: form-data; name="file"; filename="${_asciiUploadName(job.fileName)}"\r\n');
+      request.write('Content-Type: application/octet-stream\r\n\r\n');
       await request.addStream(File(job.path).openRead());
       request.write('\r\n--$boundary--\r\n');
       final response = await request.close().timeout(const Duration(minutes: 10));
@@ -659,21 +696,30 @@ class ApiClient {
     }
   }
 
-  Future<Map<String, dynamic>> job(String id) async =>
-      _jsonRequest('GET', '/api/v1/library/mobile/jobs/$id');
+  Future<Map<String, dynamic>> job(String id) => _jsonRequestAny('GET', [
+        '/api/v1/library/mobile/jobs/$id',
+        '/api/v1/library/jobs/$id',
+        '/api/v1/jobs/$id',
+      ]);
 
-  Future<Map<String, dynamic>> library(String query, String category) => _jsonRequest(
-        'GET',
-        '/api/v1/library/mobile/catalog?q=${Uri.encodeQueryComponent(query)}&category=${Uri.encodeQueryComponent(category)}',
-      );
+  Future<Map<String, dynamic>> library(String query, String category) {
+    final params = 'q=${Uri.encodeQueryComponent(query)}&category=${Uri.encodeQueryComponent(category)}';
+    return _jsonRequestAny('GET', [
+      '/api/v1/library/mobile/catalog?$params',
+      '/api/v1/library/catalog?$params',
+      '/api/v1/library?$params',
+    ]);
+  }
 
-  Future<Map<String, dynamic>> processLibrary(PipelineJob job) => postJson(
+  Future<Map<String, dynamic>> processLibrary(PipelineJob job) => _jsonRequestAny('POST', [
         '/api/v1/library/mobile/catalog/${job.libraryId}/process',
-        {'arrangement_mode': 'live_band', 'transpose': job.semitones, 'output': 'wav_mp3'},
-      );
+        '/api/v1/library/${job.libraryId}/process',
+      ], payload: {'arrangement_mode': 'live_band', 'transpose': job.semitones, 'output': 'wav_mp3'});
 
-  Future<Map<String, dynamic>> importLink(String url) =>
-      postJson('/api/v1/library/mobile/import-url', {'url': url});
+  Future<Map<String, dynamic>> importLink(String url) => _jsonRequestAny('POST', [
+        '/api/v1/library/mobile/import-url',
+        '/api/v1/library/import-url',
+      ], payload: {'url': url});
 
   Future<Map<String, dynamic>> generateLyrics(Map<String, dynamic> payload) =>
       postJson('/api/v1/library/mobile/lyrics/generate', payload);
@@ -688,6 +734,19 @@ class ApiClient {
 
   Future<Map<String, dynamic>> putJson(String path, Map<String, dynamic> payload) =>
       _jsonRequest('PUT', path, payload: payload);
+
+  Future<Map<String, dynamic>> _jsonRequestAny(String method, List<String> paths, {Map<String, dynamic>? payload}) async {
+    Object? lastError;
+    for (final path in paths) {
+      try {
+        return await _jsonRequest(method, path, payload: payload);
+      } catch (error) {
+        lastError = error;
+        if (!_isRouteMissing(error)) rethrow;
+      }
+    }
+    throw FormatException('$lastError');
+  }
 
   Future<Map<String, dynamic>> _jsonRequest(String method, String path, {Map<String, dynamic>? payload}) async {
     Object? lastError;
@@ -709,7 +768,7 @@ class ApiClient {
         return await _decode(response);
       } catch (error) {
         lastError = error;
-        if (attempt >= 2) rethrow;
+        if (_isRouteMissing(error) || attempt >= 2) rethrow;
         await Future<void>.delayed(Duration(milliseconds: 600 * (attempt + 1)));
       } finally {
         client.close(force: true);
@@ -750,7 +809,19 @@ class ApiClient {
     }
   }
 
-  String _safeHeader(String value) => value.replaceAll(RegExp(r'[\r\n"]'), '_');
+  bool _isRouteMissing(Object error) {
+    final text = '$error'.toLowerCase();
+    return text.contains('not found') || text.contains('（404）') || text.contains('(404)');
+  }
+
+  String _asciiUploadName(String value) {
+    final normalized = value.replaceAll('\\', '/').split('/').last;
+    final dot = normalized.lastIndexOf('.');
+    var extension = dot >= 0 ? normalized.substring(dot).toLowerCase() : '.mp3';
+    if (!RegExp(r'^\.[a-z0-9]{1,8}$').hasMatch(extension)) extension = '.mp3';
+    final digest = utf8.encode(normalized).fold<int>(0, (hash, byte) => ((hash * 31) + byte) & 0x7fffffff);
+    return 'upload_${digest.toRadixString(16)}$extension';
+  }
 }
 
 class JuweierMusicApp extends StatelessWidget {
@@ -1206,7 +1277,8 @@ class _LibraryPageState extends State<LibraryPage> {
       final categoryMatches = category == '全部' || song.category == category;
       final textMatches = filterText.isEmpty ||
           song.title.toLowerCase().contains(filterText) ||
-          song.artist.toLowerCase().contains(filterText);
+          song.artist.toLowerCase().contains(filterText) ||
+          song.album.toLowerCase().contains(filterText);
       return categoryMatches && textMatches;
     });
     final grouped = <String, List<LibrarySong>>{};
@@ -2011,7 +2083,7 @@ class _LyricsStudioPageState extends State<LyricsStudioPage> {
 }
 
 const openSourceNotice = '''
-橘味儿音乐感谢开源社区。移动端使用 Flutter、Dart、file_picker、shared_preferences、just_audio 与 cupertino_icons；服务器/电脑端使用 FastAPI、PyTorch、Demucs、NumPy、SciPy、librosa 和 PySide6 等组件。
+橘味儿音乐感谢开源社区。移动端使用 Flutter、Dart、file_picker、shared_preferences、just_audio 与 cupertino_icons；服务器/电脑端使用 FastAPI、PyTorch、Demucs、audio-separator/UVR、NumPy、SciPy、librosa 和 PySide6 等组件。
 
 各组件的版权、商标与许可证归其权利人所有，实际许可条款以随包许可证和官方项目声明为准。本软件不宣称对这些组件享有额外权利。
 ''';
@@ -2031,7 +2103,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.6
+橘味儿音乐 v3.2.7
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。

@@ -1,4 +1,4 @@
-# 橘味儿音乐 v3.2.6（三端测试版）
+# 橘味儿音乐 v3.2.7（三端修复版）
 
 > 本软件目前仅供学习与研究使用，不提供歌曲下载服务。
 
@@ -29,7 +29,7 @@
 - 使用正式橘子音符图标，桌面端和移动端统一为橙色暗色视觉。
 - Windows、Android、iOS 共用账号系统和内测群聊。
 - 修复播放中拖动进度条后跳回旧位置的问题，所有分轨同步定位。
-- 基础模型仍为 `htdemucs_6s` 六轨；综合吉他轨会继续执行二次频谱分离，生成独立木吉他与电吉他轨，不虚标七轨模型。
+- 使用 `audio-separator` 运行 UVR 兼容的 `htdemucs_6s.yaml` 六轨；真实 Guitar stem 再执行木吉他/电吉他二阶段识别，生成独立轨道并记录诊断，不虚标七轨模型。
 - Android/iOS 新增服务器歌曲库，可按歌曲、歌手、抖音流行、酷狗排行榜搜索并直接提交 AI 处理。
 - 新增主旋律音高转写、MusicXML、可视五线谱和实际品位六线谱，并随播放位置滚动。
 - 默认本地歌曲库为 `G:\JuweierMusicLibrary`，原曲放在 `01_Originals`，不会重复复制。
@@ -53,9 +53,9 @@
 | Windows | `app/`、`Run-Juweier-Music.bat` | 本地服务器/测试工作站，负责六轨基础分离、电吉他二次分离、分析、编配、谱面和演出 |
 | Android | `mobile/` | Flutter 正式客户端；上传音频、查看进度、管理任务和谱面 |
 | iOS | `mobile/` | 与 Android 共用 Flutter 代码；提供未签名包与 TestFlight 工程工作流 |
-| 手机 AI 服务 | `server/mobile_api.py`、`Run-Mobile-Server.bat` | 在 Windows/GPU 电脑执行 Demucs 与分析，向手机提供任务 API |
+| 手机 AI 服务 | `server/mobile_api.py`、`Run-Mobile-Server.bat` | 在 Windows/GPU 电脑执行 UVR 兼容分轨与分析，向手机提供任务 API |
 
-手机端不会在手机本机运行 Demucs 大模型。手机可选择服务器歌曲库或上传音频，由 Windows/GPU 电脑完成分轨、BPM/调性/和弦分析、主旋律转写、五线谱、六线谱和新编配 MIDI。
+手机端不会在手机本机运行 UVR 大模型。手机可选择服务器歌曲库或上传音频，由 Windows/GPU 电脑完成分轨、BPM/调性/和弦分析、主旋律转写、五线谱、六线谱和新编配 MIDI。
 
 ## Windows 源码运行
 
@@ -64,7 +64,7 @@
 3. 双击 `Check-GPU.bat` 检查 CUDA。
 4. 双击 `Run-Juweier-Music.bat`。
 
-第一次分轨会安装并校验 `htdemucs_6s` AI 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.6-Windows-x64`，其中含安装程序和便携 ZIP。
+第一次分轨会由 UVR 兼容引擎下载并校验 `htdemucs_6s.yaml` 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；便携目录和安装程序分别直接交付，不再压缩包套压缩包。
 
 ## Android / iOS 使用
 

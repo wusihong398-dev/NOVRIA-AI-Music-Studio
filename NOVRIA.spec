@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 _datas = [('assets','assets')]
 _binaries = []
 _hidden = []
-for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp']:
+for pkg in ['demucs', 'audio_separator', 'onnx', 'onnxruntime', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp']:
     try:
         d, b, h = collect_all(pkg)
         _datas += d
@@ -14,9 +14,11 @@ for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'libros
         pass
 
 _hidden += collect_submodules('demucs')
+_hidden += collect_submodules('audio_separator')
 _common_hidden = _hidden + [
     'numpy', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp',
     'demucs.separate', 'demucs.pretrained', 'demucs.apply', 'demucs.api',
+    'audio_separator.separator',
 ]
 
 _windows_manifest = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

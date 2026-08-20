@@ -8,16 +8,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class DesktopRegressionTests(unittest.TestCase):
     def test_python_sources_parse(self):
-        for relative in ('app/main.py', 'app/launcher.py', 'app/separation_worker_process.py', 'server/mobile_api.py'):
+        for relative in ('app/main.py', 'app/launcher.py', 'app/separation_worker_process.py', 'app/uvr_separator.py', 'server/mobile_api.py'):
             ast.parse((ROOT / relative).read_text(encoding='utf-8'))
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
         mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.2.6"', launcher)
-        self.assertIn('version: 3.2.6+326', mobile_manifest)
-        self.assertIn('VERSION = "3.2.6"', server)
+        self.assertIn('VERSION = "3.2.7"', launcher)
+        self.assertIn('version: 3.2.7+327', mobile_manifest)
+        self.assertIn('VERSION = "3.2.7"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -104,6 +104,45 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertNotIn('self.batch_worker=None', methods['_on_batch_song_done'])
         self.assertNotIn('self.batch_worker=None', methods['_on_batch_song_failed'])
         self.assertNotIn('self.pipeline_batch_worker=None', methods['_pipeline_stems_done'])
+
+    def test_v327_mobile_upload_and_route_fallbacks(self):
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn("field('original_filename', job.fileName)", mobile)
+        self.assertIn('filename="${_asciiUploadName(job.fileName)}"', mobile)
+        self.assertNotIn('filename="${_safeHeader(job.fileName)}"', mobile)
+        self.assertIn("'/api/v1/library/catalog?$params'", mobile)
+        self.assertIn("'/api/v1/library?$params'", mobile)
+        self.assertIn('original_filename: str = Form("")', server)
+        self.assertIn('@app.post("/api/v1/library/jobs", status_code=202)', server)
+
+    def test_windows_catalog_is_async_lazy_and_letters_are_visible(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        self.assertIn('class ServerCatalogWorker(QThread)', desktop)
+        self.assertIn('self.tree.itemExpanded.connect(self._populate_artist_children)', desktop)
+        self.assertIn('["展开后加载歌曲",""]', desktop)
+        self.assertIn('button.setFixedWidth(50 if value == "全部" else 36)', desktop)
+        self.assertNotIn('ai.setExpanded(bool(query.strip()))', desktop)
+
+    def test_uvr_engine_electric_guitar_and_lyrics_toggle(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        uvr = (ROOT / 'app/uvr_separator.py').read_text(encoding='utf-8')
+        server_requirements = (ROOT / 'requirements-server.txt').read_text(encoding='utf-8')
+        self.assertIn('from audio_separator.separator import Separator', uvr)
+        self.assertIn('htdemucs_6s.yaml', uvr)
+        self.assertIn('electric_guitar.wav', (ROOT / 'app/project_utils.py').read_text(encoding='utf-8'))
+        self.assertIn('audio-separator>=0.44.5', server_requirements)
+        self.assertIn('QCheckBox("显示歌词")', desktop)
+        self.assertIn('score/show_lyrics', desktop)
+        self.assertIn('lyrics_url', desktop)
+
+    def test_actions_do_not_create_nested_delivery_archives(self):
+        mobile_workflow = (ROOT / '.github/workflows/build-mobile.yml').read_text(encoding='utf-8')
+        ios_workflow = (ROOT / '.github/workflows/build-ios-testflight-package.yml').read_text(encoding='utf-8')
+        windows_workflow = (ROOT / '.github/workflows/build-windows-exe.yml').read_text(encoding='utf-8')
+        self.assertNotIn('Juweier-Music-v3.2.7-iOS-Simulator.zip', mobile_workflow)
+        self.assertNotIn('Juweier-Music-v3.2.7-iOS-TestFlight-Xcode-Project.zip', ios_workflow)
+        self.assertNotIn('Compress-Archive', windows_workflow)
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.6.
+"""Mobile API companion for 橘味儿音乐 v3.2.7.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -53,7 +53,7 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.6"
+VERSION = "3.2.7"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -76,7 +76,7 @@ SERVER_LIBRARY_FLAC_ROOT = Path(os.environ.get(
     r"G:\JuweierMusicLibrary\008.按歌手分类",
 ))
 SERVER_LIBRARY_ROOTS = list(dict.fromkeys((SERVER_LIBRARY_ROOT, SERVER_LIBRARY_FLAC_ROOT)))
-AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "1").strip().lower() not in {
+AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "0").strip().lower() not in {
     "0", "false", "no", "off",
 }
 connect_catalog(LIBRARY_DB).close()
@@ -499,6 +499,7 @@ def _runtime_capabilities() -> dict:
     modules = {
         "torch": importlib.util.find_spec("torch") is not None,
         "demucs": importlib.util.find_spec("demucs") is not None,
+        "audio_separator": importlib.util.find_spec("audio_separator") is not None,
         "librosa": importlib.util.find_spec("librosa") is not None,
         "mido": importlib.util.find_spec("mido") is not None,
     }
@@ -539,6 +540,8 @@ def _friendly_job_error(exc: Exception) -> str:
         return "AI 处理环境未安装 PyTorch（torch），请安装 requirements-server.txt 后重启服务器。"
     if "no module named 'demucs'" in lowered:
         return "AI 六轨分离模型未安装（demucs），请安装 requirements-server.txt 后重启服务器。"
+    if "audio_separator" in lowered or "audio-separator" in lowered:
+        return "UVR 分轨运行环境未安装（audio-separator），请重新运行 Install-AI-Engine.bat 后重启服务器。"
     if "ffmpeg" in lowered and ("not found" in lowered or "找不到" in text):
         return "服务器未安装或未配置 FFmpeg，暂时无法读取和处理音频。"
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
@@ -546,6 +549,7 @@ def _friendly_job_error(exc: Exception) -> str:
 
 @app.get("/health")
 @app.get("/api/health")
+@app.get("/api/v1/library/health")
 @app.get("/api/v1/library/mobile/health")
 def health(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
@@ -567,7 +571,7 @@ def health(_: None = Depends(authorize)) -> dict:
 def app_config(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.6",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.7",
         "service": "online",
         "processing_ready": capabilities["processing_ready"],
         "lyrics_asr_available": capabilities["lyrics_asr_available"],
@@ -814,20 +818,23 @@ def send_community_message(payload: ChatPayload, user: sqlite3.Row = Depends(cur
 
 
 @app.post("/api/v1/jobs", status_code=202)
+@app.post("/api/v1/library/jobs", status_code=202)
 @app.post("/api/v1/library/mobile/jobs", status_code=202)
 async def create_job(
     file: UploadFile = File(...),
+    original_filename: str = Form(""),
     arrangement_mode: str = Form("乐队现场版"),
     transpose: int = Form(0),
     output: str = Form("wav_mp3"),
     _: None = Depends(authorize),
 ) -> dict:
-    suffix = Path(file.filename or "audio.mp3").suffix.lower() or ".mp3"
+    display_name = (original_filename or file.filename or "audio.mp3").replace("\\", "/").split("/")[-1]
+    suffix = Path(display_name).suffix.lower() or Path(file.filename or "audio.mp3").suffix.lower() or ".mp3"
     allowed = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".aif"}
     if suffix not in allowed:
         raise HTTPException(status_code=400, detail="不支持的音频格式")
     job_id = uuid.uuid4().hex
-    name = safe_file_stem(Path(file.filename or "audio").stem)
+    name = safe_file_stem(Path(display_name).stem)
     upload_path = UPLOADS / f"{job_id}_{name}{suffix}"
     size = 0
     with upload_path.open("wb") as stream:
@@ -844,7 +851,7 @@ async def create_job(
     await file.close()
 
     queued_id = _queue_job(
-        file_name=file.filename or upload_path.name,
+        file_name=display_name or upload_path.name,
         input_path=upload_path,
         arrangement_mode=arrangement_mode,
         transpose=transpose,
@@ -883,6 +890,7 @@ def _queue_job(
 
 
 @app.get("/api/v1/library/mobile/catalog")
+@app.get("/api/v1/library/catalog")
 @app.get("/api/v1/library")
 def library(
     request: Request, q: str = "", category: str = "全部", limit: int = 100000,
@@ -911,6 +919,13 @@ def library(
         song.pop("source_path", None)
         song.pop("working_path", None)
         song["audio_url"] = str(request.url_for("library_mobile_audio", track_id=track_id))
+        audio_path = Path(source_path)
+        lyric_path = next(
+            (candidate for candidate in (audio_path.with_suffix(".lrc"), audio_path.with_suffix(".LRC")) if candidate.is_file()),
+            None,
+        )
+        if lyric_path is not None:
+            song["lyrics_url"] = str(request.url_for("library_mobile_lyrics", track_id=track_id))
         if song.get("cover_path"):
             song["cover_url"] = str(request.url_for("library_mobile_cover", track_id=track_id))
         song.pop("cover_path", None)
@@ -932,6 +947,7 @@ def library(
 
 
 @app.post("/api/v1/library/mobile/catalog/scan")
+@app.post("/api/v1/library/catalog/scan")
 @app.post("/api/v1/library/scan")
 def scan_library(_: None = Depends(authorize)) -> dict:
     try:
@@ -967,6 +983,23 @@ def library_cover(track_id: int, _: None = Depends(authorize)):
     if not path or not path.is_file():
         raise HTTPException(status_code=404, detail="封面不存在")
     return FileResponse(path, filename=path.name)
+
+
+@app.get("/api/v1/library/mobile/catalog/{track_id}/lyrics", name="library_mobile_lyrics")
+@app.get("/api/v1/library/catalog/{track_id}/lyrics", name="library_lyrics")
+@app.get("/api/v1/library/{track_id}/lyrics", name="library_legacy_lyrics")
+def library_lyrics(track_id: int, _: None = Depends(authorize)):
+    song = catalog_track(LIBRARY_DB, track_id)
+    audio_path = Path(str(song.get("working_path") or song.get("source_path"))) if song else None
+    if not audio_path:
+        raise HTTPException(status_code=404, detail="歌词不存在")
+    path = next(
+        (candidate for candidate in (audio_path.with_suffix(".lrc"), audio_path.with_suffix(".LRC")) if candidate.is_file()),
+        None,
+    )
+    if path is None:
+        raise HTTPException(status_code=404, detail="歌词不存在")
+    return FileResponse(path, filename=f"{safe_file_stem(audio_path.stem)}.lrc", media_type="text/plain")
 
 
 @app.post("/api/v1/library/mobile/catalog/{track_id}/process", status_code=202)

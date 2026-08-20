@@ -3,6 +3,7 @@ numpy>=1.26,<3
 sounddevice>=0.4.7
 soundfile>=0.12.1
 demucs>=4.0.1
+audio-separator>=0.44.5
 pyinstaller>=6.10,<7
 
 librosa>=0.10.2

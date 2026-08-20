@@ -227,7 +227,12 @@ def align_lyric_units_to_notes(notes: Iterable[dict], units: Iterable[dict]) -> 
     return result
 
 
-def split_guitar_stem(stem_dir: str | Path) -> dict:
+def split_guitar_stem(
+    stem_dir: str | Path,
+    *,
+    engine: str = "demucs-direct",
+    model: str = "htdemucs_6s",
+) -> dict:
     """Split the six-stem model's combined guitar into aligned acoustic/electric files."""
     import shutil
     import librosa
@@ -271,7 +276,9 @@ def split_guitar_stem(stem_dir: str | Path) -> dict:
     sf.write(str(guitar), np.column_stack(acoustic_channels), sample_rate, subtype="PCM_24")
     sf.write(str(folder / "electric_guitar.wav"), np.column_stack(electric_channels), sample_rate, subtype="PCM_24")
     diagnostics = {
-        "method": "spectral-soft-mask-v1", "base_model": "htdemucs_6s",
+        "method": "electric-acoustic-spectral-mask-v2",
+        "engine": engine,
+        "base_model": model,
         "sample_rate": int(sample_rate), "duration": float(len(audio) / sample_rate),
         "electric_activity": round(float(np.mean(frame_scores)), 4),
         "outputs": ["guitar.wav", "electric_guitar.wav", "guitar_combined.wav"],
