@@ -936,8 +936,7 @@ class _MainShellState extends State<MainShell> {
   int index = 0;
 
   Future<void> pickAudio() async {
-    final result = await FilePicker.platform.pickFiles(type: FileType.audio, allowMultiple: true);
-    final files = result?.files ?? const <PlatformFile>[];
+    final files = await FilePicker.pickFiles(type: FileType.audio);
     if (files.isEmpty || !mounted) return;
     final report = await widget.store.addFiles(files);
     if (!mounted) return;
