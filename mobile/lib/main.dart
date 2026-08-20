@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.5';
+const appVersion = '3.2.6';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -103,10 +103,11 @@ class PipelineJob {
 }
 
 class LibrarySong {
-  const LibrarySong({required this.id, required this.title, required this.artist, required this.category, required this.audioUrl, required this.coverUrl});
+  const LibrarySong({required this.id, required this.title, required this.artist, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl});
   final int id;
   final String title;
   final String artist;
+  final String artistInitial;
   final String category;
   final String audioUrl;
   final String coverUrl;
@@ -115,10 +116,21 @@ class LibrarySong {
         id: (json['id'] as num?)?.toInt() ?? 0,
         title: '${json['title'] ?? '未命名歌曲'}',
         artist: '${json['artist'] ?? '未知歌手'}',
+        artistInitial: '${json['artist_initial'] ?? '#'}'.toUpperCase(),
         category: '${json['category'] ?? '本地导入'}',
         audioUrl: '${json['audio_url'] ?? ''}',
         coverUrl: '${json['cover_url'] ?? ''}',
       );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'artist': artist,
+        'artist_initial': artistInitial,
+        'category': category,
+        'audio_url': audioUrl,
+        'cover_url': coverUrl,
+      };
 }
 
 class ImportReport {
@@ -150,6 +162,8 @@ class AppStore extends ChangeNotifier {
   static const _accountTokenKey = 'juweier_account_token';
   static const _usernameKey = 'juweier_username';
   static const _nicknameKey = 'juweier_nickname';
+  static const _catalogKey = 'juweier_catalog_v326';
+  static const _guestKey = 'juweier_guest_testing';
 
   SharedPreferences? _prefs;
   final List<PipelineJob> jobs = [];
@@ -167,6 +181,7 @@ class AppStore extends ChangeNotifier {
   String origin = '';
   String address = '';
   String wechat = '';
+  bool guestMode = false;
   String accountState = '未登录';
   String serverState = '待检测';
   String serverDetail = 'AI 服务由应用自动连接';
@@ -178,7 +193,17 @@ class AppStore extends ChangeNotifier {
     accountToken = _prefs?.getString(_accountTokenKey) ?? '';
     username = _prefs?.getString(_usernameKey) ?? '';
     nickname = _prefs?.getString(_nicknameKey) ?? '';
+    guestMode = _prefs?.getBool(_guestKey) ?? false;
     accountState = accountToken.isEmpty ? '未登录' : '已登录';
+    final rawCatalog = _prefs?.getString(_catalogKey);
+    if (rawCatalog != null && rawCatalog.isNotEmpty) {
+      try {
+        final rows = jsonDecode(rawCatalog) as List<dynamic>;
+        catalog.addAll(rows.map((row) => LibrarySong.fromJson(Map<String, dynamic>.from(row as Map))));
+      } catch (_) {
+        catalog.clear();
+      }
+    }
     final raw = _prefs?.getString(_jobsKey);
     if (raw != null && raw.isNotEmpty) {
       try {
@@ -196,6 +221,7 @@ class AppStore extends ChangeNotifier {
       }
     }
     unawaited(testServer());
+    unawaited(refreshCatalog(silent: true));
     if (accountToken.isNotEmpty) unawaited(refreshProfile());
   }
 
@@ -204,6 +230,8 @@ class AppStore extends ChangeNotifier {
     await _prefs?.setString(_accountTokenKey, accountToken);
     await _prefs?.setString(_usernameKey, username);
     await _prefs?.setString(_nicknameKey, nickname);
+    await _prefs?.setBool(_guestKey, guestMode);
+    await _prefs?.setString(_catalogKey, jsonEncode(catalog.map((e) => e.toJson()).toList()));
   }
 
   Future<void> saveServer(String base, String token) async {
@@ -245,17 +273,24 @@ class AppStore extends ChangeNotifier {
     return ImportReport(added, skipped);
   }
 
-  Future<void> refreshCatalog({String query = '', String category = '全部'}) async {
+  Future<void> refreshCatalog({String query = '', String category = '全部', bool silent = false}) async {
     if (serverBase.isEmpty) return;
-    final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
-    final result = await client.library(query, category);
-    final rows = result['songs'];
-    catalog
-      ..clear()
-      ..addAll(rows is List
-          ? rows.map((row) => LibrarySong.fromJson(Map<String, dynamic>.from(row as Map)))
-          : const <LibrarySong>[]);
-    notifyListeners();
+    try {
+      final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
+      // Keep one complete offline catalog. Search and category filters are
+      // applied locally so a filtered screen never overwrites the startup cache.
+      final result = await client.library('', '全部');
+      final rows = result['songs'];
+      catalog
+        ..clear()
+        ..addAll(rows is List
+            ? rows.map((row) => LibrarySong.fromJson(Map<String, dynamic>.from(row as Map)))
+            : const <LibrarySong>[]);
+      await _save();
+      notifyListeners();
+    } catch (_) {
+      if (!silent) rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> importPublicLink(String url) async {
@@ -301,9 +336,10 @@ class AppStore extends ChangeNotifier {
     serverDetail = serverBase;
     notifyListeners();
     try {
-      final result = await ApiClient(serverBase, apiToken).health();
+      final token = accountToken.isNotEmpty ? accountToken : apiToken;
+      final result = await ApiClient(serverBase, token).health();
       serverState = '在线';
-      serverDetail = '${result['gpu'] ?? result['device'] ?? '服务器可用'}';
+      serverDetail = '${result['gpu'] ?? result['device'] ?? '服务器可用'} · ${result['catalog_count'] ?? catalog.length} 首歌曲';
     } catch (error) {
       serverState = '离线';
       serverDetail = '$error';
@@ -468,6 +504,7 @@ class AppStore extends ChangeNotifier {
       username = '${result['username'] ?? account.trim()}';
       nickname = '${result['nickname'] ?? username}';
       phone = '${result['phone'] ?? phoneValue.trim()}';
+      guestMode = false;
       accountState = '已登录';
       await _save();
       await refreshProfile();
@@ -540,9 +577,19 @@ class AppStore extends ChangeNotifier {
     address = '';
     wechat = '';
     accountState = '未登录';
+    guestMode = false;
     communityMessages.clear();
     await _save();
     notifyListeners();
+  }
+
+  Future<void> enterGuestTesting() async {
+    guestMode = true;
+    accountState = '测试模式';
+    await _save();
+    notifyListeners();
+    unawaited(testServer());
+    unawaited(refreshCatalog(silent: true));
   }
 
   Future<void> refreshCommunity() async {
@@ -617,16 +664,16 @@ class ApiClient {
 
   Future<Map<String, dynamic>> library(String query, String category) => _jsonRequest(
         'GET',
-        '/api/v1/library?q=${Uri.encodeQueryComponent(query)}&category=${Uri.encodeQueryComponent(category)}',
+        '/api/v1/library/mobile/catalog?q=${Uri.encodeQueryComponent(query)}&category=${Uri.encodeQueryComponent(category)}',
       );
 
   Future<Map<String, dynamic>> processLibrary(PipelineJob job) => postJson(
-        '/api/v1/library/${job.libraryId}/process',
+        '/api/v1/library/mobile/catalog/${job.libraryId}/process',
         {'arrangement_mode': 'live_band', 'transpose': job.semitones, 'output': 'wav_mp3'},
       );
 
   Future<Map<String, dynamic>> importLink(String url) =>
-      postJson('/api/v1/library/import-url', {'url': url});
+      postJson('/api/v1/library/mobile/import-url', {'url': url});
 
   Future<Map<String, dynamic>> generateLyrics(Map<String, dynamic> payload) =>
       postJson('/api/v1/library/mobile/lyrics/generate', payload);
@@ -643,19 +690,32 @@ class ApiClient {
       _jsonRequest('PUT', path, payload: payload);
 
   Future<Map<String, dynamic>> _jsonRequest(String method, String path, {Map<String, dynamic>? payload}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
-    try {
-      final request = await client.openUrl(method, Uri.parse('$base$path'));
-      _headers(request);
-      if (payload != null) {
-        request.headers.contentType = ContentType.json;
-        request.write(jsonEncode(payload));
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 12);
+      try {
+        final request = await client.openUrl(method, Uri.parse('$base$path'));
+        _headers(request);
+        if (payload != null) {
+          request.headers.contentType = ContentType.json;
+          request.write(jsonEncode(payload));
+        }
+        final response = await request.close().timeout(const Duration(seconds: 25));
+        if (<int>{502, 503, 504}.contains(response.statusCode) && attempt < 2) {
+          await response.drain<void>();
+          await Future<void>.delayed(Duration(milliseconds: 600 * (attempt + 1)));
+          continue;
+        }
+        return await _decode(response);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 2) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 600 * (attempt + 1)));
+      } finally {
+        client.close(force: true);
       }
-      final response = await request.close().timeout(const Duration(seconds: 20));
-      return await _decode(response);
-    } finally {
-      client.close(force: true);
     }
+    throw FormatException('$lastError');
   }
 
   void _headers(HttpClientRequest request) {
@@ -677,7 +737,17 @@ class ApiClient {
       throw FormatException(message);
     }
     if (body.trim().isEmpty) return <String, dynamic>{};
-    return Map<String, dynamic>.from(jsonDecode(body) as Map);
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is! Map) throw const FormatException('返回内容不是 JSON 对象');
+      return Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      final contentType = response.headers.contentType?.mimeType ?? '未知类型';
+      if (body.toLowerCase().contains('cloudflare') || body.trimLeft().startsWith('<')) {
+        throw FormatException('AI 服务器返回了网页而不是数据（$contentType），请检查 Cloudflare Tunnel 与 Mobile API 路由。');
+      }
+      throw FormatException('AI 服务器返回的数据格式不完整（$contentType），请稍后重试。');
+    }
   }
 
   String _safeHeader(String value) => value.replaceAll(RegExp(r'[\r\n"]'), '_');
@@ -718,7 +788,7 @@ class JuweierMusicApp extends StatelessWidget {
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
           ),
         ),
-        home: store.accountToken.isEmpty ? AuthGatePage(store: store) : MainShell(store: store),
+        home: store.accountToken.isEmpty && !store.guestMode ? AuthGatePage(store: store) : MainShell(store: store),
       ),
   );
 }
@@ -836,6 +906,16 @@ class _AuthGatePageState extends State<AuthGatePage> {
           TextField(controller: password, obscureText: true, decoration: InputDecoration(labelText: reset ? '设置新密码（至少 6 位）' : '密码（至少 6 位）')),
           const SizedBox(height: 18),
           FilledButton.icon(onPressed: busy ? null : submit, icon: busy ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.login), label: Text(reset ? '重置密码' : register ? '注册并进入' : '登录')),
+          if (!register && !reset) ...[
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: busy ? null : widget.store.enterGuestTesting,
+              icon: const Icon(Icons.science_outlined),
+              label: const Text('先进入测试（无需验证码）'),
+            ),
+            const SizedBox(height: 6),
+            const Text('测试模式可体验曲库、导入、AI 流水线和谱面；账号资料与内测群聊仍需正式登录。', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
+          ],
           const SizedBox(height: 12),
           const Text('验证码 60 秒内只能发送 1 次，5 分钟内有效。注册即表示同意用户协议与隐私政策。', style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
         ])),
@@ -856,7 +936,8 @@ class _MainShellState extends State<MainShell> {
   int index = 0;
 
   Future<void> pickAudio() async {
-    final files = await FilePicker.pickFiles(type: FileType.audio);
+    final result = await FilePicker.platform.pickFiles(type: FileType.audio, allowMultiple: true);
+    final files = result?.files ?? const <PlatformFile>[];
     if (files.isEmpty || !mounted) return;
     final report = await widget.store.addFiles(files);
     if (!mounted) return;
@@ -1060,11 +1141,9 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  String artistInitial(String value) {
-    final text = value.trim();
-    if (text.isEmpty) return '#';
-    final first = text.substring(0, 1).toUpperCase();
-    return RegExp(r'[A-Z]').hasMatch(first) ? first : '#';
+  String artistInitial(LibrarySong song) {
+    final value = song.artistInitial.trim().toUpperCase();
+    return RegExp(r'^[A-Z]$').hasMatch(value) ? value : '#';
   }
 
   ImageProvider<Object>? artistImage(LibrarySong song) {
@@ -1123,11 +1202,19 @@ class _LibraryPageState extends State<LibraryPage> {
 
   @override
   Widget build(BuildContext context) {
+    final filterText = search.text.trim().toLowerCase();
+    final visibleSongs = widget.store.catalog.where((song) {
+      final categoryMatches = category == '全部' || song.category == category;
+      final textMatches = filterText.isEmpty ||
+          song.title.toLowerCase().contains(filterText) ||
+          song.artist.toLowerCase().contains(filterText);
+      return categoryMatches && textMatches;
+    });
     final grouped = <String, List<LibrarySong>>{};
-    for (final song in widget.store.catalog) {
+    for (final song in visibleSongs) {
       grouped.putIfAbsent(song.artist, () => <LibrarySong>[]).add(song);
     }
-    final artists = grouped.entries.where((entry) => initial == '全部' || artistInitial(entry.key) == initial).toList()
+    final artists = grouped.entries.where((entry) => initial == '全部' || artistInitial(entry.value.first) == initial).toList()
       ..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase()));
     final featured = grouped.entries.take(8).toList();
     return Column(children: [
@@ -1144,11 +1231,9 @@ class _LibraryPageState extends State<LibraryPage> {
           FilledButton.icon(onPressed: refresh, icon: const Icon(Icons.search), label: const Text('搜索')),
           ]),
           const SizedBox(height: 8),
-          Row(children: [
-            Expanded(child: DropdownButtonFormField<String>(value: category, decoration: const InputDecoration(labelText: '歌曲分类'), items: const ['全部','本地导入','临时歌曲库','抖音流行','酷狗排行榜'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) { setState(() => category = value); unawaited(refresh()); } })),
-            const SizedBox(width: 8),
+          Wrap(spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+            SizedBox(width: 190, child: DropdownButtonFormField<String>(initialValue: category, decoration: const InputDecoration(labelText: '歌曲分类'), items: const ['全部','本地导入','临时歌曲库','抖音流行','酷狗排行榜'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) { setState(() => category = value); unawaited(refresh()); } })),
             OutlinedButton.icon(onPressed: widget.onImport, icon: const Icon(Icons.audio_file), label: const Text('本地导入')),
-            const SizedBox(width: 8),
             OutlinedButton.icon(onPressed: importLink, icon: const Icon(Icons.link), label: const Text('链接导入')),
           ]),
         ])),
@@ -1166,7 +1251,7 @@ class _LibraryPageState extends State<LibraryPage> {
               ])));
             },
           )),
-          SizedBox(height: 48, child: ListView(
+          SizedBox(height: 52, child: ListView(
             padding: const EdgeInsets.symmetric(horizontal: 16), scrollDirection: Axis.horizontal,
             children: [for (final value in const ['全部','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','#'])
               Padding(padding: const EdgeInsets.only(right: 7), child: ChoiceChip(label: Text(value), selected: initial == value, onSelected: (_) => setState(() => initial = value))),
@@ -1478,6 +1563,7 @@ class ScorePreview extends StatefulWidget {
 class _ScorePreviewState extends State<ScorePreview> {
   List<Map<String, dynamic>> notes = const [];
   List<Map<String, dynamic>> lyrics = const [];
+  List<Map<String, dynamic>> lyricUnits = const [];
   String lyricsMessage = '';
 
   @override
@@ -1503,9 +1589,11 @@ class _ScorePreviewState extends State<ScorePreview> {
         final data = Map<String, dynamic>.from(jsonDecode(body) as Map);
         final rows = data[widget.tablature ? 'tab_notes' : 'staff_notes'];
         final lyricRows = data['lyrics'];
+        final unitRows = data['lyric_units'];
         if (mounted) setState(() {
           notes = rows is List ? rows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
           lyrics = lyricRows is List ? lyricRows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
+          lyricUnits = unitRows is List ? unitRows.map((e) => Map<String, dynamic>.from(e as Map)).toList() : const [];
           lyricsMessage = '${data['lyrics_message'] ?? ''}';
         });
       }
@@ -1516,18 +1604,19 @@ class _ScorePreviewState extends State<ScorePreview> {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-        height: 180,
+        height: 230,
         child: CustomPaint(
-          painter: ScorePainter(notes: notes, lyrics: lyrics, lyricsMessage: lyricsMessage, tablature: widget.tablature, positionSeconds: widget.positionSeconds),
+          painter: ScorePainter(notes: notes, lyrics: lyrics, lyricUnits: lyricUnits, lyricsMessage: lyricsMessage, tablature: widget.tablature, positionSeconds: widget.positionSeconds),
           size: Size.infinite,
         ),
       );
 }
 
 class ScorePainter extends CustomPainter {
-  ScorePainter({required this.notes, required this.lyrics, required this.lyricsMessage, required this.tablature, required this.positionSeconds});
+  ScorePainter({required this.notes, required this.lyrics, required this.lyricUnits, required this.lyricsMessage, required this.tablature, required this.positionSeconds});
   final List<Map<String, dynamic>> notes;
   final List<Map<String, dynamic>> lyrics;
+  final List<Map<String, dynamic>> lyricUnits;
   final String lyricsMessage;
   final bool tablature;
   final double positionSeconds;
@@ -1535,7 +1624,6 @@ class ScorePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final linePaint = Paint()..color = const Color(0xFFBDAAB5)..strokeWidth = 1;
-    final notePaint = Paint()..color = accent;
     final text = TextPainter(textDirection: TextDirection.ltr);
     final lineCount = tablature ? 6 : 5;
     const top = 35.0;
@@ -1550,17 +1638,27 @@ class ScorePainter extends CustomPainter {
     for (var i = 0; i < visible.length; i++) {
       final note = visible[i];
       final x = 28 + i * ((size.width - 56) / 24);
+      final noteStart = (note['start'] as num?)?.toDouble() ?? 0;
+      final noteDuration = (note['duration'] as num?)?.toDouble() ?? .1;
+      final active = positionSeconds >= noteStart && positionSeconds <= noteStart + noteDuration;
+      final activeNotePaint = Paint()..color = active ? orangeSoft : accent;
       if (tablature) {
         final string = ((note['string'] as num?)?.toInt() ?? 1).clamp(1, 6);
         final fret = (note['fret'] as num?)?.toInt() ?? 0;
-        text.text = TextSpan(text: '$fret', style: const TextStyle(color: accent, fontSize: 14, fontWeight: FontWeight.bold));
+        text.text = TextSpan(text: '$fret', style: TextStyle(color: active ? orangeSoft : accent, fontSize: 14, fontWeight: FontWeight.bold));
         text.layout();
         text.paint(canvas, Offset(x - text.width / 2, top + (string - 1) * gap - text.height / 2));
       } else {
         final midi = (note['midi'] as num?)?.toInt() ?? 60;
         final y = (top + 4 * gap - (midi - 60) * gap / 3.5).clamp(16.0, 132.0);
-        canvas.drawOval(Rect.fromCenter(center: Offset(x, y), width: 12, height: 9), notePaint);
-        canvas.drawLine(Offset(x + 5, y), Offset(x + 5, y - 28), notePaint..strokeWidth = 1.5);
+        canvas.drawOval(Rect.fromCenter(center: Offset(x, y), width: 12, height: 9), activeNotePaint);
+        canvas.drawLine(Offset(x + 5, y), Offset(x + 5, y - 28), activeNotePaint..strokeWidth = 1.5);
+      }
+      final noteLyric = '${note['lyric'] ?? ''}';
+      if (noteLyric.isNotEmpty) {
+        text.text = TextSpan(text: noteLyric, style: TextStyle(color: active ? Colors.white : const Color(0xFFBDAAB5), fontSize: 13, fontWeight: active ? FontWeight.w800 : FontWeight.w500, fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei']));
+        text.layout(maxWidth: 28);
+        text.paint(canvas, Offset(x - text.width / 2, top + lineCount * gap + 5));
       }
     }
     if (visible.isEmpty) {
@@ -1576,8 +1674,37 @@ class ScorePainter extends CustomPainter {
         break;
       }
     }
-    if (currentLyric.isNotEmpty) {
-      text.text = TextSpan(text: currentLyric, style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700));
+    Map<String, dynamic>? currentUnit;
+    for (final unit in lyricUnits) {
+      if (((unit['start'] as num?)?.toDouble() ?? 0) <= positionSeconds) {
+        currentUnit = unit;
+      } else {
+        break;
+      }
+    }
+    final currentLine = (currentUnit?['line'] as num?)?.toInt();
+    final lineUnits = currentLine == null ? const <Map<String, dynamic>>[] : lyricUnits.where((row) => (row['line'] as num?)?.toInt() == currentLine).toList();
+    if (lineUnits.isNotEmpty) {
+      text.text = TextSpan(children: [
+        for (final unit in lineUnits)
+          TextSpan(
+            text: '${unit['text'] ?? ''}',
+            style: TextStyle(
+              color: positionSeconds >= ((unit['end'] as num?)?.toDouble() ?? 0)
+                  ? accent
+                  : positionSeconds >= ((unit['start'] as num?)?.toDouble() ?? 0)
+                      ? Colors.white
+                      : const Color(0xFF776A73),
+              fontSize: 19,
+              fontWeight: positionSeconds >= ((unit['start'] as num?)?.toDouble() ?? 0) && positionSeconds < ((unit['end'] as num?)?.toDouble() ?? 0) ? FontWeight.w900 : FontWeight.w600,
+              fontFamilyFallback: const ['PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei'],
+            ),
+          ),
+      ]);
+      text.layout(maxWidth: size.width - 28);
+      text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 8));
+    } else if (currentLyric.isNotEmpty) {
+      text.text = TextSpan(text: currentLyric, style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700, fontFamilyFallback: ['PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei']));
       text.layout(maxWidth: size.width - 28);
       text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 4));
     } else if (lyrics.isEmpty && lyricsMessage.isNotEmpty) {
@@ -1588,7 +1715,7 @@ class ScorePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant ScorePainter oldDelegate) => oldDelegate.notes != notes || oldDelegate.lyrics != lyrics || oldDelegate.lyricsMessage != lyricsMessage || oldDelegate.tablature != tablature || oldDelegate.positionSeconds != positionSeconds;
+  bool shouldRepaint(covariant ScorePainter oldDelegate) => oldDelegate.notes != notes || oldDelegate.lyrics != lyrics || oldDelegate.lyricUnits != lyricUnits || oldDelegate.lyricsMessage != lyricsMessage || oldDelegate.tablature != tablature || oldDelegate.positionSeconds != positionSeconds;
 }
 
 class CommunityPage extends StatefulWidget {
@@ -1905,7 +2032,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.5
+橘味儿音乐 v3.2.6
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。

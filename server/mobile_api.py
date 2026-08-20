@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.5.
+"""Mobile API companion for 橘味儿音乐 v3.2.6.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -30,7 +30,13 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from app.project_utils import atomic_write_json, safe_file_stem, load_synced_lyrics
+from app.project_utils import (
+    align_lyric_units_to_notes,
+    atomic_write_json,
+    expand_lyric_units,
+    safe_file_stem,
+    load_synced_lyrics,
+)
 from app.lyrics_ai import generate_lyrics, lyrics_to_lrc
 from app.lyrics_transcription import transcribe_synced_lyrics
 from app.library_catalog import (
@@ -47,7 +53,7 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.5"
+VERSION = "3.2.6"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -65,13 +71,27 @@ SERVER_LIBRARY_ROOT = Path(os.environ.get(
     "JUWEIER_SERVER_LIBRARY",
     r"G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）",
 ))
+SERVER_LIBRARY_FLAC_ROOT = Path(os.environ.get(
+    "JUWEIER_SERVER_LIBRARY_FLAC",
+    r"G:\JuweierMusicLibrary\008.按歌手分类",
+))
+SERVER_LIBRARY_ROOTS = list(dict.fromkeys((SERVER_LIBRARY_ROOT, SERVER_LIBRARY_FLAC_ROOT)))
+AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 connect_catalog(LIBRARY_DB).close()
 for folder in (UPLOADS, OUTPUTS):
     folder.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title=f"{APP_NAME} Mobile API", version=VERSION)
 lock = threading.RLock()
-executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JUWEIER_WORKERS", "1"))))
+executor = ThreadPoolExecutor(max_workers=max(2, int(os.environ.get("JUWEIER_WORKERS", "2"))))
+catalog_state = {
+    "status": "cached",
+    "message": "正在使用服务器已保存的歌曲索引",
+    "updated_at": 0.0,
+    "result": {},
+}
 
 
 class AuthPayload(BaseModel):
@@ -395,6 +415,75 @@ def current_user(authorization: str | None = Header(default=None)) -> sqlite3.Ro
     return user
 
 
+def _catalog_count() -> int:
+    connection = connect_catalog(LIBRARY_DB)
+    try:
+        row = connection.execute("SELECT COUNT(*) FROM tracks").fetchone()
+        return int(row[0] if row else 0)
+    finally:
+        connection.close()
+
+
+def _existing_server_library_roots() -> list[Path]:
+    return [root for root in SERVER_LIBRARY_ROOTS if root.is_dir()]
+
+
+def _artist_initial(artist: str, source_path: str = "") -> str:
+    name = str(artist or "").strip()
+    if name:
+        first = name[0].upper()
+        if "A" <= first <= "Z":
+            return first
+    for part in Path(source_path or ".").parts:
+        match = re.match(r"^\s*([A-Za-z])(?:\s|[._-])*(?:字母|开头|歌手|歌曲|分类)", str(part))
+        if match:
+            return match.group(1).upper()
+    try:
+        from pypinyin import Style, lazy_pinyin
+
+        values = lazy_pinyin(name, style=Style.FIRST_LETTER, errors="ignore")
+        if values and values[0] and values[0][0].isalpha():
+            return values[0][0].upper()
+    except Exception:
+        pass
+    return "#"
+
+
+def _scan_server_catalog() -> dict:
+    roots = _existing_server_library_roots()
+    if not roots:
+        raise RuntimeError(
+            "服务器曲库目录不存在或不可访问：" + "；".join(str(root) for root in SERVER_LIBRARY_ROOTS)
+        )
+    with lock:
+        catalog_state.update(status="scanning", message="正在后台更新服务器歌曲索引")
+    result = scan_catalog_roots(roots, LIBRARY_DB, LIBRARY_PATHS["covers"])
+    with lock:
+        catalog_state.update(
+            status="ready",
+            message="服务器歌曲索引已更新",
+            updated_at=time.time(),
+            result=dict(result),
+        )
+    return {**result, "roots": [str(root) for root in roots], "source_scope": "server"}
+
+
+def _background_catalog_scan() -> None:
+    try:
+        _scan_server_catalog()
+    except Exception as exc:
+        with lock:
+            catalog_state.update(status="error", message=str(exc), updated_at=time.time())
+
+
+@app.on_event("startup")
+def start_catalog_index() -> None:
+    """Serve the cached index immediately and refresh it without blocking startup."""
+
+    if AUTO_SCAN_LIBRARY:
+        executor.submit(_background_catalog_scan)
+
+
 def _gpu_name() -> str:
     try:
         import torch
@@ -463,6 +552,9 @@ def health(_: None = Depends(authorize)) -> dict:
     return {
         "status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name(),
         "server_library_root": str(SERVER_LIBRARY_ROOT),
+        "server_library_roots": [str(root) for root in SERVER_LIBRARY_ROOTS],
+        "catalog_count": _catalog_count(),
+        "catalog_state": dict(catalog_state),
         "processing_ready": capabilities["processing_ready"],
         "runtime": capabilities,
         "lyrics_asr_available": capabilities["lyrics_asr_available"],
@@ -475,7 +567,7 @@ def health(_: None = Depends(authorize)) -> dict:
 def app_config(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.5",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.6",
         "service": "online",
         "processing_ready": capabilities["processing_ready"],
         "lyrics_asr_available": capabilities["lyrics_asr_available"],
@@ -790,13 +882,15 @@ def _queue_job(
     return job_id
 
 
+@app.get("/api/v1/library/mobile/catalog")
 @app.get("/api/v1/library")
 def library(
     request: Request, q: str = "", category: str = "全部", limit: int = 100000,
     _: None = Depends(authorize),
 ) -> dict:
     songs = list_catalog(LIBRARY_DB, q, category, limit)
-    allowed_roots = [SERVER_LIBRARY_ROOT.resolve(), LIBRARY_PATHS["temp"].resolve()]
+    allowed_roots = [root.resolve() for root in SERVER_LIBRARY_ROOTS]
+    allowed_roots.append(LIBRARY_PATHS["temp"].resolve())
     filtered = []
     for song in songs:
         raw_path = str(song.get("source_path") or song.get("working_path") or "")
@@ -809,14 +903,16 @@ def library(
         filtered.append(song)
     songs = filtered
     for song in songs:
+        source_path = str(song.get("source_path") or song.get("working_path") or "")
         song["metadata_artist"] = song.get("artist") or "未知歌手"
         song["artist"] = catalog_artist_name(song)
+        song["artist_initial"] = _artist_initial(song["artist"], source_path)
         track_id = int(song["id"])
         song.pop("source_path", None)
         song.pop("working_path", None)
-        song["audio_url"] = str(request.url_for("library_audio", track_id=track_id))
+        song["audio_url"] = str(request.url_for("library_mobile_audio", track_id=track_id))
         if song.get("cover_path"):
-            song["cover_url"] = str(request.url_for("library_cover", track_id=track_id))
+            song["cover_url"] = str(request.url_for("library_mobile_cover", track_id=track_id))
         song.pop("cover_path", None)
     artists = {}
     for song in songs:
@@ -828,24 +924,23 @@ def library(
         "categories": ["全部", "本地导入", "临时歌曲库", "抖音流行", "酷狗排行榜"],
         "source_scope": "server",
         "server_library_root": str(SERVER_LIBRARY_ROOT),
+        "server_library_roots": [str(root) for root in SERVER_LIBRARY_ROOTS],
+        "catalog_state": dict(catalog_state),
+        "catalog_updated_at": float(catalog_state.get("updated_at", 0) or 0),
         "notice": "服务器曲库与客户端本地导入已分离",
     }
 
 
+@app.post("/api/v1/library/mobile/catalog/scan")
 @app.post("/api/v1/library/scan")
 def scan_library(_: None = Depends(authorize)) -> dict:
-    if not SERVER_LIBRARY_ROOT.is_dir():
-        raise HTTPException(
-            status_code=503,
-            detail=f"服务器曲库目录不存在或不可访问：{SERVER_LIBRARY_ROOT}",
-        )
-    result = scan_catalog_roots(
-        [SERVER_LIBRARY_ROOT],
-        LIBRARY_DB, LIBRARY_PATHS["covers"],
-    )
-    return {**result, "root": str(SERVER_LIBRARY_ROOT), "source_scope": "server"}
+    try:
+        return _scan_server_catalog()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.post("/api/v1/library/mobile/import-url", status_code=201)
 @app.post("/api/v1/library/import-url", status_code=201)
 def import_library_url(payload: LinkImportPayload, _: None = Depends(authorize)) -> dict:
     destination = LIBRARY_PATHS["temp"] / "链接导入"
@@ -854,6 +949,7 @@ def import_library_url(payload: LinkImportPayload, _: None = Depends(authorize))
     return {"status": "imported", "file_name": path.name, "scan": result}
 
 
+@app.get("/api/v1/library/mobile/catalog/{track_id}/audio", name="library_mobile_audio")
 @app.get("/api/v1/library/{track_id}/audio", name="library_audio")
 def library_audio(track_id: int, _: None = Depends(authorize)):
     song = catalog_track(LIBRARY_DB, track_id)
@@ -863,6 +959,7 @@ def library_audio(track_id: int, _: None = Depends(authorize)):
     return FileResponse(path, filename=path.name)
 
 
+@app.get("/api/v1/library/mobile/catalog/{track_id}/cover", name="library_mobile_cover")
 @app.get("/api/v1/library/{track_id}/cover", name="library_cover")
 def library_cover(track_id: int, _: None = Depends(authorize)):
     song = catalog_track(LIBRARY_DB, track_id)
@@ -872,6 +969,7 @@ def library_cover(track_id: int, _: None = Depends(authorize)):
     return FileResponse(path, filename=path.name)
 
 
+@app.post("/api/v1/library/mobile/catalog/{track_id}/process", status_code=202)
 @app.post("/api/v1/library/{track_id}/process", status_code=202)
 def process_library_song(track_id: int, payload: LibraryProcessPayload, _: None = Depends(authorize)) -> dict:
     song = catalog_track(LIBRARY_DB, track_id)
@@ -1129,9 +1227,11 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
             note_step, note_alter = note_steps[pitch]
             octave = midi // 12 - 1
             alter_note_xml = f"<alter>{note_alter}</alter>" if note_alter else ""
+            lyric = html.escape(str(event.get("lyric", "") or ""))
+            lyric_xml = f"<lyric><syllabic>single</syllabic><text>{lyric}</text></lyric>" if lyric else ""
             note_xml.append(
                 f"<note><pitch><step>{note_step}</step>{alter_note_xml}<octave>{octave}</octave></pitch>"
-                "<duration>1</duration><type>quarter</type></note>"
+                f"<duration>1</duration><type>quarter</type>{lyric_xml}</note>"
             )
         if not note_xml:
             note_xml.append("<note><rest/><duration>4</duration><type>whole</type></note>")
@@ -1154,6 +1254,11 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
 
 def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) -> dict[str, str]:
     lyrics = list(analysis.get("lyrics", []))
+    lyric_units = expand_lyric_units(lyrics)
+    staff_notes = align_lyric_units_to_notes(analysis.get("melody_notes", []), lyric_units)
+    score_analysis = dict(analysis)
+    score_analysis["melody_notes"] = staff_notes
+    score_analysis["lyric_units"] = lyric_units
 
     def lyric_at(seconds: float) -> str:
         current = ""
@@ -1195,10 +1300,10 @@ def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) ->
         path = folder / f"{key}.html"
         path.write_text(table(name, hint), encoding="utf-8")
         result[key] = str(path)
-    result["musicxml"] = str(_write_musicxml(folder, title, analysis, rows))
+    result["musicxml"] = str(_write_musicxml(folder, title, score_analysis, rows))
     tuning = [40, 45, 50, 55, 59, 64]
     tab_notes = []
-    for note in analysis.get("melody_notes", []):
+    for note in staff_notes:
         midi = int(note.get("midi", 60))
         choices = [(midi - open_note, string + 1) for string, open_note in enumerate(tuning) if 0 <= midi - open_note <= 24]
         fret, string = min(choices, default=(0, 1), key=lambda item: (item[0], -item[1]))
@@ -1207,8 +1312,10 @@ def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) ->
     atomic_write_json(score_data, {
         "title": title, "bpm": analysis.get("bpm", 120), "key": analysis.get("key", "C"),
         "duration": analysis.get("duration", 0), "bars": rows,
-        "staff_notes": analysis.get("melody_notes", []), "tab_notes": tab_notes,
+        "staff_notes": staff_notes, "tab_notes": tab_notes,
         "lyrics": analysis.get("lyrics", []),
+        "lyric_units": lyric_units,
+        "lyrics_note_aligned": True,
         "lyrics_status": analysis.get("lyrics_status", "empty"),
         "lyrics_source": analysis.get("lyrics_source", "none"),
         "lyrics_language": analysis.get("lyrics_language", ""),
@@ -1218,6 +1325,7 @@ def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) ->
     lyrics_data = folder / "lyrics_timeline.json"
     atomic_write_json(lyrics_data, {
         "rows": analysis.get("lyrics", []),
+        "units": lyric_units,
         "status": analysis.get("lyrics_status", "empty"),
         "source": analysis.get("lyrics_source", "none"),
         "language": analysis.get("lyrics_language", ""),

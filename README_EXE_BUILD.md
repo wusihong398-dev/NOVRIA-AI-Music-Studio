@@ -1,4 +1,4 @@
-# 橘味儿音乐 v3.0.0 — Windows EXE 发布工程
+# 橘味儿音乐 v3.2.6 — Windows EXE 发布工程
 
 这个版本已经针对“冻结成 EXE”修正 Demucs 调用方式，不再使用 `sys.executable -m demucs`。
 
@@ -10,7 +10,7 @@
 4. 选择 **Build Juweier Music Windows EXE**。
 5. 点击 **Run workflow**。
 6. 构建完成后，在该次 Actions 页面底部下载 Artifact：
-   `Juweier-Music-v3.0.0-Windows-x64`
+   `Juweier-Music-v3.2.6-Windows-x64`
 7. 解压 Artifact 后得到便携版 ZIP，其中包含：
    `Juweier-Music.exe`
 
@@ -25,7 +25,7 @@
 ## 安装程序
 
 工程里同时包含 `installer/NOVRIA.iss`。Windows 构建完成后可以用 Inno Setup 6 编译为标准安装程序：
-`Juweier_Music_v3.0.0_Setup_x64.exe`
+`Juweier_Music_v3.2.6_Setup_x64.exe`
 
 ## 注意
 

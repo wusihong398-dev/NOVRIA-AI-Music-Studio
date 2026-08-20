@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Juweier Music v3.0.0
+title Juweier Music v3.2.6
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (

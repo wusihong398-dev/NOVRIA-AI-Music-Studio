@@ -534,7 +534,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
         source_name = urllib.parse.unquote(Path(parsed.path).name) or "link_audio.mp3"
         target = destination / f"{safe_file_stem(Path(source_name).stem, 'link_audio')}{suffix}"
         part = target.with_suffix(target.suffix + ".part")
-        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.2.5"})
+        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.2.6"})
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
             total, downloaded = int(response.headers.get("Content-Length") or 0), 0
             while True:
@@ -551,7 +551,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("当前安装包缺少授权音频直链导入组件，请更新到完整版 v3.2.5") from exc
+        raise RuntimeError("当前安装包缺少授权音频直链导入组件，请更新到完整版 v3.2.6") from exc
     before = {path.resolve() for path in destination.iterdir() if path.is_file()}
 
     def hook(status: dict) -> None:

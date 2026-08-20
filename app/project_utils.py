@@ -126,6 +126,107 @@ def load_synced_lyrics(path: str | Path, duration: float = 0) -> list[dict]:
     return rows
 
 
+def _lyric_tokens(text: str) -> list[str]:
+    """Split CJK lyrics per character while keeping Latin words readable."""
+
+    tokens: list[str] = []
+    latin = ""
+    for char in str(text or "").strip():
+        if char.isspace():
+            if latin:
+                tokens.append(latin)
+                latin = ""
+            continue
+        if "\u3400" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff":
+            if latin:
+                tokens.append(latin)
+                latin = ""
+            tokens.append(char)
+        elif char.isalnum() or char in {"'", "-"}:
+            latin += char
+        else:
+            if latin:
+                tokens.append(latin)
+                latin = ""
+            tokens.append(char)
+    if latin:
+        tokens.append(latin)
+    return [token for token in tokens if token]
+
+
+def expand_lyric_units(rows: Iterable[dict]) -> list[dict]:
+    """Return word/character karaoke units with stable start/end timestamps.
+
+    faster-whisper word timestamps are preserved when available.  LRC-only
+    lines are divided across the line duration so older libraries still gain a
+    usable per-character karaoke timeline.
+    """
+
+    units: list[dict] = []
+    for line_index, raw_row in enumerate(rows):
+        row = dict(raw_row)
+        line_start = max(0.0, float(row.get("start", 0) or 0))
+        line_end = max(line_start + 0.2, float(row.get("end", line_start + 4) or line_start + 4))
+        raw_words = row.get("words") if isinstance(row.get("words"), list) else []
+        timed_parts = []
+        for raw_word in raw_words:
+            if not isinstance(raw_word, dict):
+                continue
+            value = str(raw_word.get("text") or raw_word.get("word") or "").strip()
+            if not value:
+                continue
+            start = max(line_start, float(raw_word.get("start", line_start) or line_start))
+            end = min(line_end, max(start + 0.04, float(raw_word.get("end", start + 0.2) or start + 0.2)))
+            timed_parts.append((value, start, end))
+        if not timed_parts:
+            timed_parts = [(str(row.get("text", "") or ""), line_start, line_end)]
+
+        for value, part_start, part_end in timed_parts:
+            tokens = _lyric_tokens(value)
+            if not tokens:
+                continue
+            step = max(0.04, (part_end - part_start) / len(tokens))
+            for token_index, token in enumerate(tokens):
+                start = part_start + token_index * step
+                end = part_end if token_index == len(tokens) - 1 else min(part_end, start + step)
+                units.append({
+                    "start": round(start, 3),
+                    "end": round(max(start + 0.04, end), 3),
+                    "text": token,
+                    "line": line_index,
+                    "index": len(units),
+                })
+    return units
+
+
+def align_lyric_units_to_notes(notes: Iterable[dict], units: Iterable[dict]) -> list[dict]:
+    """Attach each karaoke unit to the closest available melody note."""
+
+    result = [dict(note) for note in notes]
+    available = set(range(len(result)))
+    for unit in units:
+        if not available:
+            break
+        start = float(unit.get("start", 0) or 0)
+        end = float(unit.get("end", start + 0.2) or start + 0.2)
+        middle = (start + end) / 2
+
+        def distance(index: int) -> tuple[float, float]:
+            note_start = float(result[index].get("start", 0) or 0)
+            duration = max(0.04, float(result[index].get("duration", 0.1) or 0.1))
+            note_middle = note_start + duration / 2
+            outside = 0.0 if note_start <= end and note_start + duration >= start else 1.0
+            return outside, abs(note_middle - middle)
+
+        chosen = min(available, key=distance)
+        available.remove(chosen)
+        result[chosen]["lyric"] = str(unit.get("text", "") or "")
+        result[chosen]["lyric_index"] = int(unit.get("index", 0) or 0)
+        result[chosen]["lyric_start"] = round(start, 3)
+        result[chosen]["lyric_end"] = round(end, 3)
+    return result
+
+
 def split_guitar_stem(stem_dir: str | Path) -> dict:
     """Split the six-stem model's combined guitar into aligned acoustic/electric files."""
     import shutil

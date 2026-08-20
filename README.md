@@ -1,4 +1,4 @@
-# 橘味儿音乐 v3.2.3（三端新版）
+# 橘味儿音乐 v3.2.6（三端测试版）
 
 > 本软件目前仅供学习与研究使用，不提供歌曲下载服务。
 
@@ -64,7 +64,7 @@
 3. 双击 `Check-GPU.bat` 检查 CUDA。
 4. 双击 `Run-Juweier-Music.bat`。
 
-第一次分轨会安装并校验 `htdemucs_6s` AI 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.3-Windows-x64`，其中含安装程序和便携 ZIP。
+第一次分轨会安装并校验 `htdemucs_6s` AI 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.6-Windows-x64`，其中含安装程序和便携 ZIP。
 
 ## Android / iOS 使用
 

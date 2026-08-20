@@ -1,6 +1,6 @@
 {
   "app_name": "橘味儿音乐",
-  "version": "3.0.0",
+  "version": "3.2.6",
   "separation_model": "htdemucs_6s",
   "stems": [
     "vocals",

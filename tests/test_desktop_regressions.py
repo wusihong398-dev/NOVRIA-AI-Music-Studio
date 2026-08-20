@@ -15,9 +15,9 @@ class DesktopRegressionTests(unittest.TestCase):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
         mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.2.5"', launcher)
-        self.assertIn('version: 3.2.5+325', mobile_manifest)
-        self.assertIn('VERSION = "3.2.5"', server)
+        self.assertIn('VERSION = "3.2.6"', launcher)
+        self.assertIn('version: 3.2.6+326', mobile_manifest)
+        self.assertIn('VERSION = "3.2.6"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -48,6 +48,8 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('/api/v1/library/mobile/artifacts/{job_id}/{name}', server)
         self.assertIn('/api/v1/library/mobile/health', server)
         self.assertIn("'/api/v1/library/mobile/jobs/$id'", mobile)
+        self.assertIn('/api/v1/library/mobile/catalog', server)
+        self.assertIn("'/api/v1/library/mobile/catalog", mobile)
 
     def test_processing_runtime_is_checked_before_accepting_expensive_work(self):
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
@@ -78,6 +80,18 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('electric_guitar_tab', server)
         self.assertIn('acoustic_guitar_tab', server)
         self.assertIn("lyrics_message", mobile)
+        self.assertIn('lyric_units', server)
+        self.assertIn('lyricUnits', mobile)
+
+    def test_mobile_can_be_tested_before_sms_and_uses_cached_catalog(self):
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('enterGuestTesting', mobile)
+        self.assertIn('先进入测试（无需验证码）', mobile)
+        self.assertIn('_catalogKey', mobile)
+        self.assertIn('AUTO_SCAN_LIBRARY', server)
+        self.assertIn('_background_catalog_scan', server)
+        self.assertIn('artist_initial', server)
 
     def test_done_handlers_do_not_destroy_running_qthreads(self):
         source = (ROOT / 'app/main.py').read_text(encoding='utf-8')

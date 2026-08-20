@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.5"
+VERSION = "3.2.6"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -155,7 +155,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/3.2.5"}
+            headers={"User-Agent": "Juweier-Music/3.2.6"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -2733,7 +2733,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.5"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.6"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2907,6 +2907,21 @@ class MusicLibraryPage(QWidget):
         search_row.addWidget(search_button)
         search_row.addWidget(clear_button)
         layout.addLayout(search_row)
+
+        self.library_initial = "全部"
+        self.library_initial_buttons = {}
+        initial_row = QHBoxLayout()
+        initial_row.addWidget(QLabel("歌手首字母"))
+        for value in ["全部", *list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "#"]:
+            button = QPushButton(value)
+            button.setCheckable(True)
+            button.setChecked(value == "全部")
+            button.setFixedWidth(44 if value == "全部" else 28)
+            button.clicked.connect(lambda checked=False, item=value: self._set_library_initial(item))
+            self.library_initial_buttons[value] = button
+            initial_row.addWidget(button)
+        initial_row.addStretch(1)
+        layout.addLayout(initial_row)
 
         self.library_scan_status=QLabel("服务器曲库：等待连接")
         self.library_scan_status.setObjectName("SectionHint")
@@ -3533,6 +3548,11 @@ class MusicLibraryPage(QWidget):
                 raise ServerLibraryError("服务器未返回 server 曲库标识")
             self.server_library_root = str(result.get("server_library_root") or self.server_library_root)
             rows = [dict(row) for row in result.get("songs", [])]
+            if self.library_initial != "全部":
+                rows = [
+                    row for row in rows
+                    if str(row.get("artist_initial") or "#").upper() == self.library_initial
+                ]
             self.remote_rows = {int(row["id"]): row for row in rows}
         except Exception as exc:
             rows = []
@@ -3559,16 +3579,23 @@ class MusicLibraryPage(QWidget):
             ti.setData(0,Qt.UserRole,("track",int(row["id"])))
             ai.addChild(ti)
 
-        for index,(artist,ai) in enumerate(artists.items()):
+        for artist,ai in artists.items():
             ai.setText(1,f"{ai.childCount()} 首")
-            if index < 30:
-                ai.setExpanded(True)
+            # Keep all singer groups collapsed on normal startup.  Search
+            # results expand only while the user is actively filtering.
+            ai.setExpanded(bool(query.strip()))
         if rows:
             self.library_scan_status.setText(
                 f"当前显示 {len(artists)} 位歌手、{len(rows)} 首服务器歌曲 · "
                 f"服务器目录：{self.server_library_root} · 未扫描客户端 G 盘"
             )
         self.tree.setUpdatesEnabled(True)
+
+    def _set_library_initial(self, value):
+        self.library_initial = str(value or "全部")
+        for key, button in self.library_initial_buttons.items():
+            button.setChecked(key == self.library_initial)
+        self.refresh_library()
 
     def _selected_track_id(self):
         items=self.tree.selectedItems()

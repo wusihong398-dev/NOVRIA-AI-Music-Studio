@@ -5,7 +5,9 @@ import wave
 from pathlib import Path
 
 from app.project_utils import (
+    align_lyric_units_to_notes,
     atomic_write_json,
+    expand_lyric_units,
     normalized_path,
     repair_text,
     safe_file_stem,
@@ -23,6 +25,17 @@ except ImportError:
 
 
 class ProjectUtilsTests(unittest.TestCase):
+    def test_lyrics_expand_per_character_and_align_to_notes(self):
+        units = expand_lyric_units([{"start": 0, "end": 2, "text": "你好吗"}])
+        self.assertEqual([item["text"] for item in units], ["你", "好", "吗"])
+        notes = [
+            {"start": 0.0, "duration": .5, "midi": 60},
+            {"start": .7, "duration": .5, "midi": 62},
+            {"start": 1.4, "duration": .5, "midi": 64},
+        ]
+        aligned = align_lyric_units_to_notes(notes, units)
+        self.assertEqual([item.get("lyric") for item in aligned], ["你", "好", "吗"])
+
     def test_safe_file_stem_preserves_chinese_and_removes_windows_chars(self):
         self.assertEqual(safe_file_stem('橘味儿:测试?.mp3'), '橘味儿_测试_.mp3')
 

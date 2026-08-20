@@ -59,7 +59,18 @@ def transcribe_synced_lyrics(path: str | Path, duration: float = 0) -> dict:
                 continue
             start = max(0.0, float(getattr(segment, "start", 0) or 0))
             end = max(start + 0.2, float(getattr(segment, "end", start + 0.2) or start + 0.2))
-            rows.append({"start": round(start, 3), "end": round(end, 3), "text": text})
+            words = []
+            for word in list(getattr(segment, "words", None) or []):
+                word_text = str(getattr(word, "word", "") or "").strip()
+                if not word_text:
+                    continue
+                word_start = max(start, float(getattr(word, "start", start) or start))
+                word_end = min(end, max(word_start + 0.04, float(getattr(word, "end", word_start + 0.2) or word_start + 0.2)))
+                words.append({"start": round(word_start, 3), "end": round(word_end, 3), "text": word_text})
+            rows.append({
+                "start": round(start, 3), "end": round(end, 3), "text": text,
+                "words": words,
+            })
         language = str(getattr(info, "language", "") or "")
         return {
             "rows": rows,
