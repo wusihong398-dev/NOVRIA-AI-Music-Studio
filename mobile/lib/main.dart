@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.3';
+const appVersion = '3.2.5';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -330,14 +330,28 @@ class AppStore extends ChangeNotifier {
     }
     final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
     try {
-      job.status = job.libraryId > 0 ? '处理中' : '上传中';
-      job.stage = job.libraryId > 0 ? '从服务器歌曲库读取' : '上传音频';
-      job.progress = .03;
+      job.status = job.libraryId > 0 ? '加载中' : '上传中';
+      job.stage = job.libraryId > 0 ? '连接服务器歌曲库' : '上传音频';
+      job.progress = job.libraryId > 0 ? .01 : .03;
       job.error = '';
       await _save();
       notifyListeners();
 
-      final response = job.libraryId > 0 ? await client.processLibrary(job) : await client.submit(job);
+      Map<String, dynamic> response;
+      if (job.libraryId > 0) {
+        await client.health();
+        job.stage = '定位服务器歌曲';
+        job.progress = .04;
+        await _save();
+        notifyListeners();
+        job.stage = '提交 AI 处理任务';
+        job.progress = .06;
+        await _save();
+        notifyListeners();
+        response = await client.processLibrary(job);
+      } else {
+        response = await client.submit(job);
+      }
       job.serverJobId = '${response['job_id'] ?? response['id'] ?? ''}';
       if (job.serverJobId.isEmpty) throw const FormatException('服务器没有返回 job_id');
       job.status = '处理中';
@@ -348,7 +362,7 @@ class AppStore extends ChangeNotifier {
       await _pollJob(client, job);
     } catch (error) {
       job.status = '失败';
-      job.error = '$error';
+      job.error = _friendlyJobError(error);
       await _save();
       notifyListeners();
     }
@@ -366,7 +380,7 @@ class AppStore extends ChangeNotifier {
       await _pollJob(ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken), job);
     } catch (error) {
       job.status = '失败';
-      job.error = '$error';
+      job.error = _friendlyJobError(error);
       await _save();
       notifyListeners();
     }
@@ -390,13 +404,36 @@ class AppStore extends ChangeNotifier {
         job.progress = 1;
       } else if (<String>{'failed', 'error', 'cancelled', 'canceled'}.contains(rawStatus)) {
         job.status = '失败';
-        job.error = '${result['error'] ?? result['message'] ?? '服务器任务失败'}';
+        job.error = _friendlyJobError(result['error'] ?? result['message'] ?? '服务器任务失败');
       }
       await _save();
       notifyListeners();
       if (job.status != '处理中') break;
       await Future<void>.delayed(const Duration(seconds: 2));
     }
+  }
+
+  String _friendlyJobError(Object error) {
+    var message = '$error'
+        .replaceFirst(RegExp(r'^(FormatException|HttpException|Exception):\s*'), '')
+        .trim();
+    final lower = message.toLowerCase();
+    if (lower.contains("no module named 'torch'") || lower.contains('缺少 torch')) {
+      return '服务器未安装 AI 分轨运行环境（缺少 PyTorch）：请安装 requirements-server.txt 后重启服务。';
+    }
+    if (lower.contains("no module named 'demucs'") || lower.contains('缺少 demucs')) {
+      return '服务器未安装 AI 分轨运行环境（缺少 Demucs）：请安装 requirements-server.txt 后重启服务。';
+    }
+    if (lower.contains('ffmpeg') && (lower.contains('not found') || lower.contains('未找到'))) {
+      return '服务器缺少 FFmpeg，暂时不能读取或处理歌曲。';
+    }
+    if (lower.contains('origin web server') || lower.contains('cloudflare')) {
+      return 'AI 服务器暂时没有完整响应，请确认服务端和 Cloudflare Tunnel 均在线后重试。';
+    }
+    if (lower.contains('http 404') || lower.contains('"detail":"not found"')) {
+      return 'AI 任务接口未连接到新版服务器，请检查 Cloudflare 曲库路由后重试。';
+    }
+    return message.isEmpty ? 'AI 处理失败，请稍后重试' : message;
   }
 
   Future<void> setTranspose(PipelineJob job, int value) async {
@@ -575,7 +612,8 @@ class ApiClient {
     }
   }
 
-  Future<Map<String, dynamic>> job(String id) async => _jsonRequest('GET', '/api/v1/library/jobs/$id');
+  Future<Map<String, dynamic>> job(String id) async =>
+      _jsonRequest('GET', '/api/v1/library/mobile/jobs/$id');
 
   Future<Map<String, dynamic>> library(String query, String category) => _jsonRequest(
         'GET',
@@ -1867,7 +1905,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.4
+橘味儿音乐 v3.2.5
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。

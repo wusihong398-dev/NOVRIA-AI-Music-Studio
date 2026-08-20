@@ -3,7 +3,7 @@ name: Package Juweier Music v3 Source
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.3"]
+    branches: ["main", "agent/juweier-v3.2.5"]
     paths-ignore:
       - "**/*.md"
 
@@ -21,16 +21,16 @@ jobs:
         run: |
           python -m compileall -q app server tests
           python -m unittest discover -s tests -v
-          grep -q 'VERSION = "3.2.3"' app/main.py
-          grep -q 'VERSION = "3.2.3"' server/mobile_api.py
+          grep -q 'VERSION = "3.2.5"' app/main.py
+          grep -q 'VERSION = "3.2.5"' server/mobile_api.py
       - name: Package complete source first
         run: |
-          zip -qry "$RUNNER_TEMP/Juweier-Music-v3.2.3-Complete-Source.zip" . \
+          zip -qry "$RUNNER_TEMP/Juweier-Music-v3.2.5-Complete-Source.zip" . \
             -x '.git/*' '__pycache__/*' '*.pyc' 'mobile_server_data/*'
-          cp "$RUNNER_TEMP/Juweier-Music-v3.2.3-Complete-Source.zip" .
+          cp "$RUNNER_TEMP/Juweier-Music-v3.2.5-Complete-Source.zip" .
       - uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.3-Complete-Source
-          path: Juweier-Music-v3.2.3-Complete-Source.zip
+          name: Juweier-Music-v3.2.5-Complete-Source
+          path: Juweier-Music-v3.2.5-Complete-Source.zip
           if-no-files-found: error
           retention-days: 30

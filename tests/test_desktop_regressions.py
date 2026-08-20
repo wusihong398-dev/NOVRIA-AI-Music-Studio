@@ -13,7 +13,11 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.2.3"', launcher)
+        mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('VERSION = "3.2.5"', launcher)
+        self.assertIn('version: 3.2.5+325', mobile_manifest)
+        self.assertIn('VERSION = "3.2.5"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -40,9 +44,21 @@ class DesktopRegressionTests(unittest.TestCase):
     def test_library_job_routes_stay_inside_cloudflare_library_route(self):
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
         mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
-        self.assertIn('/api/v1/library/jobs/{job_id}', server)
-        self.assertIn('/api/v1/library/artifacts/{job_id}/{name}', server)
-        self.assertIn("'/api/v1/library/jobs/$id'", mobile)
+        self.assertIn('/api/v1/library/mobile/jobs/{job_id}', server)
+        self.assertIn('/api/v1/library/mobile/artifacts/{job_id}/{name}', server)
+        self.assertIn('/api/v1/library/mobile/health', server)
+        self.assertIn("'/api/v1/library/mobile/jobs/$id'", mobile)
+
+    def test_processing_runtime_is_checked_before_accepting_expensive_work(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        self.assertIn('def _runtime_capabilities()', server)
+        self.assertIn('def _require_processing_runtime()', server)
+        self.assertIn('lyrics_asr_available', server)
+        self.assertIn('检查 AI 处理环境', server)
+        self.assertIn('定位服务器歌曲', mobile)
+        self.assertIn('提交 AI 处理任务', mobile)
+        self.assertIn('服务器未安装 AI 分轨运行环境', mobile)
 
     def test_g_drive_library_is_global_and_visible_before_processors(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')

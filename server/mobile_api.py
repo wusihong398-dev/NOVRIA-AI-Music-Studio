@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.3.
+"""Mobile API companion for 橘味儿音乐 v3.2.5.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -47,7 +47,7 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.4"
+VERSION = "3.2.5"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -406,14 +406,66 @@ def _gpu_name() -> str:
         return "未检测到 PyTorch"
 
 
+def _runtime_capabilities() -> dict:
+    modules = {
+        "torch": importlib.util.find_spec("torch") is not None,
+        "demucs": importlib.util.find_spec("demucs") is not None,
+        "librosa": importlib.util.find_spec("librosa") is not None,
+        "mido": importlib.util.find_spec("mido") is not None,
+    }
+    ffmpeg = shutil.which("ffmpeg") is not None
+    missing = [name for name, available in modules.items() if not available]
+    if not ffmpeg:
+        missing.append("ffmpeg")
+    lyrics_asr = importlib.util.find_spec("faster_whisper") is not None
+    issues = []
+    if missing:
+        issues.append("AI 处理环境缺少：" + "、".join(missing))
+    if not lyrics_asr:
+        issues.append("AI 歌词转写模型未安装：faster-whisper")
+    return {
+        "processing_ready": not missing,
+        "lyrics_asr_available": lyrics_asr,
+        "modules": modules,
+        "ffmpeg": ffmpeg,
+        "issues": issues,
+    }
+
+
+def _require_processing_runtime() -> None:
+    capabilities = _runtime_capabilities()
+    if capabilities["processing_ready"]:
+        return
+    issue = capabilities["issues"][0]
+    raise RuntimeError(
+        f"{issue}。请在服务器项目目录使用完整环境安装 requirements-server.txt，"
+        "再重启橘味儿音乐 Mobile API。"
+    )
+
+
+def _friendly_job_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    lowered = text.lower()
+    if "no module named 'torch'" in lowered:
+        return "AI 处理环境未安装 PyTorch（torch），请安装 requirements-server.txt 后重启服务器。"
+    if "no module named 'demucs'" in lowered:
+        return "AI 六轨分离模型未安装（demucs），请安装 requirements-server.txt 后重启服务器。"
+    if "ffmpeg" in lowered and ("not found" in lowered or "找不到" in text):
+        return "服务器未安装或未配置 FFmpeg，暂时无法读取和处理音频。"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 @app.get("/health")
 @app.get("/api/health")
 @app.get("/api/v1/library/mobile/health")
 def health(_: None = Depends(authorize)) -> dict:
+    capabilities = _runtime_capabilities()
     return {
         "status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name(),
         "server_library_root": str(SERVER_LIBRARY_ROOT),
-        "lyrics_asr_available": importlib.util.find_spec("faster_whisper") is not None,
+        "processing_ready": capabilities["processing_ready"],
+        "runtime": capabilities,
+        "lyrics_asr_available": capabilities["lyrics_asr_available"],
         "lyrics_asr_model": os.environ.get("JUWEIER_LYRICS_MODEL", "large-v3-turbo"),
     }
 
@@ -421,9 +473,13 @@ def health(_: None = Depends(authorize)) -> dict:
 @app.get("/api/v1/app/config")
 @app.get("/api/v1/library/mobile/app/config")
 def app_config(_: None = Depends(authorize)) -> dict:
+    capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.4",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.5",
         "service": "online",
+        "processing_ready": capabilities["processing_ready"],
+        "lyrics_asr_available": capabilities["lyrics_asr_available"],
+        "runtime_issues": capabilities["issues"],
         "notice": "本软件目前仅供学习与研究使用，不提供歌曲下载服务。",
     }
 
@@ -841,6 +897,8 @@ def _run_job(job_id: str) -> None:
     )
     output_root.mkdir(parents=True, exist_ok=True)
     try:
+        _update(job_id, status="processing", stage="检查 AI 处理环境", progress=5)
+        _require_processing_runtime()
         _update(job_id, status="processing", stage="准备六轨模型与电吉他二次分离", progress=7)
         command = [
             sys.executable,
@@ -907,7 +965,7 @@ def _run_job(job_id: str) -> None:
             finally:
                 connection.close()
     except Exception as exc:
-        _update(job_id, status="failed", stage="失败", error=f"{type(exc).__name__}: {exc}")
+        _update(job_id, status="failed", stage="失败", error=_friendly_job_error(exc))
 
 
 def _analyze(path: Path, vocals_path: Path | None = None) -> tuple[dict, list[dict]]:
@@ -1197,13 +1255,14 @@ def _public_job(job: dict, request: Request) -> dict:
     result.pop("input_path", None)
     public = {}
     for key, value in result.get("artifacts", {}).items():
-        public[key] = str(request.url_for("library_artifact", job_id=result["id"], name=Path(value).name))
+        public[key] = str(request.url_for("library_mobile_artifact", job_id=result["id"], name=Path(value).name))
     result["artifacts"] = public
     return result
 
 
 @app.get("/api/v1/jobs/{job_id}")
 @app.get("/api/v1/library/jobs/{job_id}")
+@app.get("/api/v1/library/mobile/jobs/{job_id}")
 def get_job(job_id: str, request: Request, _: None = Depends(authorize)) -> dict:
     with lock:
         job = jobs.get(job_id)
@@ -1214,6 +1273,7 @@ def get_job(job_id: str, request: Request, _: None = Depends(authorize)) -> dict
 
 @app.get("/api/v1/artifacts/{job_id}/{name}", name="artifact")
 @app.get("/api/v1/library/artifacts/{job_id}/{name}", name="library_artifact")
+@app.get("/api/v1/library/mobile/artifacts/{job_id}/{name}", name="library_mobile_artifact")
 def artifact(job_id: str, name: str, _: None = Depends(authorize)):
     with lock:
         job = jobs.get(job_id)
