@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 _datas = [('assets','assets')]
 _binaries = []
 _hidden = []
-for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen']:
+for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp']:
     try:
         d, b, h = collect_all(pkg)
         _datas += d
@@ -15,9 +15,18 @@ for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'libros
 
 _hidden += collect_submodules('demucs')
 _common_hidden = _hidden + [
-    'numpy', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen',
+    'numpy', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp',
     'demucs.separate', 'demucs.pretrained', 'demucs.apply', 'demucs.api',
 ]
+
+_windows_manifest = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>'''
 
 analysis = Analysis(
     ['app/launcher.py'],
@@ -33,6 +42,7 @@ exe = EXE(
     name='Juweier-Music', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=False, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
+    manifest=_windows_manifest,
 )
 
 worker_analysis = Analysis(
@@ -49,6 +59,7 @@ worker_exe = EXE(
     name='Juweier-Separation-Worker', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
+    manifest=_windows_manifest,
 )
 
 coll = COLLECT(

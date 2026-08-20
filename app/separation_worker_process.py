@@ -7,6 +7,8 @@ import traceback
 import urllib.request
 from pathlib import Path
 
+from app.project_utils import split_guitar_stem
+
 
 def _force_utf8_stdio():
     # PyInstaller console workers on Simplified Chinese Windows may inherit GBK/CP936.
@@ -54,7 +56,7 @@ def _ensure_model(torch_module) -> Path:
     part = target.with_suffix(target.suffix + ".part")
     part.unlink(missing_ok=True)
     emit("model_progress", value=0, text="首次使用：正在连接 AI 模型服务器...")
-    request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Juweier-Music/2.1.7"})
+    request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Juweier-Music/3.2.5"})
     with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
         total = int(response.headers.get("Content-Length") or 0)
         downloaded = 0
@@ -147,6 +149,13 @@ def main():
             save_audio(source, out, samplerate=separator.samplerate)
             pct = 96 + int(i / total * 4)
             emit("separation_progress", value=min(100, pct), text=f"正在保存 {stem}.wav")
+
+        emit("separation_progress", value=97, text="正在二次识别木吉他与电吉他...")
+        guitar_diagnostics = split_guitar_stem(stem_dir)
+        emit(
+            "separation_progress", value=100,
+            text=f"六轨基础分离 + 电吉他二次分离完成（电吉他活跃度 {guitar_diagnostics['electric_activity']:.0%}）",
+        )
 
         emit("done", stem_dir=str(stem_dir))
         return 0

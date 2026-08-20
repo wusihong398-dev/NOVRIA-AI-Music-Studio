@@ -11,9 +11,12 @@ import os
 import subprocess
 import webbrowser
 import html
+import re
 import queue
 import wave
+import zipfile
 import math
+import threading
 import time, json, subprocess, traceback, platform, urllib.request, hashlib, io, os
 from pathlib import Path
 
@@ -23,27 +26,46 @@ from app.project_utils import (
     repair_text,
     safe_file_stem,
     unique_import_candidates,
+    load_synced_lyrics,
+    split_guitar_stem,
+)
+from app.library_catalog import (
+    AUDIO_EXTENSIONS,
+    catalog_artist_name,
+    connect_catalog,
+    list_catalog,
+    scan_catalog,
+    scan_catalog_roots,
+    download_public_audio,
+)
+from app.lyrics_ai import generate_lyrics, lyrics_to_lrc
+from app.server_library_client import (
+    DEFAULT_SERVER_URL,
+    ServerLibraryClient,
+    ServerLibraryError,
+    load_desktop_server_config,
 )
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from PySide6.QtCore import QFileInfo, Qt, QSize, QThread, Signal, QTimer
+from PySide6.QtCore import QFileInfo, Qt, QSize, QThread, Signal, QTimer, QPointF, QRectF
 from PySide6.QtGui import QPainter, QPen, QColor, QCloseEvent, QIcon, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QSlider, QGroupBox, QMessageBox, QProgressBar,
-    QListWidget, QListWidgetItem, QStackedWidget, QGridLayout, QDialogButtonBox, QTableWidget, QTableWidgetItem, QTabWidget, QRadioButton, QFileSystemModel, QTreeWidgetItem, QTreeWidget, QPlainTextEdit, QButtonGroup, QTextBrowser, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox
+    QListWidget, QListWidgetItem, QStackedWidget, QGridLayout, QDialogButtonBox, QTableWidget, QTableWidgetItem, QTabWidget, QRadioButton, QFileSystemModel, QTreeWidgetItem, QTreeWidget, QPlainTextEdit, QButtonGroup, QTextBrowser, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox, QInputDialog
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "2.1.7"
+VERSION = "3.2.5"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
     ("bass", "🎸", "贝斯 Bass"),
-    ("guitar", "🎸", "吉他 Guitar"),
+    ("guitar", "🎸", "木吉他 A.Guitar"),
+    ("electric_guitar", "🎸", "电吉他 E.Guitar"),
     ("piano", "🎹", "钢琴 Piano"),
     ("other", "🎻", "其他 Other"),
 ]
@@ -52,6 +74,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STEMS_DIR = BASE_DIR / "stems"
 PROJECTS_DIR = BASE_DIR / "projects"
 EXPORTS_DIR = BASE_DIR / "exports"
+DESKTOP_SERVER_CONFIG = BASE_DIR / "config" / "desktop_server.json"
 
 ASSETS_DIR = BASE_DIR / "assets"
 ICONS_DIR = ASSETS_DIR / "icons"
@@ -132,7 +155,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/2.1.7"}
+            headers={"User-Agent": "Juweier-Music/3.2.5"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -230,8 +253,13 @@ class SeparationWorker(QThread):
             if missing:
                 raise RuntimeError("分轨结果缺少：" + ", ".join(missing))
 
-            self.separation_progress.emit(100, "六轨分离完成")
-            self.log.emit("AI 六轨分离完成，可以进入现场演出模式。")
+            self.separation_progress.emit(97, "正在二次识别木吉他与电吉他...")
+            guitar_diagnostics = split_guitar_stem(stem_dir)
+            self.separation_progress.emit(100, "六轨基础分离 + 电吉他二次分离完成")
+            self.log.emit(
+                "AI 六轨模型处理完成；已从吉他轨生成独立木吉他与电吉他轨。"
+                f" 电吉他活跃度 {guitar_diagnostics['electric_activity']:.0%}。"
+            )
             self.done.emit(str(stem_dir))
         except Exception as e:
             self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
@@ -255,6 +283,62 @@ class PipelineStageWorker(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
 
 
+class LinkDownloadWorker(QThread):
+    progress = Signal(int, str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url, destination, ffmpeg_path=""):
+        super().__init__()
+        self.url = str(url).strip()
+        self.destination = Path(destination)
+        self.ffmpeg_path = str(ffmpeg_path or "")
+
+    def run(self):
+        try:
+            path = download_public_audio(
+                self.url, self.destination, self.ffmpeg_path,
+                lambda value, text: self.progress.emit(int(value), str(text)),
+            )
+            self.done.emit(str(path))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class RemoteLibraryJobWorker(QThread):
+    """Queue and monitor one server-owned library processing job."""
+
+    progress = Signal(int, str)
+    done = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, client, track_id, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.track_id = int(track_id)
+
+    def run(self):
+        try:
+            queued = self.client.queue_processing(self.track_id)
+            job_id = str(queued.get("job_id") or queued.get("id") or "")
+            if not job_id:
+                raise RuntimeError("服务器未返回 job_id")
+            while not self.isInterruptionRequested():
+                result = self.client.job(job_id)
+                status = str(result.get("status") or "processing").lower()
+                value = int(float(result.get("progress") or 0))
+                stage = str(result.get("stage") or "服务器处理中")
+                self.progress.emit(max(0, min(100, value)), stage)
+                if status in {"completed", "complete", "done", "success", "succeeded"}:
+                    self.done.emit(job_id, dict(result.get("artifacts") or {}))
+                    return
+                if status in {"failed", "error", "cancelled", "canceled"}:
+                    raise RuntimeError(str(result.get("error") or result.get("message") or "服务器任务失败"))
+                self.msleep(2000)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class MultiStemEngine:
     def __init__(self):
         self.files = {}
@@ -268,6 +352,8 @@ class MultiStemEngine:
         self.volume = {k: 0.9 for k, _, _ in STEM_ORDER}
         self.frames_played = 0
         self.total_frames = 0
+        self.speed = 1.0
+        self._io_lock = threading.RLock()
 
     def load(self, stem_dir: Path):
         self.close()
@@ -275,6 +361,8 @@ class MultiStemEngine:
         for key, _, _ in STEM_ORDER:
             p = stem_dir / f"{key}.wav"
             if not p.exists():
+                if key == "electric_guitar":
+                    continue
                 raise FileNotFoundError(f"缺少音轨：{p.name}")
             paths[key] = p
 
@@ -299,15 +387,29 @@ class MultiStemEngine:
         solos = [k for k, v in self.solo.items() if v]
         active = set(solos) if solos else {k for k in self.files if not self.mute[k]}
 
+        source_frames = max(1, int(math.ceil(frames * self.speed)))
         mix = np.zeros((frames, self.channels), dtype=np.float32)
         valid_frames = frames
 
-        for key, f in self.files.items():
-            data = f.read(frames, dtype="float32", always_2d=True)
-            n = len(data)
-            valid_frames = min(valid_frames, n)
-            if key in active and n:
-                mix[:n] += data * float(self.volume[key])
+        with self._io_lock:
+            for key, f in self.files.items():
+                data = f.read(source_frames, dtype="float32", always_2d=True)
+                n = len(data)
+                output_count = min(frames, max(0, int(n / self.speed)))
+                valid_frames = min(valid_frames, output_count)
+                if key in active and n and output_count:
+                    if n == output_count:
+                        rendered = data
+                    else:
+                        old_positions = np.arange(n, dtype=np.float32)
+                        new_positions = np.linspace(0, max(0, n - 1), output_count, dtype=np.float32)
+                        rendered = np.column_stack([
+                            np.interp(new_positions, old_positions, data[:, channel])
+                            for channel in range(self.channels)
+                        ]).astype(np.float32)
+                    mix[:output_count] += rendered * float(self.volume[key])
+            if self.files:
+                self.frames_played = min(int(f.tell()) for f in self.files.values())
 
         if valid_frames <= 0:
             outdata.fill(0)
@@ -320,8 +422,6 @@ class MultiStemEngine:
             mix /= peak
 
         outdata[:] = mix
-        self.frames_played += valid_frames
-
         if valid_frames < frames:
             outdata[valid_frames:] = 0
             self.playing = False
@@ -384,9 +484,13 @@ class MultiStemEngine:
         if not self.files or self.total_frames <= 0:
             return
         pos = int(max(0.0, min(1.0, ratio)) * self.total_frames)
-        for f in self.files.values():
-            f.seek(pos)
-        self.frames_played = pos
+        with self._io_lock:
+            for f in self.files.values():
+                f.seek(pos)
+            self.frames_played = pos
+
+    def set_speed(self, value: float):
+        self.speed = max(0.5, min(1.5, float(value)))
 
     def position_seconds(self):
         return self.frames_played / self.sample_rate if self.sample_rate else 0
@@ -403,7 +507,7 @@ class TrackRow(QWidget):
         layout.setContentsMargins(8, 5, 8, 5)
 
         label = QLabel(f"{icon}  {name}")
-        track_colors = {"vocals":"#B071FF","drums":"#FF8B3D","bass":"#3CA8FF","guitar":"#75E44C","piano":"#35D6D0","other":"#F4C04C"}
+        track_colors = {"vocals":"#B071FF","drums":"#FF8B3D","bass":"#3CA8FF","guitar":"#75E44C","electric_guitar":"#FF5B65","piano":"#35D6D0","other":"#F4C04C"}
         label.setStyleSheet(f"font-weight:700;color:{track_colors.get(key, '#EAF0FF')};")
         label.setMinimumWidth(170)
         self.mute = QPushButton("M")
@@ -439,7 +543,7 @@ class StudioPage(QWidget):
         self.main = main
         layout = QVBoxLayout(self)
 
-        title = QLabel("AI 六轨分离 / 多轨工作台")
+        title = QLabel("AI 六轨分离 + 电吉他二次分离 / 多轨工作台")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
@@ -447,7 +551,7 @@ class StudioPage(QWidget):
         self.file_label = QLabel("尚未导入歌曲")
         btn_import = QPushButton(QIcon(icon_path("import")), "导入歌曲")
         btn_import.clicked.connect(main.import_song)
-        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 六轨分离")
+        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 六轨分离 + 电吉他二次分离")
         apply_button_accent(self.btn_split, "primary")
         self.btn_split.clicked.connect(main.start_separation)
         file_row.addWidget(self.file_label, 1)
@@ -464,6 +568,8 @@ class StudioPage(QWidget):
         stop_btn.clicked.connect(main.stop)
         self.timeline = QSlider(Qt.Horizontal)
         self.timeline.setRange(0, 1000)
+        self.timeline.sliderPressed.connect(main.begin_timeline_seek)
+        self.timeline.sliderMoved.connect(main.preview_timeline_seek)
         self.timeline.sliderReleased.connect(main.seek_from_slider)
         self.time_label = QLabel("00:00 / 00:00")
         transport.addWidget(self.play_btn)
@@ -503,7 +609,7 @@ class StudioPage(QWidget):
 
         model_box = QGroupBox("AI 模型")
         model_l = QVBoxLayout(model_box)
-        self.model_status = QLabel("首次使用时会下载 htdemucs_6s 六轨模型")
+        self.model_status = QLabel("首次使用时会下载 htdemucs_6s；电吉他轨支持二次识别结果")
         self.model_progress = QProgressBar()
         self.model_progress.setRange(0, 100)
         self.model_progress.setValue(0)
@@ -512,13 +618,13 @@ class StudioPage(QWidget):
         model_l.addWidget(self.model_progress)
         layout.addWidget(model_box)
 
-        split_box = QGroupBox("六轨分离进度")
+        split_box = QGroupBox("六轨基础分离与电吉他二次识别进度")
         split_l = QVBoxLayout(split_box)
         self.split_status = QLabel("等待开始")
         self.split_progress = QProgressBar()
         self.split_progress.setRange(0, 100)
         self.split_progress.setValue(0)
-        self.split_progress.setFormat("六轨分离 %p%")
+        self.split_progress.setFormat("分轨处理 %p%")
         split_l.addWidget(self.split_status)
         split_l.addWidget(self.split_progress)
         layout.addWidget(split_box)
@@ -671,7 +777,88 @@ class SettingsPage(QWidget):
         ll.addWidget(self.offline)
         ll.addWidget(self.prevent_sleep)
         layout.addWidget(live_box)
+
+        server_box = QGroupBox("AI 服务器（服务器 G 盘曲库来源）")
+        server_layout = QGridLayout(server_box)
+        server_config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
+        self.server_edit = QLineEdit(server_config["server"])
+        self.server_edit.setPlaceholderText("https://api.example.com")
+        self.server_token_edit = QLineEdit(server_config["token"])
+        self.server_token_edit.setEchoMode(QLineEdit.Password)
+        self.server_token_edit.setPlaceholderText("访问令牌（服务器未设置时可留空）")
+        save_server = QPushButton("保存并刷新曲库")
+        test_server = QPushButton("测试服务器曲库")
+        apply_button_accent(save_server, "primary")
+        save_server.clicked.connect(self.save_server)
+        test_server.clicked.connect(self.test_server)
+        server_layout.addWidget(QLabel("服务器地址"), 0, 0)
+        server_layout.addWidget(self.server_edit, 0, 1, 1, 3)
+        server_layout.addWidget(QLabel("访问令牌"), 1, 0)
+        server_layout.addWidget(self.server_token_edit, 1, 1, 1, 3)
+        server_layout.addWidget(save_server, 2, 1)
+        server_layout.addWidget(test_server, 2, 2)
+        server_layout.addWidget(QLabel("曲库必须由服务器 API 读取，不会扫描客户端 G 盘。"), 3, 0, 1, 4)
+        layout.addWidget(server_box)
+
+        legal_box = QGroupBox("协议、帮助与关于")
+        legal_layout = QHBoxLayout(legal_box)
+        documents = {
+            "开源软件声明": "本软件使用 PySide6、FastAPI、PyTorch、Demucs、NumPy、SciPy、librosa 等开源组件。各组件的版权与许可条款以随包许可证及官方声明为准。",
+            "隐私政策": "软件仅在用户主动操作时处理导入的音频、任务参数、账号与反馈信息。手机 AI 任务会上传至配置的 AI 服务器。",
+            "用户协议": "本软件目前仅供学习与研究使用，不提供歌曲下载服务。只能导入自己创作、已获授权或依法可使用的音频；AI 结果须人工复核。",
+            "帮助与反馈": "如遇到分轨、谱面、歌词或连接问题，请记录软件版本、歌曲格式、操作步骤和错误信息后反馈。",
+            "关于软件": f"{APP_NAME} v{VERSION}\nAI 六轨+电吉他、五线谱/六线谱/歌词同步、AI 歌词与现场演出工作站。",
+        }
+        for name, text in documents.items():
+            button = QPushButton(name)
+            button.clicked.connect(lambda checked=False, n=name, t=text: self.show_document(n, t))
+            legal_layout.addWidget(button)
+        layout.addWidget(legal_box)
+        study_notice = QLabel("本软件目前仅供学习与研究使用，不提供歌曲下载服务。")
+        study_notice.setObjectName("SectionHint")
+        layout.addWidget(study_notice)
         layout.addStretch(1)
+
+    def save_server(self):
+        server = self.server_edit.text().strip().rstrip("/") or DEFAULT_SERVER_URL
+        token = self.server_token_edit.text().strip()
+        atomic_write_json(DESKTOP_SERVER_CONFIG, {"server": server, "token": token})
+        self.server_edit.setText(server)
+        if hasattr(self.main, "music_library"):
+            self.main.music_library.refresh_library()
+        QMessageBox.information(self, "AI 服务器", "服务器地址已保存，已刷新服务器 G 盘曲库。")
+
+    def test_server(self):
+        try:
+            server = self.server_edit.text().strip().rstrip("/") or DEFAULT_SERVER_URL
+            token = self.server_token_edit.text().strip()
+            client = ServerLibraryClient(server, token, timeout=12)
+            health = client.health()
+            catalog = client.songs()
+            root = catalog.get("server_library_root", "未返回路径")
+            lyric_asr = "已安装" if health.get("lyrics_asr_available") else "未安装（仅使用同名 LRC/内嵌歌词）"
+            QMessageBox.information(
+                self, "服务器曲库连接成功",
+                f"服务状态：{health.get('status', 'online')}\n"
+                f"服务器曲库：{root}\n"
+                f"已入库歌曲：{catalog.get('count', 0)} 首\n"
+                f"歌词识别模型：{lyric_asr}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "服务器曲库连接失败", str(exc))
+
+    def show_document(self, title, text):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 520)
+        layout = QVBoxLayout(dialog)
+        browser = QTextBrowser()
+        browser.setPlainText(text)
+        layout.addWidget(browser)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
 
     def refresh_audio_devices(self):
         current = self.output_combo.currentText() if hasattr(self, "output_combo") else ""
@@ -908,7 +1095,10 @@ class SetlistPage(QWidget):
         layout.addWidget(title)
 
         bar = QHBoxLayout()
-        add_btn = QPushButton("添加歌曲")
+        add_current_btn = QPushButton("加入当前 G 盘歌曲")
+        apply_button_accent(add_current_btn, "primary")
+        add_current_btn.clicked.connect(self.add_current_song)
+        add_btn = QPushButton("添加本地文件")
         add_btn.clicked.connect(self.add_song)
         remove_btn = QPushButton("删除所选")
         remove_btn.clicked.connect(self.remove_selected)
@@ -920,7 +1110,7 @@ class SetlistPage(QWidget):
         load_btn.clicked.connect(self.load_selected)
         self.auto_next = QCheckBox("播放结束自动下一首")
         self.auto_next.setChecked(True)
-        for w in [add_btn, remove_btn, up_btn, down_btn, load_btn, self.auto_next]:
+        for w in [add_current_btn, add_btn, remove_btn, up_btn, down_btn, load_btn, self.auto_next]:
             bar.addWidget(w)
         bar.addStretch(1)
         layout.addLayout(bar)
@@ -943,6 +1133,18 @@ class SetlistPage(QWidget):
             if p not in [x["path"] for x in self.items]:
                 self.items.append({"path":p,"mode":"全部开启","key":"原调","speed":"100%"})
         self.refresh()
+
+    def add_current_song(self):
+        path = str(self.main.song_file or "")
+        if not path or not Path(path).exists():
+            QMessageBox.information(self, "Setlist", "请先从左侧的 G 盘歌曲库选择一首歌曲。")
+            self.main.open_g_drive_library()
+            return
+        if path not in [item["path"] for item in self.items]:
+            self.items.append({"path": path, "mode": "全部开启", "key": "原调", "speed": "100%"})
+        self.refresh()
+        if self.items:
+            self.table.selectRow(len(self.items) - 1)
 
     def refresh(self):
         self.table.setRowCount(len(self.items))
@@ -968,9 +1170,7 @@ class SetlistPage(QWidget):
     def load_selected(self):
         r = self.table.currentRow()
         if 0 <= r < len(self.items):
-            self.main.song_file = self.items[r]["path"]
-            self.main.studio.file_label.setText(Path(self.main.song_file).name)
-            self.main.nav.setCurrentRow(2)
+            self.main.load_imported_working_file(self.items[r]["path"])
             QMessageBox.information(self, "Setlist", "歌曲已载入。若该歌曲尚未分轨，请先执行 AI 六轨分离。")
 
     def current_index(self):
@@ -1021,7 +1221,8 @@ class LiveProPage(QWidget):
         preset = QGroupBox("演出身份")
         pg = QGridLayout(preset)
         modes = [
-            ("🎸 吉他弹唱","guitar"),("🎹 钢琴弹唱","piano"),
+            ("🎸 木吉他弹唱","guitar"),("🎸 电吉他手","electric_guitar"),
+            ("🎹 钢琴弹唱","piano"),
             ("🥁 鼓手","drums"),("🎸 贝斯手","bass"),
             ("🎤 KTV/纯伴奏","vocals"),("🎼 全部恢复",None)
         ]
@@ -1038,16 +1239,29 @@ class LiveProPage(QWidget):
         self.transpose.setRange(-12,12)
         self.transpose.setValue(0)
         self.transpose.setSuffix(" 半音")
+        self.transpose.valueChanged.connect(self.update_capo_label)
         self.speed = QDoubleSpinBox()
         self.speed.setRange(0.50,1.50)
         self.speed.setSingleStep(0.05)
         self.speed.setValue(1.00)
         self.speed.setSuffix(" x")
+        self.speed.valueChanged.connect(main.engine.set_speed)
+        self.delay_ms = QSpinBox()
+        self.delay_ms.setRange(0,1000)
+        self.delay_ms.setSingleStep(10)
+        self.delay_ms.setSuffix(" ms")
+        self.capo_label=QLabel("推荐变调夹：0 品")
+        apply_transpose=QPushButton("应用变调到全部音轨")
+        apply_transpose.clicked.connect(main.apply_live_transpose)
         tg.addWidget(QLabel("升降调"),0,0)
         tg.addWidget(self.transpose,0,1)
         tg.addWidget(QLabel("速度"),1,0)
         tg.addWidget(self.speed,1,1)
-        tg.addWidget(QLabel("当前版本保存升降调/速度参数；实时高质量变调/变速 DSP 将在下一阶段接入。"),2,0,1,2)
+        tg.addWidget(QLabel("节拍/谱面延时"),2,0)
+        tg.addWidget(self.delay_ms,2,1)
+        tg.addWidget(self.capo_label,3,0)
+        tg.addWidget(apply_transpose,3,1)
+        tg.addWidget(QLabel("速度实时作用于全部分轨；变调会生成并载入保持同步的新音轨。"),4,0,1,2)
         layout.addWidget(trans)
 
         met = QGroupBox("耳返 / 节拍器")
@@ -1085,6 +1299,11 @@ class LiveProPage(QWidget):
         self.status.setObjectName("StatusGood")
         layout.addWidget(self.status)
         layout.addStretch(1)
+
+    def update_capo_label(self,value):
+        semitones=int(value)
+        capo=semitones if 0 <= semitones <= 7 else 0
+        self.capo_label.setText(f"推荐变调夹：{capo} 品" if capo else "推荐变调夹：0 品/调整和弦指法")
 
     def toggle_lock(self, checked):
         if checked:
@@ -1433,6 +1652,82 @@ class ArrangementScorePage(QWidget):
 
 
 
+class DesktopScoreCanvas(QWidget):
+    def __init__(self,main):
+        super().__init__()
+        self.main=main
+        self.mode="五线谱"
+        self.position=0.0
+        self.setMinimumHeight(230)
+
+    def set_mode(self,mode):
+        self.mode=str(mode)
+        self.update()
+
+    def set_position(self,seconds):
+        self.position=max(0,float(seconds))
+        self.update()
+
+    def _midi(self,note):
+        if "midi" in note:
+            return int(note.get("midi",60))
+        match=re.match(r"^([A-G])([#b]?)(-?\d+)$",str(note.get("note","C4")))
+        if not match:
+            return 60
+        pitch={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}[match.group(1)]
+        pitch += 1 if match.group(2)=="#" else -1 if match.group(2)=="b" else 0
+        return 12*(int(match.group(3))+1)+pitch
+
+    def paintEvent(self,event):
+        painter=QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(),QColor("#0d1018"))
+        width=max(100,self.width())
+        top=40
+        gap=22
+        tablature=self.mode=="六线谱"
+        line_count=6 if tablature else 5
+        painter.setPen(QPen(QColor("#BDAAB5"),1))
+        for index in range(line_count):
+            y=top+index*gap
+            painter.drawLine(24,y,width-24,y)
+        painter.setPen(QPen(QColor("#FF7A18"),2))
+        painter.drawLine(34,top-18,34,top+(line_count-1)*gap+18)
+
+        notes=[
+            note for note in getattr(self.main,"melody_reference",[])
+            if self.position-1 <= float(note.get("start",0)) <= self.position+15
+        ][:32]
+        tuning=[64,59,55,50,45,40]
+        for note in notes:
+            start=float(note.get("start",0))
+            x=52+(start-(self.position-1))/16*max(20,width-92)
+            midi=self._midi(note)
+            if tablature:
+                choices=[(midi-open_note,index) for index,open_note in enumerate(tuning) if 0<=midi-open_note<=24]
+                fret,string=min(choices,default=(0,0),key=lambda item:item[0])
+                painter.setPen(QColor("#FF9A2A"))
+                painter.drawText(QRectF(x-11,top+string*gap-11,24,22),Qt.AlignCenter,str(fret))
+            else:
+                y=max(18,min(top+4*gap+18,top+4*gap-(midi-60)*gap/3.5))
+                painter.setBrush(QColor("#FF7A18")); painter.setPen(Qt.NoPen)
+                painter.drawEllipse(QPointF(x,y),7,5)
+                painter.setPen(QPen(QColor("#FF7A18"),2)); painter.drawLine(QPointF(x+6,y),QPointF(x+6,y-30))
+
+        lyric=""
+        for row in getattr(self.main,"lyric_reference",[]):
+            if self.position>=float(row.get("start",0)):
+                lyric=str(row.get("text",""))
+            else:
+                break
+        painter.setPen(QColor("#FFFFFF"))
+        font=painter.font(); font.setPointSize(15); font.setBold(True); painter.setFont(font)
+        painter.drawText(QRectF(24,self.height()-55,width-48,42),Qt.AlignCenter,lyric or "歌词将随播放位置同步显示")
+        if not notes:
+            painter.setPen(QColor("#A995A6"))
+            painter.drawText(QRectF(24,top+line_count*gap+5,width-48,30),Qt.AlignCenter,"请先运行乐谱分析，自动生成主旋律五线谱和六线谱")
+
+
 class ScorePerformancePage(QWidget):
     def __init__(self, main):
         super().__init__()
@@ -1446,7 +1741,7 @@ class ScorePerformancePage(QWidget):
 
         top = QHBoxLayout()
         self.score_type = QComboBox()
-        self.score_type.addItems(["Lead Sheet","吉他 TAB","贝斯谱","鼓谱","键盘谱"])
+        self.score_type.addItems(["Lead Sheet","五线谱","六线谱","贝斯谱","鼓谱","键盘谱"])
         self.score_type.currentIndexChanged.connect(self.refresh_score)
         self.auto_follow = QCheckBox("跟随播放头自动翻谱")
         self.auto_follow.setChecked(True)
@@ -1466,6 +1761,9 @@ class ScorePerformancePage(QWidget):
         self.now = QLabel("当前小节：—")
         self.now.setObjectName("StatusGood")
         layout.addWidget(self.now)
+
+        self.canvas=DesktopScoreCanvas(main)
+        layout.addWidget(self.canvas)
 
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(False)
@@ -1498,10 +1796,35 @@ class ScorePerformancePage(QWidget):
         mode=self.score_type.currentText()
         font="24px" if self.big_mode.isChecked() else "16px"
         blocks=[]
-        for row in rows:
+        for row_index,row in enumerate(rows):
             chord=" / ".join(row.get("chords") or ["N"])
             extra=""
-            if mode=="吉他 TAB":
+            notes=[n for n in getattr(self.main,"melody_reference",[]) if row["seconds"] <= float(n.get("start",n.get("seconds",0))) < row["seconds"]+12]
+            next_seconds=rows[row_index+1]["seconds"] if row_index+1<len(rows) else row["seconds"]+12
+            lyric_lines=[
+                str(item.get("text","")) for item in getattr(self.main,"lyric_reference",[])
+                if row["seconds"] <= float(item.get("start",0)) < next_seconds
+            ]
+            if mode=="五线谱":
+                pitches="  ".join(html.escape(str(n.get("note",""))) for n in notes[:16]) or "请点击“主旋律参考转写”生成实际音符"
+                extra=f"<div class='staff'><div>𝄞 ─────────────────────────</div><div>　──────── {pitches} ────────</div><div>　─────────────────────────</div><div>　─────────────────────────</div><div>　─────────────────────────</div></div>"
+            elif mode=="六线谱":
+                tuning=[("e",64),("B",59),("G",55),("D",50),("A",45),("E",40)]
+                lanes={name:[] for name,_ in tuning}
+                for note in notes[:16]:
+                    raw=str(note.get("note","C4"))
+                    match=re.match(r"^([A-G])([#b]?)(-?\d+)$",raw)
+                    pitch={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}.get(match.group(1),0) if match else 0
+                    if match and match.group(2)=="#": pitch+=1
+                    if match and match.group(2)=="b": pitch-=1
+                    midi=int(note.get("midi",12*(int(match.group(3))+1)+pitch if match else 60))
+                    choices=[(midi-open_note,name) for name,open_note in tuning if 0<=midi-open_note<=24]
+                    fret,string=min(choices,default=(0,"e"),key=lambda x:x[0])
+                    for name,_ in tuning:
+                        lanes[name].append(str(fret) if name==string else "-")
+                tab="<br>".join(f"{name}|"+"-".join(lanes[name] or ["-"])+"|" for name,_ in tuning)
+                extra=f"<div class='tab'>{tab}</div>"
+            elif mode=="吉他 TAB":
                 first=(row.get("chords") or ["C"])[0]
                 extra=f"<div class='tab'>Chord Shape: {self._tab_for_chord(first)}<br>E A D G B e</div>"
             elif mode=="贝斯谱":
@@ -1511,6 +1834,8 @@ class ScorePerformancePage(QWidget):
                 extra="<div class='tab'>HH x-x-x-x-x-x-x-x-<br>SD ----o-------o---<br>BD o-------o-------</div>"
             elif mode=="键盘谱":
                 extra="<div class='hint'>左手：根音/五度 · 右手：和弦转位/分解</div>"
+            if lyric_lines:
+                extra += "<div class='lyrics'>"+"<br>".join(html.escape(line) for line in lyric_lines)+"</div>"
             blocks.append(
                 f"<div id='bar{row['bar']}' class='bar'>"
                 f"<div class='sec'>{html.escape(row.get('section',''))}</div>"
@@ -1523,11 +1848,14 @@ class ScorePerformancePage(QWidget):
         .sec{{color:#8ca0c5;font-size:0.65em}} .num{{color:#6f82a5;font-size:0.6em}}
         .chord{{color:#65e1ce;font-weight:800;font-size:1.35em;margin:8px 0}}
         .tab{{font-family:Consolas,monospace;color:#f4c04c;font-size:0.75em}}
+        .staff{{font-family:'Segoe UI Symbol',Consolas,monospace;color:#f4c04c;font-size:0.72em;line-height:1.0}}
         .hint{{color:#b8c4dc;font-size:0.72em}}
+        .lyrics{{color:#fff;font-size:0.9em;text-align:center;margin-top:12px;padding:8px;background:#251721;border-radius:8px}}
         .active{{border:2px solid #8b6cff;background:#21194a}}
         </style><body>{''.join(blocks)}</body></html>"""
 
     def refresh_score(self):
+        self.canvas.set_mode(self.score_type.currentText())
         self.browser.setHtml(self._html())
 
     def follow_playback(self):
@@ -1536,7 +1864,9 @@ class ScorePerformancePage(QWidget):
         rows=getattr(self.main,"chord_timeline",[])
         if not rows:
             return
-        pos=self.main.engine.position_seconds()
+        delay=(self.main.live_pro.delay_ms.value()/1000 if hasattr(self.main,"live_pro") else 0)
+        pos=max(0,self.main.engine.position_seconds()-delay)
+        self.canvas.set_position(pos)
         current=rows[0]["bar"]
         for row in rows:
             if pos >= row["seconds"]:
@@ -1545,8 +1875,90 @@ class ScorePerformancePage(QWidget):
                 break
         if current != self.current_bar:
             self.current_bar=current
-            self.now.setText(f"当前小节：{current}")
+            lyric=""
+            for item in getattr(self.main,"lyric_reference",[]):
+                if pos >= float(item.get("start",0)):
+                    lyric=str(item.get("text",""))
+                else:
+                    break
+            self.now.setText(f"当前小节：{current}" + (f"　歌词：{lyric}" if lyric else ""))
             self.browser.scrollToAnchor(f"bar{current}")
+
+
+class LyricsStudioPage(QWidget):
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.results = []
+        layout = QVBoxLayout(self)
+        title = QLabel("AI 歌词创作（普通话 / 粤语 / 英语）")
+        title.setStyleSheet("font-size:24px;font-weight:800")
+        layout.addWidget(title)
+        notice = QLabel(
+            "根据主题生成可编辑初稿，不搜索或复制已有歌曲。"
+            "粤语支持常用口语，发音、押韵和地域用词请由母语使用者复核。"
+        )
+        notice.setWordWrap(True)
+        notice.setObjectName("SectionHint")
+        layout.addWidget(notice)
+        form = QGroupBox("创作参数")
+        grid = QGridLayout(form)
+        self.theme = QLineEdit()
+        self.theme.setPlaceholderText("例：离开家乡后的重逢")
+        self.language = QComboBox(); self.language.addItems(["普通话", "粤语", "英语"])
+        self.style = QComboBox(); self.style.addItems(["流行", "摇滚", "民谣", "R&B"])
+        self.mood = QComboBox(); self.mood.addItems(["温暖", "热血", "伤感", "治愈"])
+        generate = QPushButton("生成 3 个方案")
+        apply_button_accent(generate, "primary")
+        generate.clicked.connect(self.generate)
+        grid.addWidget(QLabel("主题 / 故事"), 0, 0); grid.addWidget(self.theme, 0, 1, 1, 5)
+        grid.addWidget(QLabel("语言"), 1, 0); grid.addWidget(self.language, 1, 1)
+        grid.addWidget(QLabel("风格"), 1, 2); grid.addWidget(self.style, 1, 3)
+        grid.addWidget(QLabel("情绪"), 1, 4); grid.addWidget(self.mood, 1, 5)
+        grid.addWidget(generate, 2, 5)
+        layout.addWidget(form)
+        self.variant = QComboBox()
+        self.variant.currentIndexChanged.connect(self.show_variant)
+        layout.addWidget(self.variant)
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText("生成的歌词会显示在这里，可直接修改。")
+        layout.addWidget(self.editor, 1)
+        buttons = QHBoxLayout()
+        save_txt = QPushButton("导出 TXT"); save_lrc = QPushButton("导出 LRC")
+        use_current = QPushButton("设为当前歌曲歌词")
+        save_txt.clicked.connect(lambda: self.save("txt"))
+        save_lrc.clicked.connect(lambda: self.save("lrc"))
+        use_current.clicked.connect(self.use_current)
+        buttons.addWidget(save_txt); buttons.addWidget(save_lrc); buttons.addWidget(use_current); buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+    def generate(self):
+        theme = self.theme.text().strip()
+        if not theme:
+            QMessageBox.information(self, "AI 歌词", "请先填写主题或故事。")
+            return
+        self.results = generate_lyrics(theme, self.language.currentText(), self.style.currentText(), self.mood.currentText(), 3)
+        self.variant.blockSignals(True); self.variant.clear()
+        self.variant.addItems([item["title"] for item in self.results])
+        self.variant.blockSignals(False); self.variant.setCurrentIndex(0); self.show_variant(0)
+
+    def show_variant(self, index):
+        if 0 <= index < len(self.results):
+            self.editor.setPlainText(self.results[index]["lyrics"])
+
+    def save(self, kind):
+        text = self.editor.toPlainText().strip()
+        if not text: return
+        path, _ = QFileDialog.getSaveFileName(self, "导出歌词", str(EXPORTS_DIR / f"lyrics.{kind}"), f"{kind.upper()} (*.{kind})")
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(lyrics_to_lrc(text) if kind == "lrc" else text + "\n", encoding="utf-8")
+
+    def use_current(self):
+        text = self.editor.toPlainText().strip()
+        if not text: return
+        self.main.lyric_reference = [{"time": i * 3.3, "text": line.strip()} for i, line in enumerate(text.splitlines()) if line.strip() and not line.startswith("[")]
+        self.main.statusBar().showMessage("已将 AI 歌词初稿设为当前歌曲歌词")
 
 
 class VoiceLabPage(QWidget):
@@ -1655,7 +2067,8 @@ class InstrumentExperiencePage(QWidget):
         ql = QHBoxLayout(quick)
         self.instrument_buttons = {}
         items = [
-            ("🎸 吉他手","guitar"),
+            ("🎸 木吉他手","guitar"),
+            ("🎸 电吉他手","electric_guitar"),
             ("🎸 贝斯手","bass"),
             ("🥁 鼓手","drums"),
             ("🎹 键盘手","piano"),
@@ -1670,7 +2083,8 @@ class InstrumentExperiencePage(QWidget):
         layout.addWidget(quick)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_guitar_tab(), "吉他")
+        self.tabs.addTab(self._build_guitar_tab(), "木吉他")
+        self.tabs.addTab(self._build_electric_guitar_tab(), "电吉他")
         self.tabs.addTab(self._build_bass_tab(), "贝斯")
         self.tabs.addTab(self._build_drums_tab(), "鼓")
         self.tabs.addTab(self._build_piano_tab(), "键盘")
@@ -1773,6 +2187,28 @@ class InstrumentExperiencePage(QWidget):
         l.addWidget(tips,5,0,1,2)
         return w
 
+    def _build_electric_guitar_tab(self):
+        w=QWidget()
+        l=QGridLayout(w)
+        self.electric_difficulty=self._common_difficulty()
+        self.electric_tuning=QComboBox()
+        self.electric_tuning.addItems(["标准 EADGBE","Drop D","降半音 Eb","Drop C"])
+        self.electric_role=QComboBox()
+        self.electric_role.addItems(["自动识别","节奏吉他","主音吉他","Power Chord","清音铺底","Solo"])
+        self.electric_tone=QComboBox()
+        self.electric_tone.addItems(["跟随原曲","Clean","Crunch","Overdrive","High Gain"])
+        self.electric_density=QSlider(Qt.Horizontal)
+        self.electric_density.setRange(1,10); self.electric_density.setValue(5)
+        l.addWidget(QLabel("演奏难度"),0,0); l.addWidget(self.electric_difficulty,0,1)
+        l.addWidget(QLabel("调弦"),1,0); l.addWidget(self.electric_tuning,1,1)
+        l.addWidget(QLabel("演奏角色"),2,0); l.addWidget(self.electric_role,2,1)
+        l.addWidget(QLabel("音色建议"),3,0); l.addWidget(self.electric_tone,3,1)
+        l.addWidget(QLabel("演奏密度"),4,0); l.addWidget(self.electric_density,4,1)
+        tips=QLabel("六轨模型先分离综合吉他轨，再通过二次频谱识别生成独立木吉他与电吉他轨；排练时选择电吉他手会自动关闭电吉他原轨。")
+        tips.setWordWrap(True); tips.setObjectName("SectionHint")
+        l.addWidget(tips,5,0,1,2)
+        return w
+
     def _build_drums_tab(self):
         w=QWidget()
         l=QGridLayout(w)
@@ -1818,13 +2254,13 @@ class InstrumentExperiencePage(QWidget):
         return w
 
     def select_instrument(self,key):
-        index={"guitar":0,"bass":1,"drums":2,"piano":3}.get(key,0)
+        index={"guitar":0,"electric_guitar":1,"bass":2,"drums":3,"piano":4}.get(key,0)
         self.tabs.setCurrentIndex(index)
         for k,b in self.instrument_buttons.items():
             b.setChecked(k==key)
         self.main.apply_live_preset(key)
         if hasattr(self.main,"score_performance"):
-            mapping={"guitar":"吉他 TAB","bass":"贝斯谱","drums":"鼓谱","piano":"键盘谱"}
+            mapping={"guitar":"六线谱","electric_guitar":"六线谱","bass":"贝斯谱","drums":"鼓谱","piano":"键盘谱"}
             idx=self.main.score_performance.score_type.findText(mapping[key])
             if idx>=0:
                 self.main.score_performance.score_type.setCurrentIndex(idx)
@@ -1890,7 +2326,7 @@ class InstrumentExperiencePage(QWidget):
         self.main.score_performance.refresh_score()
 
     def _profile_data(self):
-        key=["guitar","bass","drums","piano"][self.tabs.currentIndex()]
+        key=["guitar","electric_guitar","bass","drums","piano"][self.tabs.currentIndex()]
         data={"instrument":key,"practice_speed":self.practice_speed.currentText()}
         if key=="guitar":
             data.update({
@@ -1899,6 +2335,14 @@ class InstrumentExperiencePage(QWidget):
                 "capo":self.guitar_capo.value(),
                 "style":self.guitar_style.currentText(),
                 "density":self.guitar_density.value()
+            })
+        elif key=="electric_guitar":
+            data.update({
+                "difficulty":self.electric_difficulty.currentText(),
+                "tuning":self.electric_tuning.currentText(),
+                "role":self.electric_role.currentText(),
+                "tone":self.electric_tone.currentText(),
+                "density":self.electric_density.value()
             })
         elif key=="bass":
             data.update({
@@ -2017,7 +2461,7 @@ class UniversalImportPage(QWidget):
 
         self.share_text=QPlainTextEdit()
         self.share_text.setPlaceholderText(
-            "粘贴音乐分享链接或整段分享文字，例如：\n"
+            "粘贴本人有权使用的公开音频直链，例如：\n"
             "歌曲：XXXX\nhttps://example.com/audio.mp3"
         )
         l.addWidget(self.share_text)
@@ -2025,7 +2469,7 @@ class UniversalImportPage(QWidget):
         bar=QHBoxLayout()
         paste=QPushButton("从剪贴板粘贴")
         parse=QPushButton("提取链接")
-        download=QPushButton("下载并导入")
+        download=QPushButton("导入授权音频")
         paste.clicked.connect(self.paste_clipboard)
         parse.clicked.connect(self.parse_share_text)
         download.clicked.connect(self.download_selected_link)
@@ -2041,8 +2485,9 @@ class UniversalImportPage(QWidget):
         l.addWidget(self.link_table)
 
         notice=QLabel(
-            "橘味儿音乐只下载普通可直接访问的媒体/文件链接。"
-            "不会绕过 DRM、会员、付费下载、登录验证或平台访问控制。"
+            "本软件目前仅供学习与研究使用，不提供歌曲下载服务。"
+            "仅可导入用户本人有权使用的本地音频或公开直链；"
+            "不会绕过 DRM、会员、付费、登录验证或平台访问控制。"
         )
         notice.setWordWrap(True)
         notice.setObjectName("SectionHint")
@@ -2114,12 +2559,18 @@ class UniversalImportPage(QWidget):
         return h.hexdigest()
 
     def _working_dir(self):
-        d=BASE_DIR/"imports"/"working"
+        if hasattr(self.main,"music_library"):
+            d=self.main.music_library.library_paths["temp"]/"working"
+        else:
+            d=BASE_DIR/"imports"/"working"
         d.mkdir(parents=True,exist_ok=True)
         return d
 
     def _original_dir(self):
-        d=BASE_DIR/"imports"/"originals"
+        if hasattr(self.main,"music_library"):
+            d=self.main.music_library.library_paths["originals"]/"本地导入"
+        else:
+            d=BASE_DIR/"imports"/"originals"
         d.mkdir(parents=True,exist_ok=True)
         return d
 
@@ -2273,12 +2724,16 @@ class UniversalImportPage(QWidget):
             )
             return
         try:
-            downloads=BASE_DIR/"imports"/"downloads"
+            downloads=(
+                self.main.music_library.library_paths["temp"]/"链接导入"
+                if hasattr(self.main,"music_library")
+                else BASE_DIR/"imports"/"downloads"
+            )
             downloads.mkdir(parents=True,exist_ok=True)
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/2.1.7"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.5"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2291,6 +2746,8 @@ class UniversalImportPage(QWidget):
                         self.link_table.setItem(self.link_table.currentRow() if self.link_table.currentRow()>=0 else 0,2,QTableWidgetItem(f"下载 {pct}%"))
                         QApplication.processEvents()
             self.add_local_files([str(dest)])
+            if hasattr(self.main,"music_library"):
+                self.main.music_library.scan_imports()
             QMessageBox.information(self,"下载完成",f"已下载并加入本地导入队列：\n{dest}")
         except Exception as e:
             QMessageBox.critical(self,"链接下载失败",str(e))
@@ -2355,8 +2812,24 @@ class MusicLibraryPage(QWidget):
     def __init__(self, main):
         super().__init__()
         self.main = main
-        self.db_path = BASE_DIR/"library"/"novria_music_library.sqlite3"
-        self.cover_dir = BASE_DIR/"library"/"covers"
+        self.remote_rows = {}
+        self.server_library_root = r"G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）"
+        # Client state must stay inside the application data directory.  The
+        # G: path belongs to the AI server and is never opened by this process.
+        client_state = BASE_DIR / "library" / "client_state"
+        client_state.mkdir(parents=True, exist_ok=True)
+        self.library_paths = {
+            "originals": BASE_DIR / "imports" / "local_test",
+            "temp": BASE_DIR / "imports" / "local_test",
+            "covers": client_state / "covers",
+            "database": client_state,
+        }
+        self.db_path = client_state / "desktop_local_test.sqlite3"
+        self.cover_dir = client_state / "covers"
+        self.cover_dir.mkdir(parents=True, exist_ok=True)
+        self.scan_roots_file = client_state / "legacy_scan_roots.json"
+        self.scan_roots = []
+        self.link_worker = None
         self.batch_queue = []
         self.batch_index = -1
         self.batch_worker = None
@@ -2388,25 +2861,85 @@ class MusicLibraryPage(QWidget):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        hint=QLabel("已导入素材按“歌手 → 专辑 → 歌曲”整理，并保存 BPM、调性、封面、音质与六轨状态。")
+        hint=QLabel(
+            f"服务器歌曲目录：{self.server_library_root}。只通过服务器 API 读取，不扫描客户端 G 盘；"
+            "基础模型保持六轨，吉他轨完成后再二次识别木吉他与电吉他。"
+        )
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         top=QHBoxLayout()
-        scan=QPushButton("扫描已导入音乐")
+        scan=QPushButton("扫描服务器 G 盘曲库")
+        choose_root=QPushButton("设置服务器")
+        import_local=QPushButton("导入本地音乐")
+        import_link=QPushButton("导入授权音频链接")
         analyze=QPushButton("批量 BPM / 调性分析")
-        stems=QPushButton("建立六轨队列")
+        stems=QPushButton("建立六轨+电吉他队列")
         refresh=QPushButton("刷新音乐库")
         apply_button_accent(scan,"primary")
         scan.clicked.connect(self.scan_imports)
+        choose_root.clicked.connect(self.open_server_settings)
+        import_local.clicked.connect(self.import_local_music)
+        import_link.clicked.connect(self.import_share_link)
         analyze.clicked.connect(self.batch_analyze)
         stems.clicked.connect(self.enqueue_stems)
         refresh.clicked.connect(self.refresh_library)
-        for b in [scan,analyze,stems,refresh]:
+        for b in [scan,choose_root,import_local,import_link,analyze,stems,refresh]:
             top.addWidget(b)
         top.addStretch(1)
         layout.addLayout(top)
+
+        search_row=QHBoxLayout()
+        self.library_search=QLineEdit()
+        self.library_search.setPlaceholderText("搜索歌曲、歌手或专辑")
+        self.library_category=QComboBox()
+        self.library_category.addItems(["全部","本地导入","临时歌曲库","抖音流行","酷狗排行榜"])
+        search_button=QPushButton("🔍 搜索")
+        clear_button=QPushButton("清空")
+        apply_button_accent(search_button,"primary")
+        self.library_search.returnPressed.connect(self.refresh_library)
+        self.library_category.currentTextChanged.connect(self.refresh_library)
+        search_button.clicked.connect(self.refresh_library)
+        clear_button.clicked.connect(lambda: (self.library_search.clear(), self.refresh_library()))
+        search_row.addWidget(self.library_search,1)
+        search_row.addWidget(self.library_category)
+        search_row.addWidget(search_button)
+        search_row.addWidget(clear_button)
+        layout.addLayout(search_row)
+
+        self.library_scan_status=QLabel("服务器曲库：等待连接")
+        self.library_scan_status.setObjectName("SectionHint")
+        self.library_scan_status.setWordWrap(True)
+        layout.addWidget(self.library_scan_status)
+
+        library_box=QGroupBox("服务器 G 盘歌手歌曲库（展开歌手即可查看全部歌曲）")
+        library_layout=QHBoxLayout(library_box)
+        self.tree=QTreeWidget()
+        self.tree.setHeaderLabels(["歌手分类 / 歌曲","数量 · 分类 · 专辑 · 音质"])
+        self.tree.setMinimumHeight(330)
+        self.tree.itemSelectionChanged.connect(self.show_selected)
+        self.tree.itemDoubleClicked.connect(lambda item,col: self.load_selected_to_workspace())
+        library_layout.addWidget(self.tree,2)
+
+        right=QVBoxLayout()
+        self.cover=QLabel("无封面")
+        self.cover.setFixedSize(180,180)
+        self.cover.setAlignment(Qt.AlignCenter)
+        self.cover.setStyleSheet("border:1px solid #293957;border-radius:12px;background:#0c1424;")
+        right.addWidget(self.cover)
+
+        self.detail=QLabel("请选择歌曲")
+        self.detail.setWordWrap(True)
+        right.addWidget(self.detail)
+
+        self.task_table=QTableWidget(0,6)
+        self.task_table.setHorizontalHeaderLabels(["序号","歌曲","设备","状态","进度","失败原因"])
+        self.task_table.horizontalHeader().setStretchLastSection(True)
+        right.addWidget(QLabel("批量任务"))
+        right.addWidget(self.task_table,1)
+        library_layout.addLayout(right,1)
+        layout.addWidget(library_box,2)
 
         batch_box=QGroupBox("批量 AI 处理器")
         bgl=QGridLayout(batch_box)
@@ -2456,11 +2989,11 @@ class MusicLibraryPage(QWidget):
         pgl=QGridLayout(pipeline_box)
 
         self.pipeline_executor=QComboBox()
-        self.pipeline_executor.addItems(["本地执行器","云端执行器（接口预留）"])
+        self.pipeline_executor.addItems(["服务器执行器（推荐）","本地测试执行器"])
         self.pipeline_output=QComboBox()
         self.pipeline_output.addItems(["WAV","WAV + MP3"])
 
-        self.pipe_stems=QCheckBox("六轨")
+        self.pipe_stems=QCheckBox("六轨+电吉他")
         self.pipe_analysis=QCheckBox("BPM/调性")
         self.pipe_chords=QCheckBox("和弦/段落")
         self.pipe_score=QCheckBox("乐谱")
@@ -2485,7 +3018,7 @@ class MusicLibraryPage(QWidget):
 
         self.pipeline_table=QTableWidget(0,10)
         self.pipeline_table.setHorizontalHeaderLabels(
-            ["优先级","歌曲","六轨","分析","和弦","乐谱","改编","渲染","入库","状态"]
+            ["优先级","歌曲","六轨+电吉他","分析","和弦","乐谱","改编","渲染","入库","状态"]
         )
         self.pipeline_table.horizontalHeader().setStretchLastSection(True)
 
@@ -2566,47 +3099,139 @@ class MusicLibraryPage(QWidget):
 
         layout.addWidget(scheduler_box)
 
-        body=QHBoxLayout()
-        self.tree=QTreeWidget()
-        self.tree.setHeaderLabels(["音乐库","信息"])
-        self.tree.itemSelectionChanged.connect(self.show_selected)
-        self.tree.itemDoubleClicked.connect(lambda item,col: self.load_selected_to_workspace())
-        body.addWidget(self.tree,1)
-
-        right=QVBoxLayout()
-        self.cover=QLabel("无封面")
-        self.cover.setFixedSize(220,220)
-        self.cover.setAlignment(Qt.AlignCenter)
-        self.cover.setStyleSheet("border:1px solid #293957;border-radius:12px;background:#0c1424;")
-        right.addWidget(self.cover)
-
-        self.detail=QLabel("请选择歌曲")
-        self.detail.setWordWrap(True)
-        right.addWidget(self.detail)
-
-        self.task_table=QTableWidget(0,6)
-        self.task_table.setHorizontalHeaderLabels(["序号","歌曲","设备","状态","进度","失败原因"])
-        self.task_table.horizontalHeader().setStretchLastSection(True)
-        right.addWidget(QLabel("批量任务"))
-        right.addWidget(self.task_table,1)
-        body.addLayout(right,1)
-        layout.addLayout(body,1)
-
         self.progress=QProgressBar()
         self.progress.setRange(0,100)
         self.progress.setValue(0)
         layout.addWidget(self.progress)
 
-        self.refresh_library()
+        self.library_scan_status.setText("服务器曲库：程序启动后自动连接…")
+        QTimer.singleShot(800, self.refresh_library)
         self._load_batch_queue()
         self.refresh_task_table()
         self._load_pipeline_jobs()
         self.refresh_pipeline_table()
 
+    def _server_client(self, timeout=30):
+        config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
+        settings = getattr(self.main, "settings_page", None)
+        if settings is not None:
+            config["server"] = settings.server_edit.text().strip().rstrip("/") or config["server"]
+            config["token"] = settings.server_token_edit.text().strip()
+        return ServerLibraryClient(config["server"], config["token"], timeout=timeout)
+
+    def open_server_settings(self):
+        if hasattr(self.main, "nav"):
+            self.main.nav.setCurrentRow(12)
+        self.main.statusBar().showMessage("请配置服务器 API 地址；此页面不会扫描客户端 G 盘")
+
+    def _load_scan_roots(self):
+        defaults=[self.library_paths["originals"],self.library_paths["temp"]/"链接导入"]
+        try:
+            rows=json.loads(self.scan_roots_file.read_text(encoding="utf-8"))
+            saved=[Path(row) for row in rows if str(row).strip()]
+        except Exception:
+            saved=[]
+        result=[]
+        legacy_temp=normalized_path(self.library_paths["temp"])
+        for path in [*defaults,*saved]:
+            if normalized_path(path)==legacy_temp:
+                continue
+            key=normalized_path(path)
+            if key not in {normalized_path(item) for item in result}:
+                result.append(Path(path))
+        return result
+
+    def _save_scan_roots(self):
+        atomic_write_json(self.scan_roots_file,[str(path) for path in self.scan_roots])
+
+    def choose_scan_folder(self):
+        selected=QFileDialog.getExistingDirectory(
+            self,"选择包含歌手分类的音乐目录",str(self.library_paths["originals"])
+        )
+        if not selected:
+            return
+        path=Path(selected)
+        if normalized_path(path) not in {normalized_path(item) for item in self.scan_roots}:
+            self.scan_roots.append(path)
+            self._save_scan_roots()
+        self.library_scan_status.setText("扫描目录："+"；".join(str(item) for item in self.scan_roots))
+        self.scan_imports()
+
+    def import_local_music(self):
+        files,_=QFileDialog.getOpenFileNames(
+            self,"导入本地音乐","",
+            "音频文件 (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aiff *.aif *.alac)"
+        )
+        if not files:
+            return
+        # A local import is a one-song test input only.  Never copy it to a
+        # client G: path or mix it into the server-owned catalog.
+        target=BASE_DIR/"imports"/"local_test"
+        target.mkdir(parents=True,exist_ok=True)
+        copied=0
+        imported_paths=[]
+        for raw in files:
+            source=Path(raw)
+            destination=target/source.name
+            if destination.exists() and source.resolve()!=destination.resolve():
+                destination=target/f"{safe_file_stem(source.stem)}_{int(time.time()*1000)}{source.suffix}"
+            if source.resolve()!=destination.resolve():
+                shutil.copy2(source,destination)
+            copied+=1
+            imported_paths.append(destination)
+        first = imported_paths[0]
+        if first.exists():
+            self.main.load_imported_working_file(first)
+            self.main.selected_library_source = "local_test"
+        self.library_scan_status.setText(
+            f"本地测试导入完成：{copied} 首 · 未加入服务器 G 盘曲库"
+        )
+        QMessageBox.information(
+            self, "本地测试音乐",
+            "本地歌曲只作为当前电脑的单曲测试输入，不会加入或替代服务器 G 盘曲库。",
+        )
+
+    def import_share_link(self):
+        value,ok=QInputDialog.getMultiLineText(
+            self,"导入授权音频链接",
+            "本软件目前仅供学习与研究使用，不提供歌曲下载服务。\n仅粘贴本人有权使用的公开音频直链。",
+            QApplication.clipboard().text().strip(),
+        )
+        if not ok or not value.strip():
+            return
+        match=re.search(r"https?://[^\s<>\"']+",value)
+        if not match:
+            QMessageBox.warning(self,"分享链接","没有识别到 http/https 链接。")
+            return
+        url=match.group(0).rstrip("，。；;）)]}")
+        self.progress.setValue(10)
+        try:
+            result = self._server_client(timeout=90).import_link(url)
+            self.progress.setValue(100)
+            self.refresh_library()
+            QMessageBox.information(
+                self, "服务器临时曲库",
+                f"已由服务器导入：{result.get('file_name', '音频')}",
+            )
+        except Exception as exc:
+            self.progress.setValue(0)
+            QMessageBox.critical(self, "链接导入失败", str(exc))
+
+    def _link_progress(self,value,text):
+        self.progress.setValue(max(0,min(100,int(value))))
+        self.library_scan_status.setText(text)
+
+    def _link_done(self,path):
+        self.library_scan_status.setText(f"分享歌曲已下载到临时歌曲库：{path}")
+        self.scan_imports()
+
+    def _link_failed(self,error):
+        self.progress.setValue(0)
+        self.library_scan_status.setText("分享链接导入失败")
+        QMessageBox.critical(self,"分享链接导入失败",str(error))
+
     def _db(self):
-        con=sqlite3.connect(self.db_path)
-        con.row_factory=sqlite3.Row
-        return con
+        return connect_catalog(self.db_path)
 
     def _ensure_db(self):
         self.db_path.parent.mkdir(parents=True,exist_ok=True)
@@ -2757,6 +3382,37 @@ class MusicLibraryPage(QWidget):
         return h.hexdigest()
 
     def scan_imports(self):
+        self.progress.setValue(2)
+        QApplication.processEvents()
+        self.library_scan_status.setText("正在请求 AI 服务器扫描服务器 G 盘…")
+        try:
+            result = self._server_client(timeout=300).scan()
+            self.server_library_root = str(result.get("root") or self.server_library_root)
+            self.progress.setValue(100)
+            self.refresh_library()
+            self.library_scan_status.setText(
+                f"服务器扫描完成：{self.server_library_root} · "
+                f"发现 {result.get('total', 0)} 首，新增 {result.get('added', 0)}、"
+                f"更新 {result.get('updated', 0)}、已有 {result.get('skipped', 0)}、"
+                f"失败 {result.get('failed', 0)}。"
+            )
+            QMessageBox.information(
+                self, "服务器 G 盘曲库扫描完成",
+                f"扫描位置（服务器）：\n{self.server_library_root}\n\n"
+                f"发现 {result.get('total', 0)} 个完整音频文件。\n"
+                "本次未读取、未扫描客户端 G 盘。",
+            )
+        except Exception as exc:
+            self.progress.setValue(0)
+            self.remote_rows.clear()
+            self.tree.clear()
+            self.library_scan_status.setText(f"服务器 G 盘扫描失败：{exc}")
+            QMessageBox.critical(
+                self, "服务器 G 盘曲库不可用",
+                f"{exc}\n\n请在‘设置’检查 AI 服务器地址。\n"
+                "为避免混入客户端歌曲，软件不会回退扫描客户端 G 盘。",
+            )
+        return
         candidates=[]
         fpfile=BASE_DIR/"imports"/"fingerprints.json"
         if fpfile.exists():
@@ -2841,38 +3497,78 @@ class MusicLibraryPage(QWidget):
         self.refresh_library()
         QMessageBox.information(self,"音乐库",f"扫描完成，共处理 {added} 首音乐。")
 
-    def refresh_library(self):
-        self.tree.clear()
+    def _prune_stale_jobs(self):
+        active_workers=(
+            getattr(self,"batch_worker",None),
+            getattr(self,"pipeline_batch_worker",None),
+            getattr(self,"pipeline_stage_worker",None),
+        )
+        if any(worker and worker.isRunning() for worker in active_workers):
+            return
         con=self._db()
-        rows=con.execute("SELECT * FROM tracks ORDER BY artist,album,title").fetchall()
+        valid_ids={int(row["id"]) for row in con.execute("SELECT id FROM tracks").fetchall()}
         con.close()
+        old_batch=len(self.batch_queue)
+        old_pipeline=len(self.pipeline_jobs)
+        self.batch_queue=[
+            item for item in self.batch_queue
+            if item.get("remote") or int(item.get("id",-1)) in valid_ids
+        ]
+        self.pipeline_jobs=[item for item in self.pipeline_jobs if int(item.get("track_id",-1)) in valid_ids]
+        if len(self.batch_queue)!=old_batch:
+            self._save_batch_queue()
+            self.refresh_task_table()
+        if len(self.pipeline_jobs)!=old_pipeline:
+            self._save_pipeline_jobs()
+            self.refresh_pipeline_table()
+
+    def refresh_library(self):
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        query=self.library_search.text() if hasattr(self,"library_search") else ""
+        category=self.library_category.currentText() if hasattr(self,"library_category") else "全部"
+        try:
+            result = self._server_client(timeout=30).songs(query, category)
+            if result.get("source_scope") != "server":
+                raise ServerLibraryError("服务器未返回 server 曲库标识")
+            self.server_library_root = str(result.get("server_library_root") or self.server_library_root)
+            rows = [dict(row) for row in result.get("songs", [])]
+            self.remote_rows = {int(row["id"]): row for row in rows}
+        except Exception as exc:
+            rows = []
+            self.remote_rows = {}
+            self.library_scan_status.setText(
+                f"服务器曲库读取失败：{exc} · 已禁止回退扫描客户端 G 盘"
+            )
         artists={}
         for row in rows:
-            artist=row["artist"] or "未知歌手"
-            album=row["album"] or "未分类专辑"
+            artist=str(row.get("artist") or "未知歌手")
             if artist not in artists:
                 ai=QTreeWidgetItem([artist,""])
                 ai.setData(0,Qt.UserRole,("artist",artist))
                 self.tree.addTopLevelItem(ai)
-                artists[artist]=(ai,{})
-            ai,albums=artists[artist]
-            if album not in albums:
-                alb=QTreeWidgetItem([album,""])
-                alb.setData(0,Qt.UserRole,("album",artist,album))
-                ai.addChild(alb)
-                albums[album]=alb
+                artists[artist]=ai
+            ai=artists[artist]
+            duration=float(row.get("duration") or 0)
             ti=QTreeWidgetItem([
-                row["title"] or Path(row["working_path"]).stem,
-                f'{row["duration"]:.0f}s · {row["quality"]}'
+                str(row.get("title") or "未命名歌曲"),
+                f'{row.get("category") or "服务器曲库"} · '
+                f'{row.get("album") or "未分类专辑"} · {duration:.0f}s · '
+                f'{row.get("quality") or "待检测"}'
             ])
             ti.setData(0,Qt.UserRole,("track",int(row["id"])))
-            albums[album].addChild(ti)
+            ai.addChild(ti)
 
-        for artist,(ai,albums) in artists.items():
-            count=sum(alb.childCount() for alb in albums.values())
-            ai.setText(1,f"{count} 首")
-            for alb in albums.values():
-                alb.setText(1,f"{alb.childCount()} 首")
+        for index,(artist,ai) in enumerate(artists.items()):
+            ai.setText(1,f"{ai.childCount()} 首")
+            if index < 30:
+                ai.setExpanded(True)
+        if rows:
+            self.library_scan_status.setText(
+                f"当前显示 {len(artists)} 位歌手、{len(rows)} 首服务器歌曲 · "
+                f"服务器目录：{self.server_library_root} · 未扫描客户端 G 盘"
+            )
+        self.tree.setUpdatesEnabled(True)
 
     def _selected_track_id(self):
         items=self.tree.selectedItems()
@@ -2887,89 +3583,71 @@ class MusicLibraryPage(QWidget):
         tid=self._selected_track_id()
         if not tid:
             return
-        con=self._db()
-        row=con.execute("SELECT * FROM tracks WHERE id=?",(tid,)).fetchone()
-        con.close()
+        row=self.remote_rows.get(tid)
         if not row:
             return
 
-        dur=self.main._format_time(row["duration"])
-        br=f'{row["bitrate"]/1000:.0f} kbps' if row["bitrate"] else "-"
-        sr=f'{row["samplerate"]/1000:.1f} kHz' if row["samplerate"] else "-"
+        dur=self.main._format_time(float(row.get("duration") or 0))
+        bitrate=float(row.get("bitrate") or 0)
+        samplerate=float(row.get("samplerate") or 0)
+        br=f'{bitrate/1000:.0f} kbps' if bitrate else "-"
+        sr=f'{samplerate/1000:.1f} kHz' if samplerate else "-"
         self.detail.setText(
-            f'歌曲：{row["title"]}\n歌手：{row["artist"]}\n专辑：{row["album"]}\n'
-            f'时长：{dur}\n格式：{row["format"]}\n码率：{br}\n采样率：{sr}\n'
-            f'声道：{row["channels"] or "-"}\n音质：{row["quality"]}\n'
-            f'BPM：{row["bpm"] if row["bpm"] is not None else "未分析"}\n'
-            f'调性：{row["musical_key"] or "未分析"}\n六轨：{row["stems_status"]}'
+            f'来源：服务器 G 盘\n歌曲：{row.get("title", "")}\n'
+            f'歌手：{row.get("artist", "未知歌手")}\n专辑：{row.get("album") or "未分类专辑"}\n'
+            f'时长：{dur}\n格式：{row.get("format") or "-"}\n码率：{br}\n采样率：{sr}\n'
+            f'声道：{row.get("channels") or "-"}\n音质：{row.get("quality") or "待检测"}\n'
+            f'BPM：{row.get("bpm") if row.get("bpm") is not None else "未分析"}\n'
+            f'调性：{row.get("musical_key") or "未分析"}\n'
+            f'六轨：{row.get("stems_status") or "未分轨"}'
         )
-        cp=row["cover_path"]
-        if cp and Path(cp).exists():
-            pix=QPixmap(cp)
-            self.cover.setPixmap(pix.scaled(210,210,Qt.KeepAspectRatio,Qt.SmoothTransformation))
-        else:
-            self.cover.setPixmap(QPixmap())
-            self.cover.setText("无封面")
+        self.cover.setPixmap(QPixmap())
+        self.cover.setText("服务器曲库")
 
     def batch_analyze(self):
-        con=self._db()
-        rows=con.execute("SELECT id,working_path,title FROM tracks WHERE analysis_status<>'完成' OR analysis_status IS NULL").fetchall()
-        total=max(1,len(rows))
-        done=0
-        for i,row in enumerate(rows):
-            self.progress.setValue(int(i/total*95))
-            QApplication.processEvents()
-            try:
-                import librosa
-                y,sr=librosa.load(row["working_path"],sr=22050,mono=True,duration=240)
-                tempo,_=librosa.beat.beat_track(y=y,sr=sr)
-                bpm=float(np.asarray(tempo).reshape(-1)[0])
-                chroma=librosa.feature.chroma_cqt(y=y,sr=sr)
-                names=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-                key=names[int(np.argmax(np.mean(chroma,axis=1)))]
-                con.execute(
-                    "UPDATE tracks SET bpm=?,musical_key=?,analysis_status='完成' WHERE id=?",
-                    (round(bpm,1),key,row["id"])
-                )
-                done+=1
-            except Exception as e:
-                con.execute(
-                    "UPDATE tracks SET analysis_status=? WHERE id=?",
-                    (f"失败:{str(e)[:80]}",row["id"])
-                )
-        con.commit()
-        con.close()
-        self.progress.setValue(100)
-        self.refresh_library()
-        QMessageBox.information(self,"批量分析",f"完成 {done} 首歌曲的 BPM/调性分析。")
+        if not self.remote_rows:
+            self.refresh_library()
+        if not self.remote_rows:
+            QMessageBox.information(self, "批量分析", "服务器曲库中没有可处理歌曲。")
+            return
+        self.enqueue_stems(show_message=False)
+        QMessageBox.information(
+            self, "服务器批量分析",
+            "已按服务器 G 盘曲库建立任务。服务器流水线会依次完成分轨、BPM/调性、和弦、歌词时间轴和谱面。",
+        )
+        self.start_batch_processing()
 
-    def enqueue_stems(self):
-        con=self._db()
-        rows=con.execute(
-            "SELECT id,title,working_path,stems_status FROM tracks "
-            "WHERE stems_status<>'完成' OR stems_status IS NULL ORDER BY artist,album,title"
-        ).fetchall()
+    def enqueue_stems(self, show_message=True):
+        rows=sorted(
+            self.remote_rows.values(),
+            key=lambda row: (str(row.get("artist") or ""), str(row.get("album") or ""), str(row.get("title") or "")),
+        )
         self.batch_queue=[]
         for row in rows:
+            artist = str(row.get("artist") or "未知歌手")
+            title = str(row.get("title") or f"服务器歌曲 {row.get('id')}")
             self.batch_queue.append({
                 "id":int(row["id"]),
-                "title":row["title"],
-                "path":row["working_path"],
+                "library_id":int(row["id"]),
+                "remote":True,
+                "title":f"{artist} - {title}",
+                "path":"",
                 "status":"待处理",
                 "progress":0,
                 "attempts":0,
                 "error":"",
                 "stem_dir":""
             })
-            con.execute("UPDATE tracks SET stems_status='已排队' WHERE id=?",(row["id"],))
-        con.commit()
-        con.close()
         self._save_batch_queue()
         self.refresh_task_table()
         self.total_progress.setValue(0)
         self.current_progress.setValue(0)
         self.batch_status.setText(f"批处理：已排队 {len(self.batch_queue)} 首")
-        QMessageBox.information(self,"六轨队列",f"已建立 {len(self.batch_queue)} 首歌曲的六轨任务队列。")
+        if show_message:
+            QMessageBox.information(
+                self,"服务器处理队列",
+                f"已从服务器 G 盘曲库建立 {len(self.batch_queue)} 首歌曲的处理任务。",
+            )
 
     def _batch_queue_file(self):
         return BASE_DIR/"library"/"stem_queue.json"
@@ -3102,7 +3780,7 @@ class MusicLibraryPage(QWidget):
         item=self.batch_queue[idx]
         item["status"]="处理中"
         item["attempts"]=int(item.get("attempts",0))+1
-        item["device"]=self._device_for_batch().upper()
+        item["device"]="SERVER" if item.get("remote") else self._device_for_batch().upper()
         item["progress"]=0
         item["error"]=""
         self.current_progress.setValue(0)
@@ -3112,7 +3790,19 @@ class MusicLibraryPage(QWidget):
         self.refresh_task_table()
         self._save_batch_queue()
 
-        # Use the stable single-song worker already proven by the main six-track page.
+        if item.get("remote"):
+            self.batch_worker=RemoteLibraryJobWorker(
+                self._server_client(timeout=60), item.get("library_id", item["id"]), self,
+            )
+            active_worker=self.batch_worker
+            self.batch_worker.progress.connect(self._on_batch_song_progress)
+            self.batch_worker.done.connect(self._on_remote_batch_done)
+            self.batch_worker.failed.connect(self._on_batch_song_failed)
+            self.batch_worker.finished.connect(lambda w=active_worker:self._release_batch_worker(w))
+            self.batch_worker.start()
+            return
+
+        # Local test imports can still use the single-song worker explicitly.
         self.batch_worker=SeparationWorker(item["path"])
         active_worker=self.batch_worker
         self.batch_worker.model_progress.connect(self._on_batch_model_progress)
@@ -3158,12 +3848,13 @@ class MusicLibraryPage(QWidget):
         item["error"]=""
         self.batch_completed+=1
 
-        con=self._db()
-        con.execute("UPDATE tracks SET stems_status='完成' WHERE id=?",(item["id"],))
-        con.commit()
-        con.close()
+        if not item.get("remote"):
+            con=self._db()
+            con.execute("UPDATE tracks SET stems_status='完成' WHERE id=?",(item["id"],))
+            con.commit()
+            con.close()
 
-        if self.after_analysis.isChecked():
+        if self.after_analysis.isChecked() and not item.get("remote"):
             self._post_analyze_track(item)
         if self.after_score.isChecked():
             item["score_status"]="待出谱"
@@ -3173,6 +3864,26 @@ class MusicLibraryPage(QWidget):
         self._update_total_progress()
         if self.batch_paused:
             self.batch_status.setText("批处理：当前歌曲完成，已暂停")
+        else:
+            QTimer.singleShot(250,self._start_next_batch_task)
+
+    def _on_remote_batch_done(self, job_id, artifacts):
+        if not (0<=self.batch_index<len(self.batch_queue)):
+            return
+        item=self.batch_queue[self.batch_index]
+        item["status"]="完成"
+        item["progress"]=100
+        item["device"]="SERVER"
+        item["server_job_id"]=str(job_id)
+        item["artifacts"]=dict(artifacts or {})
+        item["stem_dir"]=f"server://{job_id}"
+        item["error"]=""
+        self.batch_completed+=1
+        self._save_batch_queue()
+        self.refresh_task_table()
+        self._update_total_progress()
+        if self.batch_paused:
+            self.batch_status.setText("批处理：当前服务器任务完成，已暂停")
         else:
             QTimer.singleShot(250,self._start_next_batch_task)
 
@@ -3191,13 +3902,14 @@ class MusicLibraryPage(QWidget):
             item["error"]=str(error).splitlines()[0][:180]
             item["progress"]=0
             self.batch_failed+=1
-            con=self._db()
-            con.execute(
-                "UPDATE tracks SET stems_status=? WHERE id=?",
-                (f"失败:{item['error'][:80]}",item["id"])
-            )
-            con.commit()
-            con.close()
+            if not item.get("remote"):
+                con=self._db()
+                con.execute(
+                    "UPDATE tracks SET stems_status=? WHERE id=?",
+                    (f"失败:{item['error'][:80]}",item["id"])
+                )
+                con.commit()
+                con.close()
 
         self._save_batch_queue()
         self.refresh_task_table()
@@ -3435,12 +4147,17 @@ class MusicLibraryPage(QWidget):
                 self.pipeline_table.setItem(r,c,QTableWidgetItem(str(v)))
 
     def start_auto_pipeline(self):
-        if self.pipeline_executor.currentText().startswith("云端"):
-            QMessageBox.information(
-                self,"云端执行器",
-                "v2.0.0 已预留云端执行器接口，但当前 Windows 测试版尚未绑定服务器 API。\n"
-                "请先使用“本地执行器”。"
+        if self.pipeline_executor.currentText().startswith("服务器"):
+            if not self.remote_rows:
+                self.refresh_library()
+            if not self.remote_rows:
+                QMessageBox.information(self, "服务器流水线", "服务器曲库中没有可处理歌曲。")
+                return
+            self.enqueue_stems(show_message=False)
+            self.pipeline_status.setText(
+                f"服务器流水线：已提交 {len(self.batch_queue)} 首服务器 G 盘歌曲"
             )
+            self.start_batch_processing()
             return
 
         if not self.pipeline_jobs:
@@ -3895,7 +4612,16 @@ class MusicLibraryPage(QWidget):
         sf_path=str(job.get("render_soundfont","") or "")
 
         if not sf_path or not Path(sf_path).exists():
-            raise RuntimeError("未设置 SoundFont。请先在 AI 改编页面选择 SoundFont。")
+            # MIDI 编配已经是可交付成果。SoundFont 是可选的本地音色库，
+            # 未配置时跳过音频渲染，不再让整条 AI 流水线失败。
+            job["artifacts"]["render_notice"] = "未配置 SoundFont，已保留 MIDI 并跳过音频渲染"
+            con=self._db()
+            con.execute(
+                "UPDATE tracks SET render_status='已跳过（未配置 SoundFont）' WHERE id=?",
+                (job["track_id"],),
+            )
+            con.commit();con.close()
+            return
 
         fluidsynth=self.main._find_fluidsynth()
         if not fluidsynth:
@@ -3946,11 +4672,301 @@ class MusicLibraryPage(QWidget):
         tid=self._selected_track_id()
         if not tid:
             return
-        con=self._db()
-        row=con.execute("SELECT working_path FROM tracks WHERE id=?",(tid,)).fetchone()
-        con.close()
-        if row and Path(row["working_path"]).exists():
-            self.main.load_imported_working_file(row["working_path"])
+        row=self.remote_rows.get(tid)
+        if not row:
+            QMessageBox.warning(self, "服务器曲库", "请先刷新服务器曲库。")
+            return
+        self.main.load_server_library_track(tid, row)
+
+
+class WorksCenterPage(QWidget):
+    """Browse, reopen and archive saved Juweier projects."""
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        layout = QVBoxLayout(self)
+        title = QLabel("作品中心")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        hint = QLabel("集中管理已保存工程、Stem、谱面、MIDI 和导出混音。")
+        hint.setObjectName("SectionHint")
+        layout.addWidget(hint)
+        actions = QHBoxLayout()
+        refresh = QPushButton("刷新作品")
+        open_project = QPushButton("打开工程")
+        package = QPushButton("打包所选作品")
+        reveal = QPushButton("打开作品目录")
+        remove = QPushButton("移到回收站")
+        apply_button_accent(open_project, "primary")
+        refresh.clicked.connect(self.refresh)
+        open_project.clicked.connect(self.open_selected)
+        package.clicked.connect(self.package_selected)
+        reveal.clicked.connect(self.reveal_folder)
+        remove.clicked.connect(self.remove_selected)
+        for button in (refresh, open_project, package, reveal, remove): actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["作品", "源歌曲", "分轨", "版本", "修改时间", "工程文件"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.doubleClicked.connect(self.open_selected)
+        layout.addWidget(self.table, 1)
+        self.status = QLabel("")
+        self.status.setObjectName("SectionHint")
+        layout.addWidget(self.status)
+        self.refresh()
+
+    def _projects(self):
+        rows = []
+        for path in sorted(PROJECTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            rows.append((path, data))
+        return rows
+
+    def refresh(self):
+        rows = self._projects()
+        self.table.setRowCount(len(rows))
+        for row, (path, data) in enumerate(rows):
+            source = str(data.get("source_song") or "")
+            stem_dir = str(data.get("stem_dir") or "")
+            values = [path.stem.replace(".novria", ""), Path(source).name if source else "-",
+                      "已生成" if stem_dir and Path(stem_dir).is_dir() else "未生成",
+                      str(data.get("version") or "-"),
+                      time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)), str(path)]
+            for col, value in enumerate(values): self.table.setItem(row, col, QTableWidgetItem(value))
+        self.status.setText(f"共 {len(rows)} 个工程，目录：{PROJECTS_DIR}")
+
+    def _selected_path(self):
+        row = self.table.currentRow()
+        if row < 0: return None
+        item = self.table.item(row, 5)
+        return Path(item.text()) if item else None
+
+    def open_selected(self):
+        path = self._selected_path()
+        if not path: return
+        self.main.load_project_file(path)
+
+    def package_selected(self):
+        project = self._selected_path()
+        if not project: return
+        target, _ = QFileDialog.getSaveFileName(self, "打包作品", str(EXPORTS_DIR / f"{project.stem}.zip"), "ZIP (*.zip)")
+        if not target: return
+        data = json.loads(project.read_text(encoding="utf-8"))
+        candidates = [project, Path(str(data.get("source_song") or ""))]
+        stem_dir = Path(str(data.get("stem_dir") or ""))
+        if stem_dir.is_dir(): candidates.extend(p for p in stem_dir.rglob("*") if p.is_file())
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+            seen = set()
+            for path in candidates:
+                if path.is_file() and str(path.resolve()) not in seen:
+                    seen.add(str(path.resolve()))
+                    archive.write(path, f"{path.parent.name}/{path.name}")
+        QMessageBox.information(self, "作品打包", f"已生成：\n{target}")
+
+    def reveal_folder(self):
+        try: os.startfile(str(PROJECTS_DIR))
+        except Exception: webbrowser.open(PROJECTS_DIR.as_uri())
+
+    def remove_selected(self):
+        path = self._selected_path()
+        if not path: return
+        if QMessageBox.question(self, "移除工程", f"确定移除工程？\n{path.name}") != QMessageBox.Yes: return
+        trash = PROJECTS_DIR / ".trash"
+        trash.mkdir(exist_ok=True)
+        destination = trash / f"{int(time.time())}_{path.name}"
+        shutil.move(str(path), str(destination))
+        self.refresh()
+
+
+class CommunityPage(QWidget):
+    """Desktop account and beta community client backed by mobile_api.py."""
+
+    CONFIG_FILE = BASE_DIR / "config" / "community.json"
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.token = ""
+        self.username = ""
+        self.nickname = ""
+
+        root = QVBoxLayout(self)
+        title = QLabel("账号 / 内测群聊")
+        title.setObjectName("PageTitle")
+        root.addWidget(title)
+        hint = QLabel("Windows、Android 与 iOS 使用同一账号和群聊；服务器可填写电脑局域网地址或 Cloudflare HTTPS 域名。")
+        hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        account_box = QGroupBox("橘味儿账号")
+        form = QGridLayout(account_box)
+        self.server_edit = QLineEdit("http://192.168.1.100:8000")
+        self.server_edit.setPlaceholderText("例如 http://电脑IP:8000 或 https://api.example.com")
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("账号（至少 3 位）")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setPlaceholderText("密码（至少 6 位）")
+        self.nickname_edit = QLineEdit()
+        self.nickname_edit.setPlaceholderText("昵称（注册时可选）")
+        login_btn = QPushButton("登录")
+        register_btn = QPushButton("注册")
+        apply_button_accent(login_btn, "primary")
+        login_btn.clicked.connect(lambda: self.authenticate(False))
+        register_btn.clicked.connect(lambda: self.authenticate(True))
+        self.logout_btn = QPushButton("退出登录")
+        self.logout_btn.clicked.connect(self.logout)
+        self.account_status = QLabel("未登录")
+        self.account_status.setObjectName("SectionHint")
+        form.addWidget(QLabel("AI 服务器"), 0, 0)
+        form.addWidget(self.server_edit, 0, 1, 1, 4)
+        form.addWidget(QLabel("账号"), 1, 0)
+        form.addWidget(self.user_edit, 1, 1)
+        form.addWidget(QLabel("密码"), 1, 2)
+        form.addWidget(self.password_edit, 1, 3)
+        form.addWidget(QLabel("昵称"), 2, 0)
+        form.addWidget(self.nickname_edit, 2, 1)
+        form.addWidget(login_btn, 2, 2)
+        form.addWidget(register_btn, 2, 3)
+        form.addWidget(self.logout_btn, 2, 4)
+        form.addWidget(self.account_status, 3, 0, 1, 5)
+        root.addWidget(account_box)
+
+        chat_box = QGroupBox("v3.0 内测群聊")
+        chat_layout = QVBoxLayout(chat_box)
+        self.messages = QTextBrowser()
+        self.messages.setPlaceholderText("登录后可与三端内测用户交流。")
+        chat_layout.addWidget(self.messages, 1)
+        send_row = QHBoxLayout()
+        self.message_edit = QLineEdit()
+        self.message_edit.setPlaceholderText("输入消息，最多 500 字")
+        self.message_edit.returnPressed.connect(self.send_message)
+        refresh_btn = QPushButton("刷新")
+        send_btn = QPushButton("发送")
+        apply_button_accent(send_btn, "primary")
+        refresh_btn.clicked.connect(self.refresh_messages)
+        send_btn.clicked.connect(self.send_message)
+        send_row.addWidget(self.message_edit, 1)
+        send_row.addWidget(refresh_btn)
+        send_row.addWidget(send_btn)
+        chat_layout.addLayout(send_row)
+        root.addWidget(chat_box, 1)
+        self._load_config()
+
+    def _base_url(self):
+        return self.server_edit.text().strip().rstrip("/")
+
+    def _request(self, method, path, payload=None):
+        base = self._base_url()
+        if not base.startswith(("http://", "https://")):
+            raise RuntimeError("服务器地址必须以 http:// 或 https:// 开头")
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(detail) from exc
+        except Exception as exc:
+            raise RuntimeError(f"无法连接服务器：{exc}") from exc
+
+    def _load_config(self):
+        try:
+            data = json.loads(self.CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        self.server_edit.setText(str(data.get("server", self.server_edit.text())))
+        self.token = str(data.get("token", ""))
+        self.username = str(data.get("username", ""))
+        self.nickname = str(data.get("nickname", ""))
+        self.user_edit.setText(self.username)
+        self._update_status()
+        if self.token:
+            QTimer.singleShot(700, self.refresh_messages)
+
+    def _save_config(self):
+        self.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.CONFIG_FILE, {
+            "server": self._base_url(), "token": self.token,
+            "username": self.username, "nickname": self.nickname,
+        })
+
+    def _update_status(self):
+        text = f"已登录：{self.nickname or self.username}（{self.username}）" if self.token else "未登录"
+        self.account_status.setText(text)
+        self.logout_btn.setEnabled(bool(self.token))
+
+    def authenticate(self, register):
+        payload = {
+            "username": self.user_edit.text().strip(),
+            "password": self.password_edit.text(),
+            "nickname": self.nickname_edit.text().strip(),
+        }
+        try:
+            data = self._request("POST", "/api/v1/auth/register" if register else "/api/v1/auth/login", payload)
+            self.token = str(data.get("token", ""))
+            self.username = str(data.get("username", payload["username"]))
+            self.nickname = str(data.get("nickname", self.username))
+            self.password_edit.clear()
+            self._save_config()
+            self._update_status()
+            self.refresh_messages()
+        except Exception as exc:
+            QMessageBox.warning(self, "账号操作失败", str(exc))
+
+    def logout(self):
+        self.token = ""
+        self._save_config()
+        self._update_status()
+        self.messages.clear()
+
+    def refresh_messages(self):
+        if not self.token:
+            return
+        try:
+            data = self._request("GET", "/api/v1/community/messages?limit=100")
+            rows = []
+            for item in data.get("messages", []):
+                stamp = time.strftime("%m-%d %H:%M", time.localtime(float(item.get("created_at", 0))))
+                name = html.escape(str(item.get("nickname") or item.get("username") or "用户"))
+                content = html.escape(str(item.get("content", ""))).replace("\n", "<br>")
+                rows.append(f"<p><b style='color:#FF8A2A'>{name}</b> <span style='color:#A995A6'>{stamp}</span><br>{content}</p>")
+            self.messages.setHtml("".join(rows) or "<p>群里还没有消息，来发第一条吧。</p>")
+            bar = self.messages.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        except Exception as exc:
+            self.account_status.setText(f"群聊刷新失败：{exc}")
+
+    def send_message(self):
+        content = self.message_edit.text().strip()
+        if not self.token:
+            QMessageBox.information(self, "提示", "请先登录账号。")
+            return
+        if not content:
+            return
+        try:
+            self._request("POST", "/api/v1/community/messages", {"content": content[:500]})
+            self.message_edit.clear()
+            self.refresh_messages()
+        except Exception as exc:
+            QMessageBox.warning(self, "发送失败", str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -3961,7 +4977,10 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
         self.song_file = None
+        self.selected_library_track_id = None
+        self.selected_library_source = "none"
         self.stem_dir = None
+        self.base_stem_dir = None
         self.markers = []
         self.analysis_result = {}
         self.chord_timeline = []
@@ -3982,12 +5001,14 @@ class MainWindow(QMainWindow):
         self.ab_frame = 0
         self.soundfont_path = ""
         self.melody_reference = []
+        self.lyric_reference = []
         self.worker = None
         self.engine = MultiStemEngine()
         self.metronome_engine = MetronomeEngine()
         self.midi_worker = None
         self._auto_next_fired = False
         self.is_playing_ui = False
+        self._timeline_dragging = False
 
         central = QWidget()
         root = QHBoxLayout(central)
@@ -4005,8 +5026,8 @@ class MainWindow(QMainWindow):
         brand_l.setContentsMargins(14,14,14,14)
         brand_top = QHBoxLayout()
         brand_icon = QLabel()
-        pix = QPixmap(asset_path("novria_app_icon_256.png"))
-        brand_icon.setPixmap(pix.scaled(48,48,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+        pix = QPixmap(asset_path("juweier_brand_mark_v322.png"))
+        brand_icon.setPixmap(pix.scaled(58,58,Qt.KeepAspectRatio,Qt.SmoothTransformation))
         brand_text = QVBoxLayout()
         bt = QLabel(APP_NAME)
         bt.setObjectName("BrandTitle")
@@ -4028,20 +5049,34 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("统一音乐导入","import"),
             ("音乐库","projects"),
-            ("AI 六轨分离","split"),
+            ("AI 六轨+电吉他","split"),
             ("AI 改编 / 乐谱","arrange"),
             ("演出谱面","arrange"),
             ("乐手演奏中心","live"),
             ("现场演出","live"),
             ("Setlist 歌单","setlist"),
+            ("AI 歌词","voice"),
             ("AI 歌声","voice"),
             ("作品中心","projects"),
+            ("账号 / 内测群聊","projects"),
             ("设置","settings"),
         ]
         for text, ico in nav_items:
             QListWidgetItem(QIcon(icon_path(ico)), text, self.nav)
         self.nav.setCurrentRow(2)
         side.addWidget(self.nav, 1)
+
+        song_context=QGroupBox("全局 G 盘歌曲")
+        song_context_layout=QVBoxLayout(song_context)
+        self.current_song_label=QLabel("尚未选择歌曲")
+        self.current_song_label.setWordWrap(True)
+        self.current_song_label.setObjectName("BrandSub")
+        choose_library_song=QPushButton("从歌曲库选择")
+        apply_button_accent(choose_library_song,"primary")
+        choose_library_song.clicked.connect(self.open_g_drive_library)
+        song_context_layout.addWidget(self.current_song_label)
+        song_context_layout.addWidget(choose_library_song)
+        side.addWidget(song_context)
 
         footer = QLabel("让音乐创作与演出更自由")
         footer.setAlignment(Qt.AlignCenter)
@@ -4058,7 +5093,9 @@ class MainWindow(QMainWindow):
         self.live = LivePage(self)
         self.live_pro = LiveProPage(self)
         self.setlist = SetlistPage(self)
+        self.lyrics_studio = LyricsStudioPage(self)
         self.voice_lab = VoiceLabPage(self)
+        self.works_center = WorksCenterPage(self)
         self.stack.addWidget(self.universal_import)
         self.stack.addWidget(self.music_library)
         self.stack.addWidget(self.studio)
@@ -4067,11 +5104,15 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.instrument_experience)
         self.stack.addWidget(self.live_pro)
         self.stack.addWidget(self.setlist)
+        self.stack.addWidget(self.lyrics_studio)
         self.stack.addWidget(self.voice_lab)
-        self.stack.addWidget(Placeholder("作品中心：工程管理继续完善中"))
+        self.stack.addWidget(self.works_center)
+        self.community = CommunityPage(self)
+        self.stack.addWidget(self.community)
         self.settings_page = SettingsPage(self)
         self.stack.addWidget(self.settings_page)
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+        self._on_nav_changed(self.nav.currentRow())
 
         root.addWidget(sidebar)
         root.addWidget(self.stack, 1)
@@ -4094,14 +5135,74 @@ class MainWindow(QMainWindow):
             pass
 
 
-    def load_imported_working_file(self, path):
+    def _on_nav_changed(self,index):
+        self.stack.setCurrentIndex(index)
+        if index in {2,3,4,5,6,7,8,9,10} and not self.song_file:
+            self.statusBar().showMessage("请先点击左侧‘从歌曲库选择’，选择 G 盘歌曲")
+
+    def open_g_drive_library(self):
+        self.nav.setCurrentRow(1)
+        self.music_library.tree.setFocus()
+        self.statusBar().showMessage("请按歌手展开歌曲，双击歌曲后即可供左侧所有功能共同处理")
+
+    def load_library_track(self,track_id):
+        con=self.music_library._db()
+        row=con.execute("SELECT * FROM tracks WHERE id=?",(int(track_id),)).fetchone()
+        con.close()
+        if not row:
+            QMessageBox.warning(self,"歌曲库","找不到这首歌曲，请重新扫描 G 盘歌曲库。")
+            return
+        path=Path(row["working_path"] or row["source_path"] or "")
+        if not path.exists():
+            QMessageBox.warning(self,"歌曲库",f"歌曲文件不存在：\n{path}")
+            return
+        self.load_imported_working_file(path,library_track_id=int(track_id))
+        artist=catalog_artist_name(dict(row))
+        self.current_song_label.setText(f"{artist}\n{row['title']}")
+        self.statusBar().showMessage(f"当前 G 盘歌曲：{artist} - {row['title']}")
+
+    def load_server_library_track(self, track_id, row=None):
+        row = dict(row or self.music_library.remote_rows.get(int(track_id)) or {})
+        if not row:
+            QMessageBox.warning(self, "服务器曲库", "找不到这首服务器歌曲，请刷新曲库。")
+            return
+        audio_url = str(row.get("audio_url") or "")
+        if not audio_url:
+            QMessageBox.warning(self, "服务器曲库", "服务器未返回歌曲音频地址。")
+            return
+        format_name = str(row.get("format") or "mp3").lower().lstrip(".")
+        if format_name not in {"mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "aif", "alac"}:
+            format_name = "mp3"
+        artist = str(row.get("artist") or "未知歌手")
+        title = str(row.get("title") or f"服务器歌曲_{track_id}")
+        cache_dir = BASE_DIR / "library" / "server_cache"
+        cache_path = cache_dir / f"{int(track_id)}_{safe_file_stem(artist)}_{safe_file_stem(title)}.{format_name}"
+        try:
+            self.statusBar().showMessage(f"正在从服务器加载：{artist} - {title}")
+            QApplication.processEvents()
+            if not cache_path.is_file() or cache_path.stat().st_size == 0:
+                self.music_library._server_client(timeout=120).download(audio_url, cache_path)
+            self.load_imported_working_file(cache_path, library_track_id=int(track_id))
+            self.selected_library_source = "server"
+            self.current_song_label.setText(f"服务器 · {artist}\n{title}")
+            self.statusBar().showMessage(f"当前服务器 G 盘歌曲：{artist} - {title}")
+        except Exception as exc:
+            QMessageBox.critical(self, "服务器歌曲加载失败", str(exc))
+
+    def load_imported_working_file(self, path, library_track_id=None):
         p=Path(path)
         if not p.exists():
             return
         self.song_file=str(p)
+        self.selected_library_track_id=library_track_id
+        if library_track_id is None:
+            self.selected_library_source="local_test"
         self.stem_dir=None
         self.engine.close()
         self.studio.file_label.setText(p.name)
+        if hasattr(self,"current_song_label") and library_track_id is None:
+            self.current_song_label.setText(p.name)
+        self._load_song_lyrics(p)
         if hasattr(self,"arrangement"):
             self.arrangement.song_label.setText(p.name)
             self.arrangement.analysis_status.setText("已从统一导入中心载入，等待分析")
@@ -4115,6 +5216,10 @@ class MainWindow(QMainWindow):
         if not p:
             return
         self.song_file = p
+        self.selected_library_track_id = None
+        self.selected_library_source = "local_test"
+        if hasattr(self,"current_song_label"):
+            self.current_song_label.setText(Path(p).name)
         self.stem_dir = None
         self.stop_variant_preview()
         self.stop_ab_instant_preview()
@@ -4124,11 +5229,12 @@ class MainWindow(QMainWindow):
             self.midi_worker.wait(700)
         self.engine.close()
         self.studio.file_label.setText(Path(p).name)
+        self._load_song_lyrics(Path(p))
         if hasattr(self, "arrangement"):
             self.arrangement.song_label.setText(Path(p).name)
             self.arrangement.analysis_status.setText("已导入歌曲，等待和弦/乐谱分析")
         self.load_live_preset_file()
-        self.studio.log.setText("歌曲已导入。点击“AI 六轨分离”。")
+        self.studio.log.setText("歌曲已导入。点击“AI 六轨分离 + 电吉他二次分离”。")
         self.studio.model_progress.setValue(0)
         self.studio.split_progress.setValue(0)
         self.studio.model_status.setText("等待检测 AI 模型")
@@ -4146,7 +5252,7 @@ class MainWindow(QMainWindow):
         self.studio.split_progress.setRange(0, 100)
         self.studio.model_progress.setValue(0)
         self.studio.split_progress.setValue(0)
-        self.studio.log.setText("正在准备 AI 模型与六轨分离...")
+        self.studio.log.setText("正在准备 AI 六轨模型与电吉他二次分离...")
         self.worker = SeparationWorker(self.song_file)
         self.worker.log.connect(self.on_split_log)
         self.worker.model_progress.connect(self.on_model_progress)
@@ -4169,15 +5275,20 @@ class MainWindow(QMainWindow):
     def on_split_done(self, stem_dir):
         self.studio.model_progress.setValue(100)
         self.studio.split_progress.setValue(100)
-        self.studio.split_status.setText("六轨分离完成")
+        self.studio.split_status.setText("基础六轨完成 · 电吉他轨按识别结果载入")
         self.studio.btn_split.setEnabled(True)
         self.stem_dir = Path(stem_dir)
+        self.base_stem_dir = Path(stem_dir)
         try:
             self.engine.load(self.stem_dir)
             self.load_waveform_if_ready()
             self.sync_mix_controls()
-            self.studio.log.setText(f"六轨分离完成：{self.stem_dir}")
-            QMessageBox.information(self, "完成", "AI 六轨分离完成，可以真实 Mute/Solo 和现场播放。")
+            electric = self.stem_dir / "electric_guitar.wav"
+            self.studio.log.setText(
+                f"分轨完成：{self.stem_dir}\n"
+                + ("已载入独立电吉他轨。" if electric.exists() else "电吉他轨等待二次识别，未伪造空音频。")
+            )
+            QMessageBox.information(self, "完成", "AI 分轨完成，可以进行多轨 Mute/Solo 和现场播放。")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
@@ -4226,7 +5337,7 @@ class MainWindow(QMainWindow):
     def update_timeline(self):
         dur = self.engine.duration_seconds()
         pos = self.engine.position_seconds()
-        if dur > 0:
+        if dur > 0 and not self._timeline_dragging:
             self.studio.timeline.blockSignals(True)
             self.studio.timeline.setValue(int(min(1, pos/dur)*1000))
             self.studio.timeline.blockSignals(False)
@@ -4244,10 +5355,28 @@ class MainWindow(QMainWindow):
             self.is_playing_ui = False
             self.studio.play_btn.setText("播放")
 
+    def begin_timeline_seek(self):
+        self._timeline_dragging = True
+
+    def preview_timeline_seek(self, value):
+        self._timeline_dragging = True
+        dur = self.engine.duration_seconds()
+        if dur <= 0:
+            return
+        target = dur * max(0, min(1000, int(value))) / 1000.0
+        def fmt(seconds):
+            seconds = max(0, int(seconds))
+            return f"{seconds//60:02d}:{seconds%60:02d}"
+        self.studio.time_label.setText(f"{fmt(target)} / {fmt(dur)}")
+
     def seek_from_slider(self):
         if not self.engine.files:
+            self._timeline_dragging = False
             return
-        self.engine.seek_ratio(self.studio.timeline.value()/1000.0)
+        ratio = self.studio.timeline.value()/1000.0
+        self.engine.seek_ratio(ratio)
+        self.studio.waveform.set_position(ratio)
+        self._timeline_dragging = False
 
     def apply_live_preset(self, muted_key):
         for key, row in self.studio.rows.items():
@@ -4255,7 +5384,8 @@ class MainWindow(QMainWindow):
             row.mute.setChecked(key == muted_key if muted_key else False)
         self.sync_mix_controls()
         names = {
-            "guitar":"吉他弹唱（吉他轨关闭）",
+            "guitar":"木吉他演奏（木吉他轨关闭）",
+            "electric_guitar":"电吉他演奏（电吉他轨关闭）",
             "piano":"钢琴弹唱（钢琴轨关闭）",
             "drums":"鼓手演出（鼓轨关闭）",
             "bass":"贝斯演出（贝斯轨关闭）",
@@ -4263,6 +5393,15 @@ class MainWindow(QMainWindow):
             None:"全部恢复"
         }
         self.live.status.setText("当前预设：" + names[muted_key])
+
+    def apply_live_transpose(self):
+        if not hasattr(self,"live_pro"):
+            return
+        if not self.base_stem_dir and self.stem_dir:
+            self.base_stem_dir=Path(self.stem_dir)
+        if hasattr(self,"arrangement"):
+            self.arrangement.transpose.setValue(int(self.live_pro.transpose.value()))
+        self.generate_transposed_stems()
 
 
     def start_midi_worker(self):
@@ -4299,6 +5438,7 @@ class MainWindow(QMainWindow):
         self.setlist.select_index(target)
         item = self.setlist.items[target]
         self.song_file = item["path"]
+        self._load_song_lyrics(Path(self.song_file))
         self.studio.file_label.setText(Path(self.song_file).name)
 
         # 优先复用已经存在的六轨目录。
@@ -4346,6 +5486,14 @@ class MainWindow(QMainWindow):
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            song = str(data.get("song_file") or "")
+            if song and Path(song).exists():
+                self.song_file = song
+                self.selected_library_track_id = None
+                self.studio.file_label.setText(Path(song).name)
+                if hasattr(self, "current_song_label"):
+                    self.current_song_label.setText(Path(song).name)
+                self._load_song_lyrics(Path(song))
             if hasattr(self, "setlist"):
                 self.setlist.items = data.get("setlist", [])
                 self.setlist.refresh()
@@ -4402,6 +5550,7 @@ class MainWindow(QMainWindow):
             self.arrangement.analysis_status.setText("正在读取音频并检测节拍...")
             QApplication.processEvents()
             y, sr = librosa.load(self.song_file, sr=22050, mono=True)
+            self._load_song_lyrics(Path(self.song_file), float(librosa.get_duration(y=y,sr=sr)))
             tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
             tempo_val = float(np.asarray(tempo).reshape(-1)[0])
             beat_times = librosa.frames_to_time(beat_frames, sr=sr)
@@ -4487,6 +5636,11 @@ class MainWindow(QMainWindow):
                 row["section"]=sec or "段落 1"
             self.chord_timeline=rows
 
+            self.arrangement.progress.setValue(78)
+            self.arrangement.analysis_status.setText("正在生成主旋律五线谱、六线谱与歌词同步数据...")
+            QApplication.processEvents()
+            self.melody_reference=self._extract_melody_reference(y,sr)
+
             self.arrangement.chord_table.setRowCount(len(rows))
             for r,row in enumerate(rows):
                 values=[str(row["bar"]),self._format_time(row["seconds"]),"  ".join(row["chords"]),row["section"]]
@@ -4506,12 +5660,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,"乐谱分析失败",str(e))
 
     def generate_transposed_stems(self):
-        if not self.stem_dir or not Path(self.stem_dir).exists():
+        source_dir=Path(self.base_stem_dir or self.stem_dir) if (self.base_stem_dir or self.stem_dir) else None
+        if not source_dir or not source_dir.exists():
             QMessageBox.warning(self,"提示","请先完成六轨分离。")
             return
         semis=int(self.arrangement.transpose.value())
         if semis == 0:
-            QMessageBox.information(self,"提示","当前为原调，无需生成。")
+            self.stem_dir=source_dir
+            self.engine.load(source_dir)
+            self.engine.set_speed(self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0)
+            self.load_waveform_if_ready()
+            self.sync_mix_controls()
+            QMessageBox.information(self,"恢复原调",f"已恢复原调分轨：\n{source_dir}")
             return
         try:
             import librosa
@@ -4523,7 +5683,9 @@ class MainWindow(QMainWindow):
             for idx,key in enumerate(stems):
                 self.arrangement.progress.setValue(int(idx/len(stems)*90))
                 QApplication.processEvents()
-                src=Path(self.stem_dir)/f"{key}.wav"
+                src=source_dir/f"{key}.wav"
+                if not src.is_file():
+                    continue
                 data,sr=sf.read(str(src),dtype="float32",always_2d=True)
                 shifted=[]
                 for ch in range(data.shape[1]):
@@ -4533,6 +5695,7 @@ class MainWindow(QMainWindow):
             self.arrangement.progress.setValue(100)
             self.stem_dir=out_dir
             self.engine.load(out_dir)
+            self.engine.set_speed(self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0)
             self.load_waveform_if_ready()
             self.sync_mix_controls()
             QMessageBox.information(self,"升降调完成",f"已生成 {semis:+d} 半音演出版并载入：\n{out_dir}")
@@ -4545,6 +5708,38 @@ class MainWindow(QMainWindow):
         for row in self.chord_timeline:
             out.append({**row,"chords":[self._transpose_chord(c,semis) for c in row.get("chords",[])]})
         return out
+
+    def _load_song_lyrics(self,path,duration=0):
+        try:
+            self.lyric_reference=load_synced_lyrics(path,duration)
+        except Exception:
+            self.lyric_reference=[]
+
+    def _extract_melody_reference(self,y,sr):
+        import librosa
+        f0,voiced_flag,_=librosa.pyin(
+            y,fmin=librosa.note_to_hz("C2"),fmax=librosa.note_to_hz("C7"),
+            sr=sr,frame_length=2048,hop_length=512,
+        )
+        times=librosa.times_like(f0,sr=sr,hop_length=512)
+        refs=[]
+        current_midi=None
+        start_index=0
+        for index,(hz,voiced) in enumerate(zip(f0,voiced_flag)):
+            midi=int(round(float(librosa.hz_to_midi(hz)))) if voiced and hz is not None and np.isfinite(hz) else None
+            if midi!=current_midi:
+                if current_midi is not None and index>start_index:
+                    start=float(times[start_index])
+                    end=float(times[index-1]+512/sr)
+                    if end-start>=0.08:
+                        refs.append({"start":start,"end":end,"midi":current_midi,"note":librosa.midi_to_note(current_midi,octave=True,cents=False)})
+                current_midi=midi
+                start_index=index
+        if current_midi is not None and len(times)>start_index:
+            start=float(times[start_index]); end=float(times[-1]+512/sr)
+            if end-start>=0.08:
+                refs.append({"start":start,"end":end,"midi":current_midi,"note":librosa.midi_to_note(current_midi,octave=True,cents=False)})
+        return refs[:4000]
 
     def _make_score_html(self, title, instrument="lead"):
         rows=self._score_rows_transposed()
@@ -5985,23 +7180,7 @@ class MainWindow(QMainWindow):
         try:
             import librosa
             y,sr=librosa.load(self.song_file,sr=22050,mono=True)
-            f0, voiced_flag, voiced_prob = librosa.pyin(
-                y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
-            )
-            times=librosa.times_like(f0,sr=sr)
-            refs=[]
-            last_note=None
-            start=None
-            for t,hz,voiced in zip(times,f0,voiced_flag):
-                note=None
-                if voiced and hz is not None and not np.isnan(hz):
-                    midi=int(round(librosa.hz_to_midi(hz)))
-                    note=librosa.midi_to_note(midi, octave=True, cents=False)
-                if note!=last_note:
-                    if last_note is not None and start is not None:
-                        refs.append({"start":float(start),"end":float(t),"note":last_note})
-                    start=float(t) if note else None
-                    last_note=note
+            refs=self._extract_melody_reference(y,sr)
             self.melody_reference=refs
             song=Path(self.song_file).stem
             p,_=QFileDialog.getSaveFileName(
@@ -6136,6 +7315,50 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def load_project_file(self, path):
+        try:
+            path = Path(path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            source = Path(str(data.get("source_song") or ""))
+            if not source.is_file():
+                QMessageBox.warning(self, "打开工程", f"工程源音频不存在：\n{source}")
+                return
+            self.import_song(str(source))
+            self.markers = list(data.get("markers") or [])
+            self.analysis_result = dict(data.get("analysis") or {})
+            self.chord_timeline = list(data.get("chord_timeline") or [])
+            self.section_timeline = list(data.get("section_timeline") or [])
+            self.arrangement_result = dict(data.get("arrangement") or {})
+            self.melody_reference = list(data.get("melody_reference") or [])
+            self.manual_section_overrides = dict(data.get("manual_section_overrides") or {})
+            self.arrangement_variants = dict(data.get("arrangement_variants") or {"A": {}, "B": {}})
+            self.variant_audio = dict(data.get("variant_audio") or {"A": "", "B": ""})
+            self.arrangement_history = list(data.get("arrangement_history") or [])
+            stem_dir = Path(str(data.get("stem_dir") or ""))
+            if stem_dir.is_dir():
+                self.stem_dir = stem_dir
+                self.base_stem_dir = stem_dir
+                self.engine.load_folder(stem_dir)
+            for key, settings in (data.get("tracks") or {}).items():
+                if key in self.studio.rows:
+                    row = self.studio.rows[key]
+                    row.mute.setChecked(bool(settings.get("mute", False)))
+                    row.solo.setChecked(bool(settings.get("solo", False)))
+                    row.volume.setValue(int(settings.get("volume", 90)))
+            if hasattr(self, "arrangement"):
+                self.arrangement.transpose.setValue(int(data.get("score_transpose", 0)))
+                self.arrangement.soundfont_edit.setText(str(data.get("soundfont") or ""))
+            if hasattr(self, "live_pro"):
+                self.live_pro.transpose.setValue(int(data.get("live_transpose", 0)))
+                self.live_pro.speed.setValue(float(data.get("live_speed", 1.0)))
+            if hasattr(self, "setlist"): self.setlist.items = list(data.get("setlist") or [])
+            self.sync_mix_controls()
+            self.score_performance.refresh_score()
+            self.nav.setCurrentRow(3)
+            self.statusBar().showMessage(f"已打开工程：{path.name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "打开工程失败", str(exc))
+
     def save_project(self):
         if not self.song_file:
             QMessageBox.warning(self, "提示", "当前没有歌曲工程。")
@@ -6204,7 +7427,10 @@ class MainWindow(QMainWindow):
             for key, _, _ in STEM_ORDER:
                 if key not in active:
                     continue
-                data, this_sr = sf.read(str(self.stem_dir/f"{key}.wav"), dtype="float32", always_2d=True)
+                stem_path=self.stem_dir/f"{key}.wav"
+                if not stem_path.is_file():
+                    continue
+                data, this_sr = sf.read(str(stem_path), dtype="float32", always_2d=True)
                 sr = sr or this_sr
                 stems[key] = data * self.engine.volume[key]
                 max_frames = max(max_frames, len(data))
