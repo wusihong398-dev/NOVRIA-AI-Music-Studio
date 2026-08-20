@@ -1,4 +1,5 @@
 name: Package Juweier Music v3 Source
+run-name: Juweier Music v3.2.6 Source · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
@@ -6,6 +7,9 @@ on:
     branches: ["main", "agent/juweier-v3.2.6"]
     paths-ignore:
       - "**/*.md"
+      - ".github/workflows/build-mobile.yml"
+      - ".github/workflows/build-ios-testflight-package.yml"
+      - ".github/workflows/build-windows-exe.yml"
 
 permissions:
   contents: read
