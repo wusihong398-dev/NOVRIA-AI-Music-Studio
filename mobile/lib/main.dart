@@ -332,6 +332,19 @@ class AppStore extends ChangeNotifier {
     return job;
   }
 
+  Future<void> removeJob(PipelineJob job) async {
+    if (job.isRunning) return;
+    jobs.removeWhere((item) => item.id == job.id);
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> clearFinishedJobs() async {
+    jobs.removeWhere((job) => job.status == '完成' || job.status == '失败');
+    await _save();
+    notifyListeners();
+  }
+
   Future<void> testServer() async {
     if (serverBase.isEmpty) {
       serverState = '未配置';
@@ -1369,9 +1382,51 @@ class PipelinePage extends StatelessWidget {
   final AppStore store;
   static const stages = ['读取', '六轨+电吉他', '分析', '和弦', '乐谱', '改编', '渲染', '入库'];
 
+  Future<bool> _confirmDelete(
+    BuildContext context, {
+    required String title,
+    required String message,
+  }) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('删除'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
   @override
   Widget build(BuildContext context) => Column(children: [
-        const PageHeader(title: '自动生产流水线', subtitle: '失败可续跑，任务状态自动保存'),
+        PageHeader(
+          title: '自动生产流水线',
+          subtitle: '失败可续跑，任务状态自动保存',
+          action: store.jobs.any((job) => job.status == '完成' || job.status == '失败')
+              ? OutlinedButton.icon(
+                  onPressed: () => unawaited(() async {
+                    final confirmed = await _confirmDelete(
+                      context,
+                      title: '清空已结束任务？',
+                      message: '将清除所有已完成和失败的任务记录，不会删除原始歌曲或服务器曲库文件。',
+                    );
+                    if (confirmed) await store.clearFinishedJobs();
+                  }()),
+                  icon: const Icon(Icons.delete_sweep_outlined),
+                  label: const Text('清理'),
+                )
+              : null,
+        ),
         Expanded(
           child: store.jobs.isEmpty
               ? const EmptyState(icon: Icons.auto_awesome, title: '没有待处理歌曲', detail: '请先到音乐库导入歌曲。')
@@ -1402,11 +1457,28 @@ class PipelinePage extends StatelessWidget {
                           Text(job.error, style: const TextStyle(color: Colors.redAccent)),
                         ],
                         const SizedBox(height: 10),
-                        FilledButton.icon(
-                          onPressed: job.isRunning ? null : () => unawaited(job.serverJobId.isEmpty ? store.startJob(job) : store.resumeJob(job)),
-                          icon: Icon(job.serverJobId.isEmpty ? Icons.play_arrow : Icons.refresh),
-                          label: Text(job.serverJobId.isEmpty ? '开始自动流水线' : (job.isDone ? '刷新结果' : '继续任务')),
-                        ),
+                        Row(children: [
+                          Expanded(child: FilledButton.icon(
+                            onPressed: job.isRunning ? null : () => unawaited(job.serverJobId.isEmpty ? store.startJob(job) : store.resumeJob(job)),
+                            icon: Icon(job.serverJobId.isEmpty ? Icons.play_arrow : Icons.refresh),
+                            label: Text(job.serverJobId.isEmpty ? '开始自动流水线' : (job.isDone ? '刷新结果' : '继续任务')),
+                          )),
+                          if (!job.isRunning) ...[
+                            const SizedBox(width: 8),
+                            OutlinedButton.icon(
+                              onPressed: () => unawaited(() async {
+                                final confirmed = await _confirmDelete(
+                                  context,
+                                  title: '删除任务记录？',
+                                  message: '将从流水线移除“${job.fileName}”，不会删除原始歌曲或服务器曲库文件。',
+                                );
+                                if (confirmed) await store.removeJob(job);
+                              }()),
+                              icon: const Icon(Icons.delete_outline),
+                              label: const Text('删除'),
+                            ),
+                          ],
+                        ]),
                       ]),
                     ));
                   },

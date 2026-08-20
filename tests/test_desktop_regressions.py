@@ -117,6 +117,10 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('@app.post("/api/v1/library/jobs", status_code=202)', server)
         self.assertIn("if (job.status == '失败')", mobile)
         self.assertIn("job.serverJobId = '';", mobile)
+        self.assertIn('Future<void> removeJob(PipelineJob job)', mobile)
+        self.assertIn('Future<void> clearFinishedJobs()', mobile)
+        self.assertIn("label: const Text('删除')", mobile)
+        self.assertIn("label: const Text('清理')", mobile)
 
     def test_windows_catalog_is_async_lazy_and_letters_are_visible(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
