@@ -1,4 +1,5 @@
 name: Build Juweier Music iOS TestFlight Package
+run-name: Juweier Music v3.2.6 iOS TestFlight · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
