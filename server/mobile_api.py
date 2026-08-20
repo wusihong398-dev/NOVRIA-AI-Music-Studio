@@ -69,11 +69,11 @@ LIBRARY_PATHS = ensure_library_layout(default_library_root())
 LIBRARY_DB = LIBRARY_PATHS["database"] / "juweier_music_library.sqlite3"
 SERVER_LIBRARY_ROOT = Path(os.environ.get(
     "JUWEIER_SERVER_LIBRARY",
-    r"G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）",
+    r"G:\JuweierMusicLibrary\01_Originals",
 ))
 SERVER_LIBRARY_FLAC_ROOT = Path(os.environ.get(
     "JUWEIER_SERVER_LIBRARY_FLAC",
-    r"G:\JuweierMusicLibrary\008.按歌手分类",
+    r"G:\JuweierMusicLibrary\01_Originals",
 ))
 SERVER_LIBRARY_ROOTS = list(dict.fromkeys((SERVER_LIBRARY_ROOT, SERVER_LIBRARY_FLAC_ROOT)))
 AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "0").strip().lower() not in {
@@ -504,13 +504,16 @@ def _runtime_capabilities() -> dict:
         "mido": importlib.util.find_spec("mido") is not None,
     }
     ffmpeg = shutil.which("ffmpeg") is not None
-    missing = [name for name, available in modules.items() if not available]
+    required_modules = ("torch", "demucs", "librosa", "mido")
+    missing = [name for name in required_modules if not modules[name]]
     if not ffmpeg:
         missing.append("ffmpeg")
     lyrics_asr = importlib.util.find_spec("faster_whisper") is not None
     issues = []
     if missing:
         issues.append("AI 处理环境缺少：" + "、".join(missing))
+    if not modules["audio_separator"]:
+        issues.append("UVR 包装器不可用，将自动使用 Demucs htdemucs_6s 离线六轨引擎")
     if not lyrics_asr:
         issues.append("AI 歌词转写模型未安装：faster-whisper")
     return {
@@ -1046,7 +1049,15 @@ def _run_job(job_id: str) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=Path(__file__).resolve().parents[1],
-            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            env={
+                **os.environ,
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "JUWEIER_UVR_MODEL_DIR": os.environ.get(
+                    "JUWEIER_UVR_MODEL_DIR",
+                    str(ROOT / "models" / "uvr"),
+                ),
+            },
         )
         stem_dir = ""
         last_error = ""

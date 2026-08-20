@@ -66,6 +66,11 @@ jobs:
           if (!(Select-String -Path "NOVRIA.spec" -Pattern "Juweier-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
           python -m unittest discover -s tests -v
 
+          $env:PATH = "$root\tools\ffmpeg;$env:PATH"
+          $selfTest = & $worker --self-test
+          $selfTest | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "Frozen separation worker self-test failed" }
+          if (($selfTest -join "`n") -notmatch '"self_test": true') { throw "Frozen worker self-test did not finish" }
           & $ffmpeg -version | Select-Object -First 1
           Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
 

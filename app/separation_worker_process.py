@@ -1,10 +1,7 @@
 import argparse
-import hashlib
 import json
-import os
 import sys
 import traceback
-import urllib.request
 from pathlib import Path
 
 from app.uvr_separator import run_uvr_separation
@@ -30,64 +27,48 @@ def emit(kind, **payload):
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
 
-MODEL_URL = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th"
-MODEL_FILE = "5c90dfd2-34c22ccb.th"
-MODEL_HASH_PREFIX = "34c22ccb"
+def _self_test() -> int:
+    """Verify imports inside the real frozen Worker, not the build interpreter."""
 
-
-def _sha256_ok(path: Path) -> bool:
-    sha = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            sha.update(chunk)
-    return sha.hexdigest().startswith(MODEL_HASH_PREFIX)
-
-
-def _ensure_model(torch_module) -> Path:
-    cache_dir = Path(torch_module.hub.get_dir()) / "checkpoints"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cache_dir / MODEL_FILE
-    if target.exists() and _sha256_ok(target):
-        emit("model_progress", value=100, text="AI 六轨模型已安装")
-        return target
-    if target.exists():
-        target.unlink()
-
-    part = target.with_suffix(target.suffix + ".part")
-    part.unlink(missing_ok=True)
-    emit("model_progress", value=0, text="首次使用：正在连接 AI 模型服务器...")
-    request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Juweier-Music/3.2.7"})
-    with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
-        total = int(response.headers.get("Content-Length") or 0)
-        downloaded = 0
-        while True:
-            chunk = response.read(1024 * 512)
-            if not chunk:
-                break
-            stream.write(chunk)
-            downloaded += len(chunk)
-            if total:
-                value = min(99, int(downloaded * 100 / total))
-                text = f"下载 AI 模型 {value}%（{downloaded/1048576:.1f}/{total/1048576:.1f} MB）"
-            else:
-                value = 0
-                text = f"已下载 AI 模型 {downloaded/1048576:.1f} MB"
-            emit("model_progress", value=value, text=text)
-    emit("model_progress", value=99, text="正在校验 AI 模型...")
-    if not _sha256_ok(part):
-        part.unlink(missing_ok=True)
-        raise RuntimeError("AI 模型校验失败，请检查网络后重试。")
-    os.replace(part, target)
-    emit("model_progress", value=100, text="AI 六轨模型下载完成")
-    return target
+    modules = {}
+    failures = []
+    checks = (
+        ("torch", "torch"),
+        ("demucs", "demucs.api"),
+        ("audio_separator", "audio_separator.separator"),
+        ("soundfile", "soundfile"),
+        ("librosa", "librosa"),
+    )
+    for label, module_name in checks:
+        try:
+            module = __import__(module_name, fromlist=["*"])
+            modules[label] = str(getattr(module, "__version__", "OK"))
+        except Exception as exc:
+            modules[label] = f"ERROR: {type(exc).__name__}: {exc}"
+            failures.append(label)
+    if failures:
+        emit(
+            "failed",
+            error="Worker 缺少或无法加载模块：" + "、".join(failures),
+            modules=modules,
+        )
+        return 2
+    emit("done", self_test=True, modules=modules)
+    return 0
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("input", nargs="?")
+    parser.add_argument("--output")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+
+    if args.self_test:
+        return _self_test()
+    if not args.input or not args.output:
+        parser.error("input and --output are required unless --self-test is used")
 
     input_file = Path(args.input).resolve()
     output_root = Path(args.output).resolve()

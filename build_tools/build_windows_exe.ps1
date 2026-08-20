@@ -9,8 +9,8 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements-build.txt
 
-# Verify PyTorch imports before PyInstaller starts.
-python -c "import torch; print('Torch', torch.__version__); print('CUDA runtime', torch.version.cuda); print('CPU compatible build ready')"
+# Verify every module used by the isolated worker before PyInstaller starts.
+python -c "import torch, soundfile, librosa; import demucs.api; from audio_separator.separator import Separator; print('Torch', torch.__version__); print('CUDA runtime', torch.version.cuda); print('UVR worker imports ready')"
 
 python -m PyInstaller --noconfirm --clean NOVRIA.spec
 

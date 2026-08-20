@@ -250,11 +250,23 @@ def split_guitar_stem(
     if not guitar.is_file():
         raise FileNotFoundError(f"缺少基础吉他轨：{guitar}")
     combined = folder / "guitar_combined.wav"
-    if not combined.exists():
-        shutil.copy2(guitar, combined)
-    audio, sample_rate = sf.read(str(combined), always_2d=True, dtype="float32")
+    # A killed/failed worker can leave a zero-byte or truncated combined file.
+    # Always rebuild it atomically from the newly generated guitar stem so a
+    # retry never reuses corrupt output from the previous attempt.
+    combined_temp = folder / "guitar_combined.part.wav"
+    combined_temp.unlink(missing_ok=True)
+    shutil.copyfile(guitar, combined_temp)
+    try:
+        audio, sample_rate = sf.read(
+            str(combined_temp), always_2d=True, dtype="float32",
+        )
+    except Exception as exc:
+        combined_temp.unlink(missing_ok=True)
+        raise RuntimeError(f"基础吉他轨不是有效 WAV：{guitar}") from exc
     if not len(audio):
+        combined_temp.unlink(missing_ok=True)
         raise RuntimeError("基础吉他轨为空")
+    os.replace(combined_temp, combined)
 
     acoustic_channels, electric_channels, frame_scores = [], [], []
     n_fft, hop = 2048, 512
@@ -273,8 +285,14 @@ def split_guitar_stem(
         electric = librosa.istft(spectrum * mask, hop_length=hop, length=len(channel))
         electric_channels.append(electric.astype(np.float32))
         acoustic_channels.append((channel - electric).astype(np.float32))
-    sf.write(str(guitar), np.column_stack(acoustic_channels), sample_rate, subtype="PCM_24")
-    sf.write(str(folder / "electric_guitar.wav"), np.column_stack(electric_channels), sample_rate, subtype="PCM_24")
+    acoustic_temp = folder / "guitar.part.wav"
+    electric_temp = folder / "electric_guitar.part.wav"
+    for path in (acoustic_temp, electric_temp):
+        path.unlink(missing_ok=True)
+    sf.write(str(acoustic_temp), np.column_stack(acoustic_channels), sample_rate, subtype="PCM_24")
+    sf.write(str(electric_temp), np.column_stack(electric_channels), sample_rate, subtype="PCM_24")
+    os.replace(acoustic_temp, guitar)
+    os.replace(electric_temp, folder / "electric_guitar.wav")
     diagnostics = {
         "method": "electric-acoustic-spectral-mask-v2",
         "engine": engine,

@@ -122,6 +122,10 @@ class ProcessSeparationWorker(QThread):
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+            env.setdefault("JUWEIER_UVR_MODEL_DIR", str(base / "ai_models" / "uvr"))
+            bundled_ffmpeg = base / "tools" / "ffmpeg"
+            if bundled_ffmpeg.is_dir():
+                env["PATH"] = str(bundled_ffmpeg) + os.pathsep + env.get("PATH", "")
 
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             self.proc = subprocess.Popen(

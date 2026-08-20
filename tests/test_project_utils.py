@@ -98,6 +98,26 @@ class ProjectUtilsTests(unittest.TestCase):
             self.assertLess(float(np.max(np.abs((acoustic + electric) - combined))), 0.01)
             self.assertEqual(info["base_model"], "htdemucs_6s")
 
+    @unittest.skipUnless(HAS_AUDIO_STACK, "soundfile/librosa audio test dependencies are not installed")
+    def test_guitar_retry_replaces_corrupt_combined_wav(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sample_rate = 8000
+            signal = np.zeros((sample_rate, 2), dtype=np.float32)
+            signal[:, 0] = 0.1
+            signal[:, 1] = -0.1
+            sf.write(folder / "guitar.wav", signal, sample_rate)
+            (folder / "guitar_combined.wav").write_bytes(b"partial failed output")
+
+            split_guitar_stem(folder)
+
+            repaired, repaired_rate = sf.read(
+                folder / "guitar_combined.wav", always_2d=True,
+            )
+            self.assertEqual(repaired_rate, sample_rate)
+            self.assertEqual(repaired.shape, signal.shape)
+            self.assertFalse((folder / "guitar_combined.part.wav").exists())
+
 
 if __name__ == '__main__':
     unittest.main()

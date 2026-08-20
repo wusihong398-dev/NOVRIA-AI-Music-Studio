@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
 
 _datas = [('assets','assets')]
 _binaries = []
@@ -15,10 +15,15 @@ for pkg in ['demucs', 'audio_separator', 'onnx', 'onnxruntime', 'torch', 'torcha
 
 _hidden += collect_submodules('demucs')
 _hidden += collect_submodules('audio_separator')
+for distribution in ('audio-separator', 'demucs'):
+    try:
+        _datas += copy_metadata(distribution, recursive=True)
+    except Exception:
+        pass
 _common_hidden = _hidden + [
     'numpy', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp',
     'demucs.separate', 'demucs.pretrained', 'demucs.apply', 'demucs.api',
-    'audio_separator.separator',
+    'audio_separator.separator', 'audio_separator.architectures',
 ]
 
 _windows_manifest = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

@@ -425,6 +425,19 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> resumeJob(PipelineJob job) async {
+    // A failed server job is immutable. Re-polling the same id only returns the
+    // same error forever, even after the server/model environment is repaired.
+    // Start a fresh server job while keeping the user's pipeline card.
+    if (job.status == '失败') {
+      job.serverJobId = '';
+      job.progress = 0;
+      job.stage = '重新提交任务';
+      job.error = '';
+      await _save();
+      notifyListeners();
+      await startJob(job);
+      return;
+    }
     if (job.serverJobId.isEmpty) {
       await startJob(job);
       return;

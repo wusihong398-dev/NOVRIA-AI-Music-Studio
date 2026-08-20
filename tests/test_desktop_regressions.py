@@ -26,7 +26,7 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn("class WorksCenterPage", desktop)
         self.assertIn("self.stack.addWidget(self.works_center)", desktop)
         self.assertNotIn('Placeholder("作品中心', desktop)
-        self.assertIn(r'G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）', server)
+        self.assertIn(r'G:\JuweierMusicLibrary\01_Originals', server)
         self.assertIn('"source_scope": "server"', server)
 
     def test_v3_account_community_and_soundfont_fallback(self):
@@ -115,6 +115,8 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn("'/api/v1/library?$params'", mobile)
         self.assertIn('original_filename: str = Form("")', server)
         self.assertIn('@app.post("/api/v1/library/jobs", status_code=202)', server)
+        self.assertIn("if (job.status == '失败')", mobile)
+        self.assertIn("job.serverJobId = '';", mobile)
 
     def test_windows_catalog_is_async_lazy_and_letters_are_visible(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
@@ -132,6 +134,9 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('htdemucs_6s.yaml', uvr)
         self.assertIn('electric_guitar.wav', (ROOT / 'app/project_utils.py').read_text(encoding='utf-8'))
         self.assertIn('audio-separator>=0.44.5', server_requirements)
+        self.assertIn('_seed_offline_uvr_catalog', uvr)
+        self.assertIn('demucs/htdemucs_6s-offline-fallback', uvr)
+        self.assertIn('guitar_combined.part.wav', (ROOT / 'app/project_utils.py').read_text(encoding='utf-8'))
         self.assertIn('QCheckBox("显示歌词")', desktop)
         self.assertIn('score/show_lyrics', desktop)
         self.assertIn('lyrics_url', desktop)
@@ -143,6 +148,15 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertNotIn('Juweier-Music-v3.2.7-iOS-Simulator.zip', mobile_workflow)
         self.assertNotIn('Juweier-Music-v3.2.7-iOS-TestFlight-Xcode-Project.zip', ios_workflow)
         self.assertNotIn('Compress-Archive', windows_workflow)
+
+    def test_frozen_worker_is_verified_in_windows_ci(self):
+        worker = (ROOT / 'app/separation_worker_process.py').read_text(encoding='utf-8')
+        spec = (ROOT / 'NOVRIA.spec').read_text(encoding='utf-8')
+        workflow = (ROOT / '.github/workflows/build-windows-exe.yml').read_text(encoding='utf-8')
+        self.assertIn('--self-test', worker)
+        self.assertIn("('audio-separator', 'demucs')", spec.replace('"', "'"))
+        self.assertIn('copy_metadata(distribution', spec)
+        self.assertIn('& $worker --self-test', workflow)
 
 
 if __name__ == '__main__':
