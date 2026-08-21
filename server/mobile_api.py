@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.7.
+"""Mobile API companion for 橘味儿音乐 v3.2.8.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -53,7 +53,7 @@ from app.library_catalog import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.7"
+VERSION = "3.2.8"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -574,7 +574,7 @@ def health(_: None = Depends(authorize)) -> dict:
 def app_config(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.7",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.8",
         "service": "online",
         "processing_ready": capabilities["processing_ready"],
         "lyrics_asr_available": capabilities["lyrics_asr_available"],

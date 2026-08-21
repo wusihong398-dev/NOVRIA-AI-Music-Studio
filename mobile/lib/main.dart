@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.7';
+const appVersion = '3.2.8';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -2188,7 +2188,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.7
+橘味儿音乐 v3.2.8
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。

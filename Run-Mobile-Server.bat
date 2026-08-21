@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Juweier Music Mobile API v3.2.7
+title Juweier Music Mobile API v3.2.8
 cd /d "%~dp0"
 
 if exist "%~dp0ffmpeg\bin\ffmpeg.exe" set "PATH=%~dp0ffmpeg\bin;%PATH%"
@@ -21,7 +21,7 @@ if not exist "%JUWEIER_PYTHON%" (
   exit /b 1
 )
 
-echo 正在启动 v3.2.7 Mobile API，端口 %JUWEIER_SERVER_PORT% ...
+echo 正在启动 v3.2.8 Mobile API，端口 %JUWEIER_SERVER_PORT% ...
 echo MP3 曲库：%JUWEIER_SERVER_LIBRARY%
 echo FLAC 曲库：%JUWEIER_SERVER_LIBRARY_FLAC%
 "%JUWEIER_PYTHON%" -m uvicorn server.mobile_api:app --host 0.0.0.0 --port %JUWEIER_SERVER_PORT% --proxy-headers --forwarded-allow-ips="*"

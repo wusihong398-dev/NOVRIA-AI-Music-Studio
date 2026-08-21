@@ -15,9 +15,9 @@ class DesktopRegressionTests(unittest.TestCase):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
         mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.2.7"', launcher)
-        self.assertIn('version: 3.2.7+327', mobile_manifest)
-        self.assertIn('VERSION = "3.2.7"', server)
+        self.assertIn('VERSION = "3.2.8"', launcher)
+        self.assertIn('version: 3.2.8+328', mobile_manifest)
+        self.assertIn('VERSION = "3.2.8"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -105,7 +105,7 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertNotIn('self.batch_worker=None', methods['_on_batch_song_failed'])
         self.assertNotIn('self.pipeline_batch_worker=None', methods['_pipeline_stems_done'])
 
-    def test_v327_mobile_upload_and_route_fallbacks(self):
+    def test_v328_mobile_upload_and_route_fallbacks(self):
         mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
         self.assertIn("field('original_filename', job.fileName)", mobile)
@@ -153,8 +153,8 @@ class DesktopRegressionTests(unittest.TestCase):
         mobile_workflow = (ROOT / '.github/workflows/build-mobile.yml').read_text(encoding='utf-8')
         ios_workflow = (ROOT / '.github/workflows/build-ios-testflight-package.yml').read_text(encoding='utf-8')
         windows_workflow = (ROOT / '.github/workflows/build-windows-exe.yml').read_text(encoding='utf-8')
-        self.assertNotIn('Juweier-Music-v3.2.7-iOS-Simulator.zip', mobile_workflow)
-        self.assertNotIn('Juweier-Music-v3.2.7-iOS-TestFlight-Xcode-Project.zip', ios_workflow)
+        self.assertNotIn('Juweier-Music-v3.2.8-iOS-Simulator.zip', mobile_workflow)
+        self.assertNotIn('Juweier-Music-v3.2.8-iOS-TestFlight-Xcode-Project.zip', ios_workflow)
         self.assertNotIn('Compress-Archive', windows_workflow)
 
     def test_frozen_worker_is_verified_in_windows_ci(self):

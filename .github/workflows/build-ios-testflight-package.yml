@@ -1,10 +1,10 @@
 name: Build Juweier Music iOS TestFlight Package
-run-name: Juweier Music v3.2.7 iOS TestFlight · ${{ github.ref_name }}
+run-name: Juweier Music v3.2.8 iOS TestFlight · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.7"]
+    branches: ["main", "agent/juweier-v3.2.8"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-ios-testflight-package.yml"
@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# v3.2.7 final TestFlight build trigger after remote source verification.
+# v3.2.8 final TestFlight build trigger after remote source verification.
 
 jobs:
   ios-project:
@@ -76,7 +76,7 @@ jobs:
           - 勾选 Automatically manage signing
           - Team 选择你的 Apple Developer 团队
           - Bundle Identifier：`com.db0888.juweierMusic`
-          - Version 当前来自 pubspec：3.2.7
+          - Version 当前来自 pubspec：3.2.8
           - Build：327，上传新构建时需继续递增
 
           ## 3. 归档上传
@@ -89,7 +89,7 @@ jobs:
       - name: Upload iOS TestFlight project without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.7-iOS-TestFlight-Xcode-Project
+          name: Juweier-Music-v3.2.8-iOS-TestFlight-Xcode-Project
           path: mobile_ios
           if-no-files-found: error
           retention-days: 30
