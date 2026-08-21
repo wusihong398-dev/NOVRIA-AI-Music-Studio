@@ -14,6 +14,8 @@ on:
 permissions:
   contents: read
 
+# v3.3.0 final source publication build.
+
 jobs:
   source:
     name: Complete source archive

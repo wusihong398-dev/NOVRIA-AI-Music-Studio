@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# v3.3.0 server-published catalog TestFlight build.
+# v3.3.0 final server-published catalog TestFlight build.
 
 jobs:
   ios-project:

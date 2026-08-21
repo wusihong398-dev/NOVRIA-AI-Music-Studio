@@ -22,6 +22,8 @@ on:
 permissions:
   contents: read
 
+# v3.3.0 final server-published catalog Windows build.
+
 jobs:
   build-windows:
     runs-on: windows-latest
