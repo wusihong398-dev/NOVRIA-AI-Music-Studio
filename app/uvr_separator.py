@@ -106,7 +106,7 @@ def _ensure_demucs_model(
     notify(1, "首次使用：正在从 Demucs 官方服务器下载六轨模型")
     request = urllib.request.Request(
         DEMUCS_MODEL_URL,
-        headers={"User-Agent": "Juweier-Music/3.2.8"},
+        headers={"User-Agent": "Juweier-Music/3.3.0"},
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
@@ -338,5 +338,11 @@ def run_uvr_separation(
         engine=engine,
         model=model,
     )
+    electric = stem_dir / "electric_guitar.wav"
+    if not _valid_wav(electric):
+        raise RuntimeError("二阶段电吉他识别没有生成有效 electric_guitar.wav，歌曲不能发布")
+    guitar_info = stem_dir / "guitar_second_stage.json"
+    if not guitar_info.is_file():
+        raise RuntimeError("缺少电吉他二阶段识别报告，歌曲不能发布")
     notify(100, "UVR 六轨及独立电吉他轨处理完成")
     return stem_dir, diagnostics

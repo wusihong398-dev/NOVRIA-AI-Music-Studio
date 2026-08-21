@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Callable
 
 from app.project_utils import repair_text, safe_file_stem
+from app.library_taxonomy import (
+    artist_initial_for,
+    classify_path,
+    decode_tags,
+)
 
 
 AUDIO_EXTENSIONS = {
@@ -94,6 +99,16 @@ def connect_catalog(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_tracks_artist_album ON tracks(artist,album);
         CREATE INDEX IF NOT EXISTS idx_tracks_title_artist ON tracks(title,artist);
         CREATE INDEX IF NOT EXISTS idx_tracks_category ON tracks(category);
+        CREATE TABLE IF NOT EXISTS catalog_meta(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS catalog_changes(
+            track_id INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            change_type TEXT NOT NULL,
+            PRIMARY KEY(track_id,revision)
+        );
         """
     )
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(tracks)")}
@@ -108,12 +123,57 @@ def connect_catalog(db_path: Path) -> sqlite3.Connection:
         "play_count": "INTEGER DEFAULT 0",
         "last_played": "REAL DEFAULT 0",
         "source_group": "TEXT DEFAULT ''",
+        "artist_initial": "TEXT DEFAULT '#'",
+        "artist_initial_locked": "INTEGER DEFAULT 0",
+        "language": "TEXT DEFAULT '其他'",
+        "genre": "TEXT DEFAULT '流行'",
+        "mood": "TEXT DEFAULT ''",
+        "scene": "TEXT DEFAULT ''",
+        "region": "TEXT DEFAULT ''",
+        "tags": "TEXT DEFAULT '[]'",
+        "publish_status": "TEXT DEFAULT '已发布'",
+        "processing_status": "TEXT DEFAULT '待处理'",
+        "lyrics_status": "TEXT DEFAULT '未处理'",
+        "artifacts_json": "TEXT DEFAULT '{}'",
+        "catalog_updated_at": "REAL DEFAULT 0",
+        "sort_order": "INTEGER DEFAULT 0",
+        "is_featured": "INTEGER DEFAULT 0",
+        "catalog_revision": "INTEGER DEFAULT 0",
     }
     for name, ddl in migrations.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE tracks ADD COLUMN {name} {ddl}")
     connection.commit()
     return connection
+
+
+def catalog_version(db_path: Path | sqlite3.Connection) -> int:
+    owns = not isinstance(db_path, sqlite3.Connection)
+    connection = connect_catalog(db_path) if owns else db_path
+    try:
+        row = connection.execute("SELECT value FROM catalog_meta WHERE key='catalog_version'").fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        if owns:
+            connection.close()
+
+
+def bump_catalog_version(db_path: Path | sqlite3.Connection, value: int | None = None) -> int:
+    owns = not isinstance(db_path, sqlite3.Connection)
+    connection = connect_catalog(db_path) if owns else db_path
+    try:
+        value = int(value or max(int(time.time() * 1000), catalog_version(connection) + 1))
+        connection.execute(
+            "INSERT INTO catalog_meta(key,value) VALUES('catalog_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(value),),
+        )
+        if owns:
+            connection.commit()
+        return value
+    finally:
+        if owns:
+            connection.close()
 
 
 def _clean_folder_artist(value: str) -> str:
@@ -301,10 +361,15 @@ def extract_metadata(path: Path, cover_dir: Path, scan_root: Path | None = None)
     stem = repair_text(path.stem, path.stem)
     title = stem
     artist = "未知歌手"
+    folder_artist = infer_artist_from_path(path, scan_root)
     if " - " in stem:
         left, right = stem.split(" - ", 1)
         artist, title = repair_text(left, "未知歌手"), repair_text(right, stem)
-    folder_artist = infer_artist_from_path(path, scan_root)
+    elif folder_artist == "未知歌手" and "-" in stem:
+        possible_title, possible_artist = stem.rsplit("-", 1)
+        if possible_title.strip() and 1 <= len(possible_artist.strip()) <= 100:
+            title = repair_text(possible_title.strip(), stem)
+            artist = repair_text(possible_artist.strip(), "未知歌手")
     data = {
         "title": title,
         "artist": artist if artist != "未知歌手" else folder_artist,
@@ -381,14 +446,7 @@ def extract_metadata(path: Path, cover_dir: Path, scan_root: Path | None = None)
 
 
 def category_for(path: Path) -> str:
-    value = str(path).casefold()
-    if "抖音" in value or "douyin" in value:
-        return "抖音流行"
-    if "酷狗" in value or "kugou" in value:
-        return "酷狗排行榜"
-    if "05_temp" in value or "链接导入" in value or "临时歌曲库" in value:
-        return "临时歌曲库"
-    return "本地导入"
+    return classify_path(path)["category"]
 
 
 def scan_catalog(
@@ -409,6 +467,7 @@ def scan_catalog_roots(
     files, diagnostics = discover_audio_files(tuple(Path(root) for root in roots))
     connection = connect_catalog(db_path)
     added = updated = skipped = failed = removed_generated = 0
+    revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
     try:
         for index, (path, scan_root) in enumerate(files, start=1):
             if progress:
@@ -416,7 +475,8 @@ def scan_catalog_roots(
             try:
                 stat = path.stat()
                 existing = connection.execute(
-                    "SELECT id,imported_at,source_group,artist FROM tracks WHERE source_path=?", (str(path),)
+                    "SELECT id,imported_at,source_group,artist,artist_initial,artist_initial_locked,tags,catalog_updated_at "
+                    "FROM tracks WHERE source_path=?", (str(path),)
                 ).fetchone()
                 source_group = infer_artist_from_path(path, scan_root)
                 if (
@@ -424,18 +484,27 @@ def scan_catalog_roots(
                     and float(existing["imported_at"] or 0) == float(stat.st_mtime)
                     and str(existing["source_group"] or "").strip() == source_group
                     and str(existing["artist"] or "").strip() not in {"", "未知歌手"}
+                    and str(existing["tags"] or "[]") != "[]"
+                    and float(existing["catalog_updated_at"] or 0) > 0
                 ):
                     skipped += 1
                     continue
                 fingerprint = quick_fingerprint(path)
                 metadata = extract_metadata(path, cover_dir, scan_root)
+                taxonomy = classify_path(path, metadata["title"], metadata["artist"])
+                initial, initial_locked = artist_initial_for(
+                    path, metadata["artist"],
+                    str(existing["artist_initial"] or "") if existing else "",
+                    bool(existing["artist_initial_locked"]) if existing else False,
+                )
                 connection.execute(
                     """
                     INSERT INTO tracks(
                         fingerprint,source_path,working_path,title,artist,album,year,
                         duration,bitrate,samplerate,channels,format,quality,cover_path,
-                        imported_at,category,source_group
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        imported_at,category,source_group,artist_initial,artist_initial_locked,
+                        language,genre,scene,tags,catalog_updated_at,catalog_revision
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(fingerprint) DO UPDATE SET
                         source_path=excluded.source_path,working_path=excluded.working_path,
                         title=excluded.title,artist=excluded.artist,album=excluded.album,
@@ -444,14 +513,21 @@ def scan_catalog_roots(
                         format=excluded.format,quality=excluded.quality,
                         cover_path=CASE WHEN excluded.cover_path<>'' THEN excluded.cover_path ELSE tracks.cover_path END,
                         imported_at=excluded.imported_at,category=excluded.category,
-                        source_group=excluded.source_group
+                        source_group=excluded.source_group,
+                        artist_initial=CASE WHEN tracks.artist_initial_locked=1 THEN tracks.artist_initial ELSE excluded.artist_initial END,
+                        artist_initial_locked=CASE WHEN tracks.artist_initial_locked=1 THEN 1 ELSE excluded.artist_initial_locked END,
+                        language=excluded.language,genre=excluded.genre,scene=excluded.scene,
+                        tags=excluded.tags,catalog_updated_at=excluded.catalog_updated_at,
+                        catalog_revision=excluded.catalog_revision
                     """,
                     (
                         fingerprint, str(path), str(path), metadata["title"], metadata["artist"],
                         metadata["album"], metadata["year"], metadata["duration"],
                         metadata["bitrate"], metadata["samplerate"], metadata["channels"],
                         metadata["format"], metadata["quality"], metadata["cover_path"],
-                        float(stat.st_mtime), category_for(path), source_group,
+                        float(stat.st_mtime), taxonomy["category"], source_group,
+                        initial, initial_locked, taxonomy["language"], taxonomy["genre"],
+                        taxonomy["scene"], taxonomy["tags"], time.time(), revision,
                     ),
                 )
                 if existing:
@@ -463,8 +539,14 @@ def scan_catalog_roots(
         generated_rows = connection.execute("SELECT id,source_path FROM tracks").fetchall()
         for row in generated_rows:
             if is_generated_work_audio(row["source_path"] or ""):
+                connection.execute(
+                    "INSERT OR REPLACE INTO catalog_changes(track_id,revision,change_type) VALUES(?,?,'deleted')",
+                    (int(row["id"]), revision),
+                )
                 connection.execute("DELETE FROM tracks WHERE id=?", (row["id"],))
                 removed_generated += 1
+        if added or updated or removed_generated:
+            bump_catalog_version(connection, revision)
         connection.commit()
     finally:
         connection.close()
@@ -475,7 +557,11 @@ def scan_catalog_roots(
     }
 
 
-def list_catalog(db_path: Path, query: str = "", category: str = "全部", limit: int = 100000) -> list[dict]:
+def list_catalog(
+    db_path: Path, query: str = "", category: str = "全部", limit: int = 100000,
+    *, initial: str = "全部", publish_status: str = "", offset: int = 0,
+    since_revision: int = 0,
+) -> list[dict]:
     connection = connect_catalog(db_path)
     try:
         where = []
@@ -485,15 +571,43 @@ def list_catalog(db_path: Path, query: str = "", category: str = "全部", limit
             where.append("(title LIKE ? OR artist LIKE ? OR album LIKE ? OR source_group LIKE ?)")
             like = f"%{text}%"
             values.extend((like, like, like, like))
-        if category and category != "全部":
-            where.append("category=?")
-            values.append(category)
+        if category and category not in {"全部", "推荐", "乐库"}:
+            if category == "AI已完成":
+                where.append("processing_status='已完成'")
+            elif category == "有歌词":
+                where.append("lyrics_status='完成'")
+            elif category == "有乐谱":
+                where.append("score_status='完成'")
+            elif category == "有分轨":
+                where.append("stems_status='完成'")
+            else:
+                where.append("(category=? OR language=? OR genre=? OR scene=? OR tags LIKE ?)")
+                values.extend((category, category, category, category, f'%"{category}"%'))
+        if initial and initial != "全部":
+            where.append("artist_initial=?")
+            values.append(initial.upper())
+        if publish_status:
+            where.append("publish_status=?")
+            values.append(publish_status)
+        if since_revision:
+            where.append("catalog_revision>?")
+            values.append(int(since_revision))
         clause = " WHERE " + " AND ".join(where) if where else ""
-        values.append(max(1, min(100000, int(limit))))
+        values.extend((max(1, min(100000, int(limit))), max(0, int(offset))))
         rows = connection.execute(
-            "SELECT * FROM tracks" + clause + " ORDER BY source_group,artist,title LIMIT ?", values
+            "SELECT * FROM tracks" + clause
+            + " ORDER BY is_featured DESC,sort_order,source_group,artist,title LIMIT ? OFFSET ?", values
         ).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = decode_tags(item.get("tags"))
+            try:
+                item["artifacts"] = json.loads(item.get("artifacts_json") or "{}")
+            except Exception:
+                item["artifacts"] = {}
+            result.append(item)
+        return result
     finally:
         connection.close()
 
@@ -521,6 +635,17 @@ def list_artists(db_path: Path, query: str = "", category: str = "全部") -> li
         connection.close()
 
 
+def catalog_facets(db_path: Path) -> dict:
+    connection = connect_catalog(db_path)
+    try:
+        total = int(connection.execute("SELECT COUNT(*) FROM tracks WHERE publish_status='已发布'").fetchone()[0])
+        processed = int(connection.execute("SELECT COUNT(*) FROM tracks WHERE processing_status='已完成'").fetchone()[0])
+        artists = int(connection.execute("SELECT COUNT(DISTINCT artist) FROM tracks WHERE publish_status='已发布'").fetchone()[0])
+        return {"songs": total, "artists": artists, "processed": processed}
+    finally:
+        connection.close()
+
+
 def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = "", progress=None) -> Path:
     """Download a public direct audio URL or a non-DRM share page into 05_Temp."""
     notify = progress or (lambda _value, _text: None)
@@ -534,7 +659,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
         source_name = urllib.parse.unquote(Path(parsed.path).name) or "link_audio.mp3"
         target = destination / f"{safe_file_stem(Path(source_name).stem, 'link_audio')}{suffix}"
         part = target.with_suffix(target.suffix + ".part")
-        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.2.8"})
+        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.3.0"})
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
             total, downloaded = int(response.headers.get("Content-Length") or 0), 0
             while True:
@@ -551,7 +676,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("当前安装包缺少授权音频直链导入组件，请更新到完整版 v3.2.8") from exc
+        raise RuntimeError("当前安装包缺少授权音频直链导入组件，请更新到完整版 v3.3.0") from exc
     before = {path.resolve() for path in destination.iterdir() if path.is_file()}
 
     def hook(status: dict) -> None:

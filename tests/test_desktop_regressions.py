@@ -15,9 +15,9 @@ class DesktopRegressionTests(unittest.TestCase):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
         mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.2.8"', launcher)
-        self.assertIn('version: 3.2.8+328', mobile_manifest)
-        self.assertIn('VERSION = "3.2.8"', server)
+        self.assertIn('VERSION = "3.3.0"', launcher)
+        self.assertIn('version: 3.3.0+330', mobile_manifest)
+        self.assertIn('VERSION = "3.3.0"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -129,6 +129,30 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('["展开后加载歌曲",""]', desktop)
         self.assertIn('button.setFixedWidth(50 if value == "全部" else 36)', desktop)
         self.assertNotIn('ai.setExpanded(bool(query.strip()))', desktop)
+
+    def test_v330_catalog_is_cached_incremental_and_never_scans_on_app_start(self):
+        desktop = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        mobile = (ROOT / "mobile/lib/main.dart").read_text(encoding="utf-8")
+        server = (ROOT / "server/mobile_api.py").read_text(encoding="utf-8")
+        self.assertIn("catalogVersion", mobile)
+        self.assertIn("result['not_modified'] == true", mobile)
+        self.assertIn('since and since == current_version', server)
+        self.assertIn('JUWEIER_AUTO_SCAN_LIBRARY", "1"', server)
+        self.assertIn('_catalog_watch_loop', server)
+        self.assertIn("先显示本地缓存，再后台同步增量索引", desktop)
+        self.assertNotIn("把歌曲放进 G:", mobile)
+        desktop_client = (ROOT / "app/server_library_client.py").read_text(encoding="utf-8")
+        self.assertIn('http://127.0.0.1:8001', desktop_client)
+
+    def test_v330_requires_electric_guitar_and_note_aligned_lyrics_for_ready_results(self):
+        server = (ROOT / "server/mobile_api.py").read_text(encoding="utf-8")
+        uvr = (ROOT / "app/uvr_separator.py").read_text(encoding="utf-8")
+        mobile = (ROOT / "mobile/lib/main.dart").read_text(encoding="utf-8")
+        self.assertIn('"stem_electric_guitar"', server)
+        self.assertIn('"lyrics_note_aligned": lyric_aligned', server)
+        self.assertIn('二阶段电吉他识别没有生成有效', uvr)
+        self.assertIn("positionSeconds >= noteStart", mobile)
+        self.assertIn("positionSeconds >= ((unit['start']", mobile)
 
     def test_uvr_engine_electric_guitar_and_lyrics_toggle(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')

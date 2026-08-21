@@ -8,6 +8,7 @@ the API exposed by ``server/mobile_api.py``.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,32 +27,43 @@ class ServerLibraryClient:
         self.base_url = (base_url or DEFAULT_SERVER_URL).strip().rstrip("/")
         self.token = token.strip()
         self.timeout = timeout
+        self.local_fallback = os.environ.get(
+            "JUWEIER_DESKTOP_LOCAL_SERVER", "http://127.0.0.1:8001",
+        ).strip().rstrip("/")
         if not self.base_url.startswith(("http://", "https://")):
             raise ServerLibraryError("AI 服务器地址必须以 http:// 或 https:// 开头")
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        headers = {"Accept": "application/json", "User-Agent": "Juweier-Music/3.2.8"}
+        headers = {"Accept": "application/json", "User-Agent": "Juweier-Music/3.3.0"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         body = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
-        request = urllib.request.Request(
-            self.base_url + path, data=body, headers=headers, method=method,
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else {}
-        except urllib.error.HTTPError as exc:
+        bases = [self.base_url]
+        if self.local_fallback and self.local_fallback != self.base_url:
+            bases.append(self.local_fallback)
+        last_error: Exception | None = None
+        for index, base in enumerate(bases):
+            request = urllib.request.Request(base + path, data=body, headers=headers, method=method)
             try:
-                detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
-            except Exception:
-                detail = str(exc)
-            raise ServerLibraryError(str(detail)) from exc
-        except Exception as exc:
-            raise ServerLibraryError(f"无法连接服务器：{exc}") from exc
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read().decode("utf-8")
+                return json.loads(raw) if raw.strip() else {}
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
+                except Exception:
+                    detail = str(exc)
+                last_error = ServerLibraryError(str(detail))
+                if exc.code < 500 or index == len(bases) - 1:
+                    raise last_error from exc
+            except Exception as exc:
+                last_error = exc
+                if index == len(bases) - 1:
+                    raise ServerLibraryError(f"无法连接服务器：{exc}") from exc
+        raise ServerLibraryError(f"无法连接服务器：{last_error}")
 
     def _request_any(self, method: str, paths: list[str], payload: dict | None = None) -> dict:
         last_error: Exception | None = None
@@ -76,9 +88,13 @@ class ServerLibraryClient:
     def import_link(self, url: str) -> dict:
         return self._request("POST", "/api/v1/library/import-url", {"url": url})
 
-    def songs(self, query: str = "", category: str = "全部") -> dict:
+    def songs(
+        self, query: str = "", category: str = "全部", *, initial: str = "全部",
+        since: int = 0,
+    ) -> dict:
         params = urllib.parse.urlencode({
-            "q": query, "category": category, "limit": 100000,
+            "q": query, "category": category, "initial": initial,
+            "since": max(0, int(since)), "limit": 100000,
         })
         return self._request_any("GET", [
             f"/api/v1/library/mobile/catalog?{params}",
@@ -95,6 +111,16 @@ class ServerLibraryClient:
             {"arrangement_mode": arrangement_mode, "transpose": transpose, "output": output},
         )
 
+    def start_library_batch(self, retry_failed: bool = False) -> dict:
+        suffix = "?retry_failed=true" if retry_failed else ""
+        return self._request("POST", f"/api/v1/library/batch/start{suffix}")
+
+    def pause_library_batch(self) -> dict:
+        return self._request("POST", "/api/v1/library/batch/pause")
+
+    def library_batch_status(self) -> dict:
+        return self._request("GET", "/api/v1/library/batch/status")
+
     def job(self, job_id: str) -> dict:
         safe_id = urllib.parse.quote(str(job_id), safe="")
         return self._request_any("GET", [
@@ -105,24 +131,34 @@ class ServerLibraryClient:
 
     def download(self, url: str, destination: Path) -> Path:
         absolute = urllib.parse.urljoin(self.base_url + "/", url)
-        headers = {"Accept": "*/*", "User-Agent": "Juweier-Music/3.2.8"}
+        headers = {"Accept": "*/*", "User-Agent": "Juweier-Music/3.3.0"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         destination.parent.mkdir(parents=True, exist_ok=True)
         part = destination.with_suffix(destination.suffix + ".part")
-        request = urllib.request.Request(absolute, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=max(60, self.timeout)) as response, part.open("wb") as stream:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    stream.write(chunk)
-            part.replace(destination)
-            return destination
-        except Exception as exc:
+        parsed = urllib.parse.urlsplit(absolute)
+        candidates = [absolute]
+        if self.local_fallback:
+            local = self.local_fallback + urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
+            if local not in candidates:
+                candidates.append(local)
+        last_error: Exception | None = None
+        for candidate in candidates:
             part.unlink(missing_ok=True)
-            raise ServerLibraryError(f"服务器歌曲下载失败：{exc}") from exc
+            request = urllib.request.Request(candidate, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=max(60, self.timeout)) as response, part.open("wb") as stream:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
+                part.replace(destination)
+                return destination
+            except Exception as exc:
+                last_error = exc
+        part.unlink(missing_ok=True)
+        raise ServerLibraryError(f"服务器歌曲下载失败：{last_error}")
 
 
 def load_desktop_server_config(config_file: Path) -> dict:

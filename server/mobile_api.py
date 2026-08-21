@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.2.8.
+"""Mobile API companion for 橘味儿音乐 v3.3.0.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -41,7 +41,10 @@ from app.lyrics_ai import generate_lyrics, lyrics_to_lrc
 from app.lyrics_transcription import transcribe_synced_lyrics
 from app.library_catalog import (
     catalog_artist_name,
+    catalog_facets,
     catalog_track,
+    catalog_version,
+    bump_catalog_version,
     connect_catalog,
     default_library_root,
     ensure_library_layout,
@@ -50,14 +53,16 @@ from app.library_catalog import (
     scan_catalog_roots,
     download_public_audio,
 )
+from app.library_taxonomy import artist_initial_for, taxonomy_payload
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.2.8"
+VERSION = "3.3.0"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
 STATE_FILE = ROOT / "jobs.json"
+BATCH_STATE_FILE = ROOT / "library_batch_state.json"
 ACCOUNT_DB = ROOT / "accounts.sqlite3"
 TOKEN = os.environ.get("JUWEIER_API_TOKEN", "").strip()
 SMS_ACCESS_KEY_ID = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "").strip()
@@ -66,7 +71,13 @@ SMS_SIGN_NAME = os.environ.get("ALIYUN_SMS_SIGN_NAME", "").strip()
 SMS_TEMPLATE_CODE = os.environ.get("ALIYUN_SMS_TEMPLATE_CODE", "").strip()
 SMS_CODE_PEPPER = os.environ.get("ADMIN_KEY", "").strip()
 LIBRARY_PATHS = ensure_library_layout(default_library_root())
-LIBRARY_DB = LIBRARY_PATHS["database"] / "juweier_music_library.sqlite3"
+if os.environ.get("JUWEIER_PROCESSED_DIR", "").strip():
+    LIBRARY_PATHS["processed"] = Path(os.environ["JUWEIER_PROCESSED_DIR"].strip())
+    LIBRARY_PATHS["processed"].mkdir(parents=True, exist_ok=True)
+LIBRARY_DB = Path(os.environ.get(
+    "JUWEIER_LIBRARY_DB",
+    LIBRARY_PATHS["database"] / "juweier_music_library.sqlite3",
+))
 SERVER_LIBRARY_ROOT = Path(os.environ.get(
     "JUWEIER_SERVER_LIBRARY",
     r"G:\JuweierMusicLibrary\01_Originals",
@@ -75,10 +86,18 @@ SERVER_LIBRARY_FLAC_ROOT = Path(os.environ.get(
     "JUWEIER_SERVER_LIBRARY_FLAC",
     r"G:\JuweierMusicLibrary\01_Originals",
 ))
-SERVER_LIBRARY_ROOTS = list(dict.fromkeys((SERVER_LIBRARY_ROOT, SERVER_LIBRARY_FLAC_ROOT)))
-AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "0").strip().lower() not in {
+_configured_roots = [
+    Path(value.strip())
+    for value in os.environ.get("JUWEIER_SERVER_LIBRARY_ROOTS", "").split(";")
+    if value.strip()
+]
+SERVER_LIBRARY_ROOTS = list(dict.fromkeys(
+    _configured_roots or (SERVER_LIBRARY_ROOT, SERVER_LIBRARY_FLAC_ROOT)
+))
+AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
+CATALOG_WATCH_INTERVAL = max(60, int(os.environ.get("JUWEIER_CATALOG_WATCH_INTERVAL", "900")))
 connect_catalog(LIBRARY_DB).close()
 for folder in (UPLOADS, OUTPUTS):
     folder.mkdir(parents=True, exist_ok=True)
@@ -91,6 +110,14 @@ catalog_state = {
     "message": "正在使用服务器已保存的歌曲索引",
     "updated_at": 0.0,
     "result": {},
+}
+catalog_scan_lock = threading.Lock()
+batch_lock = threading.RLock()
+batch_thread: threading.Thread | None = None
+batch_state = {
+    "running": False, "paused": False, "current_track_id": 0,
+    "current_job_id": "", "submitted": 0, "completed": 0, "failed": 0,
+    "updated_at": 0.0,
 }
 
 
@@ -450,22 +477,23 @@ def _artist_initial(artist: str, source_path: str = "") -> str:
 
 
 def _scan_server_catalog() -> dict:
-    roots = _existing_server_library_roots()
-    if not roots:
-        raise RuntimeError(
-            "服务器曲库目录不存在或不可访问：" + "；".join(str(root) for root in SERVER_LIBRARY_ROOTS)
-        )
-    with lock:
-        catalog_state.update(status="scanning", message="正在后台更新服务器歌曲索引")
-    result = scan_catalog_roots(roots, LIBRARY_DB, LIBRARY_PATHS["covers"])
-    with lock:
-        catalog_state.update(
-            status="ready",
-            message="服务器歌曲索引已更新",
-            updated_at=time.time(),
-            result=dict(result),
-        )
-    return {**result, "roots": [str(root) for root in roots], "source_scope": "server"}
+    with catalog_scan_lock:
+        roots = _existing_server_library_roots()
+        if not roots:
+            raise RuntimeError(
+                "服务器曲库目录不存在或不可访问：" + "；".join(str(root) for root in SERVER_LIBRARY_ROOTS)
+            )
+        with lock:
+            catalog_state.update(status="scanning", message="服务器正在后台增量同步原版歌曲")
+        result = scan_catalog_roots(roots, LIBRARY_DB, LIBRARY_PATHS["covers"])
+        with lock:
+            catalog_state.update(
+                status="ready",
+                message="服务器歌曲索引已更新",
+                updated_at=time.time(),
+                result=dict(result),
+            )
+        return {**result, "roots": [str(root) for root in roots], "source_scope": "server"}
 
 
 def _background_catalog_scan() -> None:
@@ -476,12 +504,119 @@ def _background_catalog_scan() -> None:
             catalog_state.update(status="error", message=str(exc), updated_at=time.time())
 
 
+def _catalog_watch_loop() -> None:
+    while True:
+        time.sleep(CATALOG_WATCH_INTERVAL)
+        _background_catalog_scan()
+
+
+def _batch_counts() -> dict:
+    connection = connect_catalog(LIBRARY_DB)
+    try:
+        rows = connection.execute(
+            "SELECT processing_status,COUNT(*) FROM tracks GROUP BY processing_status"
+        ).fetchall()
+        counts = {str(row[0] or "待处理"): int(row[1]) for row in rows}
+        return {
+            "total": sum(counts.values()),
+            "pending": counts.get("待处理", 0),
+            "queued": counts.get("排队中", 0) + counts.get("处理中", 0),
+            "ready": counts.get("已完成", 0),
+            "failed": counts.get("失败", 0) + counts.get("成果待校验", 0),
+        }
+    finally:
+        connection.close()
+
+
+def _set_track_processing_status(track_id: int, status: str) -> None:
+    connection = connect_catalog(LIBRARY_DB)
+    try:
+        revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
+        connection.execute(
+            "UPDATE tracks SET processing_status=?,catalog_updated_at=?,catalog_revision=? WHERE id=?",
+            (status, time.time(), revision, int(track_id)),
+        )
+        bump_catalog_version(connection, revision)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _save_batch_state() -> None:
+    atomic_write_json(BATCH_STATE_FILE, {**batch_state, "counts": _batch_counts()})
+
+
+def _library_batch_loop() -> None:
+    global batch_thread
+    while True:
+        with batch_lock:
+            if not batch_state["running"] or batch_state["paused"]:
+                break
+        connection = connect_catalog(LIBRARY_DB)
+        try:
+            row = connection.execute(
+                "SELECT id,source_path,working_path FROM tracks "
+                "WHERE publish_status='已发布' AND processing_status='待处理' "
+                "ORDER BY is_featured DESC,sort_order,id LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row:
+            with batch_lock:
+                batch_state.update(running=False, current_track_id=0, current_job_id="", updated_at=time.time())
+                _save_batch_state()
+            break
+        track_id = int(row["id"])
+        _set_track_processing_status(track_id, "排队中")
+        input_path = Path(str(row["working_path"] or row["source_path"] or ""))
+        if not input_path.is_file():
+            _set_track_processing_status(track_id, "失败")
+            with batch_lock:
+                batch_state["failed"] += 1
+            continue
+        job_id = _queue_job(
+            file_name=input_path.name, input_path=input_path,
+            arrangement_mode="乐队现场版", transpose=0, output="wav_mp3",
+            library_track_id=track_id,
+        )
+        with batch_lock:
+            batch_state.update(
+                current_track_id=track_id, current_job_id=job_id,
+                submitted=int(batch_state["submitted"]) + 1, updated_at=time.time(),
+            )
+            _save_batch_state()
+        while True:
+            time.sleep(2)
+            with lock:
+                status = str(jobs.get(job_id, {}).get("status") or "")
+            if status in {"completed", "failed"}:
+                with batch_lock:
+                    key = "completed" if status == "completed" else "failed"
+                    batch_state[key] = int(batch_state[key]) + 1
+                    batch_state.update(current_track_id=0, current_job_id="", updated_at=time.time())
+                    _save_batch_state()
+                break
+    with batch_lock:
+        batch_thread = None
+
+
 @app.on_event("startup")
 def start_catalog_index() -> None:
     """Serve the cached index immediately and refresh it without blocking startup."""
 
     if AUTO_SCAN_LIBRARY:
         executor.submit(_background_catalog_scan)
+        watcher = threading.Thread(target=_catalog_watch_loop, name="catalog-watch", daemon=True)
+        watcher.start()
+    connection = connect_catalog(LIBRARY_DB)
+    try:
+        connection.execute(
+            "UPDATE tracks SET processing_status='待处理' "
+            "WHERE processing_status IN ('排队中','处理中')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _gpu_name() -> str:
@@ -558,9 +693,11 @@ def health(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
         "status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name(),
-        "server_library_root": str(SERVER_LIBRARY_ROOT),
+        "server_library_root": str(SERVER_LIBRARY_ROOTS[0]),
         "server_library_roots": [str(root) for root in SERVER_LIBRARY_ROOTS],
         "catalog_count": _catalog_count(),
+        "catalog_version": catalog_version(LIBRARY_DB),
+        "catalog_stats": catalog_facets(LIBRARY_DB),
         "catalog_state": dict(catalog_state),
         "processing_ready": capabilities["processing_ready"],
         "runtime": capabilities,
@@ -574,7 +711,7 @@ def health(_: None = Depends(authorize)) -> dict:
 def app_config(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.2.8",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.3.0",
         "service": "online",
         "processing_ready": capabilities["processing_ready"],
         "lyrics_asr_available": capabilities["lyrics_asr_available"],
@@ -897,9 +1034,25 @@ def _queue_job(
 @app.get("/api/v1/library")
 def library(
     request: Request, q: str = "", category: str = "全部", limit: int = 100000,
+    initial: str = "全部", offset: int = 0, since: int = 0,
     _: None = Depends(authorize),
 ) -> dict:
-    songs = list_catalog(LIBRARY_DB, q, category, limit)
+    current_version = catalog_version(LIBRARY_DB)
+    if since and since == current_version and not q.strip() and category == "全部" and initial == "全部":
+        return {
+            "songs": [], "count": 0, "not_modified": True,
+            "catalog_version": current_version, "taxonomy": taxonomy_payload(),
+            "categories": taxonomy_payload()["categories"], "source_scope": "server",
+            "server_library_root": str(SERVER_LIBRARY_ROOTS[0]),
+            "server_library_roots": [str(root) for root in SERVER_LIBRARY_ROOTS],
+            "catalog_stats": catalog_facets(LIBRARY_DB),
+        }
+    incremental = bool(since and since < current_version and not q.strip() and category == "全部" and initial == "全部")
+    songs = list_catalog(
+        LIBRARY_DB, q, category, limit, initial=initial,
+        publish_status="已发布", offset=offset,
+        since_revision=since if incremental else 0,
+    )
     allowed_roots = [root.resolve() for root in SERVER_LIBRARY_ROOTS]
     allowed_roots.append(LIBRARY_PATHS["temp"].resolve())
     filtered = []
@@ -917,7 +1070,11 @@ def library(
         source_path = str(song.get("source_path") or song.get("working_path") or "")
         song["metadata_artist"] = song.get("artist") or "未知歌手"
         song["artist"] = catalog_artist_name(song)
-        song["artist_initial"] = _artist_initial(song["artist"], source_path)
+        saved_initial = str(song.get("artist_initial") or "")
+        song["artist_initial"] = artist_initial_for(
+            source_path, song["artist"], saved_initial,
+            bool(song.get("artist_initial_locked")),
+        )[0]
         track_id = int(song["id"])
         song.pop("source_path", None)
         song.pop("working_path", None)
@@ -929,19 +1086,54 @@ def library(
         )
         if lyric_path is not None:
             song["lyrics_url"] = str(request.url_for("library_mobile_lyrics", track_id=track_id))
+            song["lyrics_status"] = "完成"
         if song.get("cover_path"):
             song["cover_url"] = str(request.url_for("library_mobile_cover", track_id=track_id))
+        stored_artifacts = dict(song.get("artifacts") or {})
+        song["artifacts"] = {
+            key: str(request.url_for(
+                "library_catalog_artifact", track_id=track_id, artifact_key=key,
+            ))
+            for key, value in stored_artifacts.items()
+            if Path(str(value)).is_file()
+        }
+        song.pop("artifacts_json", None)
         song.pop("cover_path", None)
+    public_fields = {
+        "id", "title", "artist", "album", "year", "duration", "format", "quality",
+        "bpm", "musical_key", "category", "artist_initial", "language", "genre",
+        "mood", "scene", "region", "tags", "publish_status", "processing_status",
+        "lyrics_status", "stems_status", "score_status", "arrangement_status",
+        "audio_url", "cover_url", "lyrics_url", "artifacts", "is_featured",
+    }
+    songs = [{key: value for key, value in song.items() if key in public_fields} for song in songs]
     artists = {}
     for song in songs:
         name = song.get("artist") or "未知歌手"
         artists[name] = artists.get(name, 0) + 1
+    deleted_ids: list[int] = []
+    if incremental:
+        connection = connect_catalog(LIBRARY_DB)
+        try:
+            deleted_ids = [
+                int(row[0]) for row in connection.execute(
+                    "SELECT DISTINCT track_id FROM catalog_changes "
+                    "WHERE revision>? AND change_type='deleted'",
+                    (int(since),),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
     return {
         "songs": songs, "count": len(songs),
+        "incremental": incremental, "deleted_ids": deleted_ids,
         "artists": [{"name": name, "count": count} for name, count in sorted(artists.items())],
-        "categories": ["全部", "本地导入", "临时歌曲库", "抖音流行", "酷狗排行榜"],
+        "categories": taxonomy_payload()["categories"],
+        "taxonomy": taxonomy_payload(),
+        "catalog_version": current_version,
+        "catalog_stats": catalog_facets(LIBRARY_DB),
         "source_scope": "server",
-        "server_library_root": str(SERVER_LIBRARY_ROOT),
+        "server_library_root": str(SERVER_LIBRARY_ROOTS[0]),
         "server_library_roots": [str(root) for root in SERVER_LIBRARY_ROOTS],
         "catalog_state": dict(catalog_state),
         "catalog_updated_at": float(catalog_state.get("updated_at", 0) or 0),
@@ -1005,6 +1197,23 @@ def library_lyrics(track_id: int, _: None = Depends(authorize)):
     return FileResponse(path, filename=f"{safe_file_stem(audio_path.stem)}.lrc", media_type="text/plain")
 
 
+@app.get(
+    "/api/v1/library/mobile/catalog/{track_id}/artifacts/{artifact_key}",
+    name="library_catalog_artifact",
+)
+@app.get("/api/v1/library/catalog/{track_id}/artifacts/{artifact_key}")
+def library_catalog_artifact(track_id: int, artifact_key: str, _: None = Depends(authorize)):
+    song = catalog_track(LIBRARY_DB, track_id)
+    try:
+        artifacts = json.loads(str(song.get("artifacts_json") or "{}")) if song else {}
+    except Exception:
+        artifacts = {}
+    path = Path(str(artifacts.get(artifact_key) or ""))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="歌曲成果不存在")
+    return FileResponse(path, filename=path.name)
+
+
 @app.post("/api/v1/library/mobile/catalog/{track_id}/process", status_code=202)
 @app.post("/api/v1/library/{track_id}/process", status_code=202)
 def process_library_song(track_id: int, payload: LibraryProcessPayload, _: None = Depends(authorize)) -> dict:
@@ -1014,12 +1223,67 @@ def process_library_song(track_id: int, payload: LibraryProcessPayload, _: None 
     input_path = Path(str(song.get("working_path") or song.get("source_path")))
     if not input_path.is_file():
         raise HTTPException(status_code=404, detail="歌曲文件不存在")
+    connection = connect_catalog(LIBRARY_DB)
+    try:
+        revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
+        connection.execute(
+            "UPDATE tracks SET processing_status='排队中',catalog_updated_at=?,catalog_revision=? WHERE id=?",
+            (time.time(), revision, track_id),
+        )
+        bump_catalog_version(connection, revision)
+        connection.commit()
+    finally:
+        connection.close()
     queued_id = _queue_job(
         file_name=input_path.name, input_path=input_path,
         arrangement_mode=payload.arrangement_mode, transpose=payload.transpose,
         output=payload.output, library_track_id=track_id,
     )
     return {"job_id": queued_id, "status": "queued"}
+
+
+@app.get("/api/v1/library/mobile/batch/status")
+@app.get("/api/v1/library/batch/status")
+def library_batch_status(_: None = Depends(authorize)) -> dict:
+    with batch_lock:
+        return {**batch_state, "counts": _batch_counts()}
+
+
+@app.post("/api/v1/library/mobile/batch/start", status_code=202)
+@app.post("/api/v1/library/batch/start", status_code=202)
+def library_batch_start(retry_failed: bool = False, _: None = Depends(authorize)) -> dict:
+    global batch_thread
+    if retry_failed:
+        connection = connect_catalog(LIBRARY_DB)
+        try:
+            revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
+            connection.execute(
+                "UPDATE tracks SET processing_status='待处理',catalog_revision=?,catalog_updated_at=? "
+                "WHERE processing_status IN ('失败','成果待校验')"
+                , (revision, time.time())
+            )
+            bump_catalog_version(connection, revision)
+            connection.commit()
+        finally:
+            connection.close()
+    with batch_lock:
+        batch_state.update(running=True, paused=False, updated_at=time.time())
+        if batch_thread is None or not batch_thread.is_alive():
+            batch_thread = threading.Thread(
+                target=_library_batch_loop, name="library-batch", daemon=True,
+            )
+            batch_thread.start()
+        _save_batch_state()
+        return {**batch_state, "counts": _batch_counts()}
+
+
+@app.post("/api/v1/library/mobile/batch/pause")
+@app.post("/api/v1/library/batch/pause")
+def library_batch_pause(_: None = Depends(authorize)) -> dict:
+    with batch_lock:
+        batch_state.update(paused=True, running=False, updated_at=time.time())
+        _save_batch_state()
+        return {**batch_state, "counts": _batch_counts(), "message": "当前歌曲完成后暂停"}
 
 
 def _run_job(job_id: str) -> None:
@@ -1084,6 +1348,9 @@ def _run_job(job_id: str) -> None:
             raise RuntimeError(last_error or f"分轨 Worker 退出码 {code}")
 
         artifacts = {f"stem_{p.stem}": str(p) for p in Path(stem_dir).glob("*.wav")}
+        guitar_report = Path(stem_dir) / "guitar_second_stage.json"
+        if guitar_report.is_file():
+            artifacts["electric_guitar_report"] = str(guitar_report)
         _update(job_id, stage="BPM / 调性 / 和弦 / 原唱歌词时间轴分析", progress=58, artifacts=artifacts)
         analysis, chord_rows = _analyze(input_path, Path(stem_dir) / "vocals.wav")
         analysis, chord_rows = _transpose_analysis(analysis, chord_rows, int(job.get("transpose", 0)))
@@ -1093,21 +1360,107 @@ def _run_job(job_id: str) -> None:
         _update(job_id, stage="生成新 MIDI 编配", progress=88, artifacts=artifacts)
         midi = _write_arrangement(output_root, analysis, chord_rows)
         artifacts["arrangement_midi"] = str(midi)
+        readiness = _validate_publish_artifacts(artifacts)
+        artifacts["readiness_report"] = str(readiness["report_path"])
         _update(job_id, status="completed", stage="全部完成", progress=100, artifacts=artifacts)
         if job.get("library_track_id"):
             connection = connect_catalog(LIBRARY_DB)
             try:
+                revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
                 connection.execute(
                     """UPDATE tracks SET bpm=?, musical_key=?, analysis_status='完成',
                        stems_status='完成', chords_status='完成', score_status='完成',
-                       arrangement_status='完成' WHERE id=?""",
-                    (analysis.get("bpm"), analysis.get("key"), int(job["library_track_id"])),
+                       arrangement_status='完成',processing_status=?,publish_status='已发布',
+                       lyrics_status=?,
+                       artifacts_json=?,catalog_updated_at=?,catalog_revision=? WHERE id=?""",
+                    (
+                        analysis.get("bpm"), analysis.get("key"), readiness["processing_status"],
+                        readiness["lyrics_status"],
+                        json.dumps(artifacts, ensure_ascii=False), time.time(), revision,
+                        int(job["library_track_id"]),
+                    ),
                 )
+                bump_catalog_version(connection, revision)
                 connection.commit()
             finally:
                 connection.close()
     except Exception as exc:
+        if job.get("library_track_id"):
+            _set_track_processing_status(int(job["library_track_id"]), "失败")
         _update(job_id, status="failed", stage="失败", error=_friendly_job_error(exc))
+
+
+def _validate_publish_artifacts(artifacts: dict[str, str]) -> dict:
+    """Only mark AI results ready after electric-guitar and lyric/note assets validate."""
+    required_audio = (
+        "stem_vocals", "stem_drums", "stem_bass", "stem_guitar",
+        "stem_electric_guitar", "stem_piano", "stem_other",
+    )
+    missing = [key for key in required_audio if not Path(str(artifacts.get(key) or "")).is_file()]
+    durations: dict[str, float] = {}
+    try:
+        import soundfile as sf
+
+        for key in required_audio:
+            path = Path(str(artifacts.get(key) or ""))
+            if not path.is_file():
+                continue
+            info = sf.info(str(path))
+            if info.frames <= 0 or info.samplerate <= 0:
+                missing.append(f"{key}:invalid")
+            else:
+                durations[key] = float(info.frames / info.samplerate)
+    except Exception as exc:
+        missing.append(f"audio-validation:{exc}")
+    if durations:
+        reference = max(durations.values())
+        for key, duration in durations.items():
+            if abs(reference - duration) > 1.0:
+                missing.append(f"{key}:duration")
+
+    score_path = Path(str(artifacts.get("score_data") or ""))
+    lyric_path = Path(str(artifacts.get("lyrics_timeline") or ""))
+    lyric_aligned = False
+    if score_path.is_file() and lyric_path.is_file():
+        try:
+            score = json.loads(score_path.read_text(encoding="utf-8"))
+            timeline = json.loads(lyric_path.read_text(encoding="utf-8"))
+            units = list(timeline.get("units") or [])
+            notes = list(score.get("staff_notes") or [])
+            lyric_aligned = bool(units) and any(str(note.get("lyric") or "") for note in notes)
+        except Exception:
+            lyric_aligned = False
+    if not score_path.is_file():
+        missing.append("score_data")
+    if not Path(str(artifacts.get("electric_guitar_tab") or "")).is_file():
+        missing.append("electric_guitar_tab")
+    guitar_method = ""
+    guitar_report_path = Path(str(artifacts.get("electric_guitar_report") or ""))
+    if guitar_report_path.is_file():
+        try:
+            guitar_method = str(json.loads(guitar_report_path.read_text(encoding="utf-8")).get("method") or "")
+        except Exception:
+            guitar_method = ""
+    if not guitar_method:
+        missing.append("electric_guitar_provenance")
+    if not lyric_aligned:
+        missing.append("lyrics_note_alignment")
+
+    report_path = (score_path.parent if score_path.parent.is_dir() else ROOT) / "publish_readiness.json"
+    report = {
+        "ready": not missing,
+        "electric_guitar_valid": "stem_electric_guitar" in durations,
+        "electric_guitar_method": guitar_method,
+        "lyrics_note_aligned": lyric_aligned,
+        "durations": durations,
+        "issues": list(dict.fromkeys(missing)),
+    }
+    atomic_write_json(report_path, report)
+    return {
+        "processing_status": "已完成" if not missing else "成果待校验",
+        "lyrics_status": "完成" if lyric_aligned else "待校对",
+        "report_path": report_path,
+    }
 
 
 def _analyze(path: Path, vocals_path: Path | None = None) -> tuple[dict, list[dict]]:

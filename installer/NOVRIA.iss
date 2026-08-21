@@ -1,5 +1,5 @@
 #define MyAppName "橘味儿音乐"
-#define MyAppVersion "3.2.8"
+#define MyAppVersion "3.3.0"
 #define MyAppExeName "Juweier-Music.exe"
 
 [Setup]
@@ -9,7 +9,7 @@ AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\Juweier Music
 DefaultGroupName={#MyAppName}
 OutputDir=..\release
-OutputBaseFilename=Juweier_Music_v3.2.8_Setup_x64
+OutputBaseFilename=Juweier_Music_v3.3.0_Setup_x64
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible

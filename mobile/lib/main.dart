@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.2.8';
+const appVersion = '3.3.0';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -103,7 +103,7 @@ class PipelineJob {
 }
 
 class LibrarySong {
-  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl});
+  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl, required this.tags, required this.language, required this.genre, required this.processingStatus, required this.publishStatus, required this.artifacts});
   final int id;
   final String title;
   final String artist;
@@ -113,6 +113,13 @@ class LibrarySong {
   final String audioUrl;
   final String coverUrl;
   final String lyricsUrl;
+  final List<String> tags;
+  final String language;
+  final String genre;
+  final String processingStatus;
+  final String publishStatus;
+  final Map<String, String> artifacts;
+  bool get isAiReady => processingStatus == '已完成' && artifacts.isNotEmpty;
 
   factory LibrarySong.fromJson(Map<String, dynamic> json) => LibrarySong(
         id: (json['id'] as num?)?.toInt() ?? 0,
@@ -124,6 +131,14 @@ class LibrarySong {
         audioUrl: '${json['audio_url'] ?? ''}',
         coverUrl: '${json['cover_url'] ?? ''}',
         lyricsUrl: '${json['lyrics_url'] ?? ''}',
+        tags: (json['tags'] is List ? json['tags'] as List : const []).map((e) => '$e').toList(),
+        language: '${json['language'] ?? '其他'}',
+        genre: '${json['genre'] ?? '流行'}',
+        processingStatus: '${json['processing_status'] ?? '待处理'}',
+        publishStatus: '${json['publish_status'] ?? '已发布'}',
+        artifacts: json['artifacts'] is Map
+            ? (json['artifacts'] as Map).map((key, value) => MapEntry('$key', '$value'))
+            : <String, String>{},
       );
 
   Map<String, dynamic> toJson() => {
@@ -136,6 +151,12 @@ class LibrarySong {
         'audio_url': audioUrl,
         'cover_url': coverUrl,
         'lyrics_url': lyricsUrl,
+        'tags': tags,
+        'language': language,
+        'genre': genre,
+        'processing_status': processingStatus,
+        'publish_status': publishStatus,
+        'artifacts': artifacts,
       };
 }
 
@@ -170,12 +191,16 @@ class AppStore extends ChangeNotifier {
   static const _nicknameKey = 'juweier_nickname';
   // Keep the existing catalog key so v3.2.6 users see cached songs immediately.
   static const _catalogKey = 'juweier_catalog_v326';
+  static const _catalogVersionKey = 'juweier_catalog_version_v330';
+  static const _catalogCategoriesKey = 'juweier_catalog_categories_v330';
   static const _guestKey = 'juweier_guest_testing';
 
   SharedPreferences? _prefs;
   final List<PipelineJob> jobs = [];
   final List<CommunityMessage> communityMessages = [];
   final List<LibrarySong> catalog = [];
+  int catalogVersion = 0;
+  List<String> catalogCategories = const ['全部','推荐','新歌','华语','粤语','欧美','日韩','流行','摇滚','民谣','古风','电子','DJ','经典','轻音乐','情歌','儿童','车载','KTV','广场舞','影视','游戏','运动','抖音流行','酷狗排行榜','AI已完成','有歌词','有乐谱','有分轨'];
   String serverBase = mobileAiServer;
   String apiToken = '';
   String accountToken = '';
@@ -203,6 +228,9 @@ class AppStore extends ChangeNotifier {
     guestMode = _prefs?.getBool(_guestKey) ?? false;
     accountState = accountToken.isEmpty ? '未登录' : '已登录';
     final rawCatalog = _prefs?.getString(_catalogKey);
+    catalogVersion = _prefs?.getInt(_catalogVersionKey) ?? 0;
+    final savedCategories = _prefs?.getStringList(_catalogCategoriesKey);
+    if (savedCategories != null && savedCategories.isNotEmpty) catalogCategories = savedCategories;
     if (rawCatalog != null && rawCatalog.isNotEmpty) {
       try {
         final rows = jsonDecode(rawCatalog) as List<dynamic>;
@@ -239,6 +267,8 @@ class AppStore extends ChangeNotifier {
     await _prefs?.setString(_nicknameKey, nickname);
     await _prefs?.setBool(_guestKey, guestMode);
     await _prefs?.setString(_catalogKey, jsonEncode(catalog.map((e) => e.toJson()).toList()));
+    await _prefs?.setInt(_catalogVersionKey, catalogVersion);
+    await _prefs?.setStringList(_catalogCategoriesKey, catalogCategories);
   }
 
   Future<void> saveServer(String base, String token) async {
@@ -286,13 +316,31 @@ class AppStore extends ChangeNotifier {
       final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
       // Keep one complete offline catalog. Search and category filters are
       // applied locally so a filtered screen never overwrites the startup cache.
-      final result = await client.library('', '全部');
+      final result = await client.library('', '全部', since: catalog.isNotEmpty ? catalogVersion : 0);
+      if (result['not_modified'] == true) return;
       final rows = result['songs'];
-      catalog
-        ..clear()
-        ..addAll(rows is List
-            ? rows.map((row) => LibrarySong.fromJson(Map<String, dynamic>.from(row as Map)))
-            : const <LibrarySong>[]);
+      final incoming = rows is List
+          ? rows.map((row) => LibrarySong.fromJson(Map<String, dynamic>.from(row as Map))).toList()
+          : const <LibrarySong>[];
+      if (result['incremental'] == true) {
+        final deleted = (result['deleted_ids'] is List ? result['deleted_ids'] as List : const [])
+            .map((value) => (value as num).toInt()).toSet();
+        final merged = <int, LibrarySong>{for (final song in catalog) song.id: song};
+        for (final id in deleted) merged.remove(id);
+        for (final song in incoming) merged[song.id] = song;
+        catalog
+          ..clear()
+          ..addAll(merged.values);
+      } else {
+        catalog
+          ..clear()
+          ..addAll(incoming);
+      }
+      catalogVersion = (result['catalog_version'] as num?)?.toInt() ?? catalogVersion;
+      final categories = result['categories'];
+      if (categories is List && categories.isNotEmpty) {
+        catalogCategories = categories.map((e) => '$e').toList();
+      }
       await _save();
       notifyListeners();
     } catch (_) {
@@ -728,8 +776,8 @@ class ApiClient {
         '/api/v1/jobs/$id',
       ]);
 
-  Future<Map<String, dynamic>> library(String query, String category) {
-    final params = 'q=${Uri.encodeQueryComponent(query)}&category=${Uri.encodeQueryComponent(category)}';
+  Future<Map<String, dynamic>> library(String query, String category, {int since = 0, String initial = '全部'}) {
+    final params = 'q=${Uri.encodeQueryComponent(query)}&category=${Uri.encodeQueryComponent(category)}&initial=${Uri.encodeQueryComponent(initial)}&since=$since';
     return _jsonRequestAny('GET', [
       '/api/v1/library/mobile/catalog?$params',
       '/api/v1/library/catalog?$params',
@@ -1175,8 +1223,10 @@ class LibraryPage extends StatefulWidget {
 
 class _LibraryPageState extends State<LibraryPage> {
   final search = TextEditingController();
+  final previewPlayer = AudioPlayer();
   String category = '全部';
   String initial = '全部';
+  String discoveryTab = '乐库';
   bool loading = false;
 
   @override
@@ -1188,7 +1238,22 @@ class _LibraryPageState extends State<LibraryPage> {
   @override
   void dispose() {
     search.dispose();
+    unawaited(previewPlayer.dispose());
     super.dispose();
+  }
+
+  Future<void> playSong(LibrarySong song) async {
+    if (song.audioUrl.isEmpty) return;
+    try {
+      final token = widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken;
+      await previewPlayer.setUrl(
+        song.audioUrl,
+        headers: token.isEmpty ? null : {'Authorization': 'Bearer $token'},
+      );
+      await previewPlayer.play();
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('歌曲播放失败：$error')));
+    }
   }
 
   Future<void> refresh() async {
@@ -1249,27 +1314,26 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Future<void> processSong(LibrarySong song) async {
-    final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
-      title: const Text('确认开始 AI 处理？'),
-      content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(song.title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
-        Text(song.artist, style: const TextStyle(color: Color(0xFFBDAAB5))),
-        const SizedBox(height: 14),
-        const Text('将从服务器曲库读取原曲，依次完成六轨+电吉他、BPM/调性、和弦、歌词与乐谱、智能改编和渲染。处理时间取决于歌曲长度和服务器负载。'),
-      ]),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-        FilledButton.icon(onPressed: () => Navigator.pop(context, true), icon: const Icon(Icons.auto_awesome), label: const Text('加入处理队列')),
-      ],
+    if (song.isAiReady) {
+      final job = await widget.store.addLibrarySong(song);
+      job.status = '完成';
+      job.stage = '服务器成果可用';
+      job.progress = 1;
+      job.artifacts
+        ..clear()
+        ..addAll(song.artifacts);
+      await widget.store._save();
+      widget.store.notifyListeners();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: const Text('已打开服务器预处理成果：分轨、歌词和乐谱可直接使用'),
+        action: SnackBarAction(label: '查看', onPressed: widget.onOpenPipeline),
+      ));
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('这首歌曲正在等待服务器管理员预处理，完成后会自动显示歌词、乐谱和独立乐器轨。'),
     ));
-    if (confirmed != true || !mounted) return;
-    final job = await widget.store.addLibrarySong(song);
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: const Text('已加入 AI 处理队列，可在流水线查看实时进度'),
-      action: SnackBarAction(label: '查看', onPressed: widget.onOpenPipeline),
-    ));
-    unawaited(widget.store.startJob(job));
   }
 
   void openArtist(MapEntry<String, List<LibrarySong>> group) {
@@ -1287,8 +1351,9 @@ class _LibraryPageState extends State<LibraryPage> {
             final song = group.value[index];
             return ListTile(
               leading: CircleAvatar(backgroundColor: accent.withValues(alpha: .16), child: Text('${index + 1}')),
-              title: Text(song.title), subtitle: Text(song.category),
-              trailing: FilledButton.tonal(onPressed: () { Navigator.pop(context); unawaited(processSong(song)); }, child: const Text('AI 处理')),
+              title: Text(song.title), subtitle: Text('${song.language} · ${song.genre} · ${song.processingStatus}'),
+              onTap: () => unawaited(playSong(song)),
+              trailing: FilledButton.tonal(onPressed: () { Navigator.pop(context); unawaited(processSong(song)); }, child: Text(song.isAiReady ? '打开成果' : '处理中')),
             );
           })),
         ]),
@@ -1300,7 +1365,7 @@ class _LibraryPageState extends State<LibraryPage> {
   Widget build(BuildContext context) {
     final filterText = search.text.trim().toLowerCase();
     final visibleSongs = widget.store.catalog.where((song) {
-      final categoryMatches = category == '全部' || song.category == category;
+      final categoryMatches = category == '全部' || category == '推荐' || song.category == category || song.language == category || song.genre == category || song.tags.contains(category) || (category == 'AI已完成' && song.isAiReady) || (category == '有歌词' && song.lyricsUrl.isNotEmpty) || (category == '有乐谱' && song.artifacts.containsKey('score_data')) || (category == '有分轨' && song.artifacts.containsKey('stem_vocals'));
       final textMatches = filterText.isEmpty ||
           song.title.toLowerCase().contains(filterText) ||
           song.artist.toLowerCase().contains(filterText) ||
@@ -1314,22 +1379,44 @@ class _LibraryPageState extends State<LibraryPage> {
     final artists = grouped.entries.where((entry) => initial == '全部' || artistInitial(entry.value.first) == initial).toList()
       ..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase()));
     final featured = grouped.entries.take(8).toList();
+    final songs = visibleSongs.where((song) => initial == '全部' || artistInitial(song) == initial).toList();
     return Column(children: [
-        PageHeader(title: '歌曲库', subtitle: '${widget.store.catalog.length} 首服务器歌曲 · ${widget.store.jobs.length} 个任务', action: IconButton(onPressed: widget.onImport, icon: const Icon(Icons.add))),
+        PageHeader(title: '橘味儿乐库', subtitle: '${widget.store.catalog.length} 首已发布歌曲 · 打开即播、成果即用', action: IconButton(onPressed: refresh, icon: const Icon(Icons.sync))),
+        SizedBox(height: 48, child: ListView(
+          padding: const EdgeInsets.symmetric(horizontal: 16), scrollDirection: Axis.horizontal,
+          children: [for (final value in const ['推荐','乐库','歌单','歌手','分类','AI成果'])
+            Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(
+              label: Text(value), selected: discoveryTab == value,
+              onSelected: (_) => setState(() {
+                discoveryTab = value;
+                category = value == 'AI成果' ? 'AI已完成' : value == '推荐' ? '推荐' : '全部';
+              }),
+            )),
+          ],
+        )),
+        if (discoveryTab == '推荐') Container(
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 10), padding: const EdgeInsets.all(18),
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(colors: [Color(0xFF5B2945), Color(0xFFFF7A18)]),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: const Row(children: [Icon(Icons.auto_awesome, size: 38), SizedBox(width: 14), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('服务器 AI 精选', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900)), Text('歌词、五线谱、六线谱与独立乐器轨预先生成')]))]),
+        ),
         Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 8), child: Column(children: [
           Row(children: [
           Expanded(child: TextField(
             controller: search,
             textInputAction: TextInputAction.search,
-            onSubmitted: (_) => refresh(),
+            onChanged: (_) => setState(() {}),
+            onSubmitted: (_) => setState(() {}),
             decoration: const InputDecoration(hintText: '搜索歌手、歌曲或专辑', prefixIcon: Icon(Icons.search)),
           )),
           const SizedBox(width: 8),
-          FilledButton.icon(onPressed: refresh, icon: const Icon(Icons.search), label: const Text('搜索')),
+          FilledButton.icon(onPressed: () => setState(() {}), icon: const Icon(Icons.search), label: const Text('搜索')),
           ]),
           const SizedBox(height: 8),
           Wrap(spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
-            SizedBox(width: 190, child: DropdownButtonFormField<String>(initialValue: category, decoration: const InputDecoration(labelText: '歌曲分类'), items: const ['全部','本地导入','临时歌曲库','抖音流行','酷狗排行榜'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) { setState(() => category = value); unawaited(refresh()); } })),
+            SizedBox(width: 190, child: DropdownButtonFormField<String>(initialValue: widget.store.catalogCategories.contains(category) ? category : '全部', decoration: const InputDecoration(labelText: '歌曲分类'), items: widget.store.catalogCategories.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) setState(() => category = value); })),
             OutlinedButton.icon(onPressed: widget.onImport, icon: const Icon(Icons.audio_file), label: const Text('本地导入')),
             OutlinedButton.icon(onPressed: importLink, icon: const Icon(Icons.link), label: const Text('链接导入')),
           ]),
@@ -1357,8 +1444,8 @@ class _LibraryPageState extends State<LibraryPage> {
         ],
         Expanded(
           child: widget.store.catalog.isEmpty
-              ? EmptyState(icon: Icons.library_music, title: '服务器歌曲库暂无结果', detail: '把歌曲放进 G:\\JuweierMusicLibrary\\01_Originals，再在 Windows 端扫描；也可直接导入手机文件。', action: widget.onImport)
-              : ListView.builder(
+              ? EmptyState(icon: Icons.library_music, title: '暂时没有已发布歌曲', detail: 'App 不会扫描手机或电脑硬盘。服务器管理员发布曲库后会自动同步；离线时仍保留上次歌曲索引。', action: refresh)
+              : discoveryTab == '歌手' ? ListView.builder(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
                   itemCount: artists.length,
                   itemBuilder: (context, i) {
@@ -1369,6 +1456,26 @@ class _LibraryPageState extends State<LibraryPage> {
                       title: Text(group.key, style: const TextStyle(fontWeight: FontWeight.w800)),
                       subtitle: Text('${group.value.length} 首服务器歌曲'),
                       trailing: const Icon(Icons.chevron_right),
+                    ));
+                  },
+                ) : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                  itemCount: songs.length,
+                  itemBuilder: (context, index) {
+                    final song = songs[index];
+                    return Card(child: ListTile(
+                      onTap: () => unawaited(playSong(song)),
+                      leading: CircleAvatar(
+                        backgroundColor: accent.withValues(alpha: .16),
+                        foregroundImage: artistImage(song),
+                        child: const Icon(Icons.play_arrow),
+                      ),
+                      title: Text(song.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: Text('${song.artist} · ${song.language} · ${song.genre}'),
+                      trailing: FilledButton.tonal(
+                        onPressed: () => unawaited(processSong(song)),
+                        child: Text(song.isAiReady ? '打开成果' : '处理中'),
+                      ),
                     ));
                   },
                 ),
@@ -2188,7 +2295,7 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.2.8
+橘味儿音乐 v3.3.0
 AI 音乐工作站·Android / iOS / Windows
 
 核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。

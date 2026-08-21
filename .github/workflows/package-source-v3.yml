@@ -1,10 +1,10 @@
 name: Package Juweier Music v3 Source
-run-name: Juweier Music v3.2.8 Source · ${{ github.ref_name }}
+run-name: Juweier Music v3.3.0 Source · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.8"]
+    branches: ["main", "agent/juweier-v3.3.0"]
     paths-ignore:
       - "**/*.md"
       - ".github/workflows/build-mobile.yml"
@@ -25,11 +25,11 @@ jobs:
         run: |
           python -m compileall -q app server tests
           python -m unittest discover -s tests -v
-          grep -q 'VERSION = "3.2.8"' app/main.py
-          grep -q 'VERSION = "3.2.8"' server/mobile_api.py
+          grep -q 'VERSION = "3.3.0"' app/main.py
+          grep -q 'VERSION = "3.3.0"' server/mobile_api.py
       - uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.8-Complete-Source
+          name: Juweier-Music-v3.3.0-Complete-Source
           path: |
             .
             !.git/**

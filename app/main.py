@@ -1,7661 +1,5155 @@
-
-import sys
-import sqlite3
-import shutil
-import shlex
-import mimetypes
-import urllib.request
-import urllib.parse
-import hashlib
-import os
-import subprocess
-import webbrowser
-import html
-import re
-import queue
-import wave
-import zipfile
-import math
-import threading
-import time, json, subprocess, traceback, platform, urllib.request, hashlib, io, os
-from pathlib import Path
-
-from app.project_utils import (
-    atomic_write_json,
-    normalized_path,
-    repair_text,
-    safe_file_stem,
-    unique_import_candidates,
-    load_synced_lyrics,
-    split_guitar_stem,
-)
-from app.uvr_separator import run_uvr_separation
-from app.library_catalog import (
-    AUDIO_EXTENSIONS,
-    catalog_artist_name,
-    connect_catalog,
-    list_catalog,
-    scan_catalog,
-    scan_catalog_roots,
-    download_public_audio,
-)
-from app.lyrics_ai import generate_lyrics, lyrics_to_lrc
-from app.server_library_client import (
-    DEFAULT_SERVER_URL,
-    ServerLibraryClient,
-    ServerLibraryError,
-    load_desktop_server_config,
-)
-
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
-
-from PySide6.QtCore import QFileInfo, Qt, QSize, QThread, Signal, QTimer, QPointF, QRectF, QSettings
-from PySide6.QtGui import QPainter, QPen, QColor, QCloseEvent, QIcon, QPixmap, QFont
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFileDialog, QSlider, QGroupBox, QMessageBox, QProgressBar,
-    QListWidget, QListWidgetItem, QStackedWidget, QGridLayout, QDialogButtonBox, QTableWidget, QTableWidgetItem, QTabWidget, QRadioButton, QFileSystemModel, QTreeWidgetItem, QTreeWidget, QPlainTextEdit, QButtonGroup, QTextBrowser, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox, QInputDialog
-)
-
-APP_NAME = "æ©˜å‘³å„¿éŸ³ä¹"
-VERSION = "3.2.8"
-STEM_ORDER = [
-    ("vocals", "ğŸ¤", "äººå£° Vocal"),
-    ("drums", "ğŸ¥", "é¼“ Drums"),
-    ("bass", "ğŸ¸", "è´æ–¯ Bass"),
-    ("guitar", "ğŸ¸", "æœ¨å‰ä»– A.Guitar"),
-    ("electric_guitar", "ğŸ¸", "ç”µå‰ä»– E.Guitar"),
-    ("piano", "ğŸ¹", "é’¢ç´ Piano"),
-    ("other", "ğŸ»", "å…¶ä»– Other"),
-]
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-STEMS_DIR = BASE_DIR / "stems"
-PROJECTS_DIR = BASE_DIR / "projects"
-EXPORTS_DIR = BASE_DIR / "exports"
-DESKTOP_SERVER_CONFIG = BASE_DIR / "config" / "desktop_server.json"
-
-ASSETS_DIR = BASE_DIR / "assets"
-ICONS_DIR = ASSETS_DIR / "icons"
-
-def asset_path(*parts):
-    return str(ASSETS_DIR.joinpath(*parts))
-
-def icon_path(name):
-    return str(ICONS_DIR / f"{name}.png")
-
-def apply_button_accent(button, accent):
-    button.setProperty("accent", accent)
-    button.style().unpolish(button)
-    button.style().polish(button)
-
-
-class SeparationWorker(QThread):
-    log = Signal(str)
-    model_progress = Signal(int, str)
-    separation_progress = Signal(int, str)
-    done = Signal(str)
-    failed = Signal(str)
-
-    MODEL_URL = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th"
-    MODEL_FILE = "5c90dfd2-34c22ccb.th"
-    MODEL_HASH_PREFIX = "34c22ccb"
-
-    def __init__(self, input_file: str):
-        super().__init__()
-        self.input_file = input_file
-
-    def _safe_streams(self):
-        # PyInstaller windowed EXE ä¸­ sys.stdout/sys.stderr å¯èƒ½ä¸º Noneã€‚
-        # æŸäº›ä¸‰æ–¹åº“ä»ä¼šå°è¯• write()ï¼Œå› æ­¤æä¾›å®‰å…¨çš„å†…å­˜è¾“å‡ºæµå…œåº•ã€‚
-        if sys.stdout is None:
-            sys.stdout = io.StringIO()
-        if sys.stderr is None:
-            sys.stderr = io.StringIO()
-
-    def _sha256_ok(self, path: Path) -> bool:
-        sha = hashlib.sha256()
-        with path.open('rb') as f:
-            while True:
-                b = f.read(1024 * 1024)
-                if not b:
-                    break
-                sha.update(b)
-        return sha.hexdigest().startswith(self.MODEL_HASH_PREFIX)
-
-    def _ensure_model(self):
-        import torch
-        cache_dir = Path(torch.hub.get_dir()) / "checkpoints"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        target = cache_dir / self.MODEL_FILE
-
-        if target.exists():
-            self.model_progress.emit(5, "æ£€æµ‹æœ¬åœ° AI æ¨¡å‹...")
-            try:
-                if self._sha256_ok(target):
-                    self.model_progress.emit(100, "AI å…­è½¨æ¨¡å‹å·²å®‰è£…ï¼Œæ— éœ€é‡å¤ä¸‹è½½")
-                    return target
-            except Exception:
-                pass
-            try:
-                target.unlink()
-            except Exception:
-                pass
-
-        part = target.with_suffix(target.suffix + ".part")
-        if part.exists():
-            try:
-                part.unlink()
-            except Exception:
-                pass
-
-        self.log.emit("é¦–æ¬¡ä½¿ç”¨ï¼šæ­£åœ¨ä¸‹è½½ UVR htdemucs_6s å…­è½¨æ¨¡å‹...")
-        self.model_progress.emit(0, "è¿æ¥ AI æ¨¡å‹æœåŠ¡å™¨...")
-
-        req = urllib.request.Request(
-            self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/3.2.8"}
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
-            total = int(resp.headers.get("Content-Length") or 0)
-            downloaded = 0
-            while True:
-                chunk = resp.read(1024 * 512)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = min(99, int(downloaded * 100 / total))
-                    mb1 = downloaded / 1024 / 1024
-                    mb2 = total / 1024 / 1024
-                    self.model_progress.emit(pct, f"ä¸‹è½½ AI æ¨¡å‹ {pct}%  ({mb1:.1f}/{mb2:.1f} MB)")
-                else:
-                    self.model_progress.emit(0, f"å·²ä¸‹è½½ {downloaded/1024/1024:.1f} MB")
-
-        self.model_progress.emit(99, "æ­£åœ¨æ ¡éªŒ AI æ¨¡å‹å®Œæ•´æ€§...")
-        if not self._sha256_ok(part):
-            try:
-                part.unlink()
-            except Exception:
-                pass
-            raise RuntimeError("AI æ¨¡å‹æ ¡éªŒå¤±è´¥ï¼Œä¸‹è½½æ–‡ä»¶å¯èƒ½ä¸å®Œæ•´ï¼Œè¯·é‡æ–°ä¸‹è½½ã€‚")
-
-        os.replace(part, target)
-        self.model_progress.emit(100, "AI å…­è½¨æ¨¡å‹ä¸‹è½½å®Œæˆ")
-        return target
-
-    def _separation_callback(self, info: dict):
-        try:
-            audio_length = max(1, int(info.get("audio_length", 1)))
-            offset = max(0, int(info.get("segment_offset", 0)))
-            state = info.get("state", "start")
-            pct = int(min(98, max(0, offset * 100 / audio_length)))
-            if state == "end":
-                pct = min(99, pct + 1)
-            self.separation_progress.emit(pct, f"AI å…­è½¨åˆ†ç¦»ä¸­ {pct}%")
-        except Exception:
-            pass
-
-    def run(self):
-        try:
-            self._safe_streams()
-            out_dir = STEMS_DIR
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.log.emit(f"UVR è¿ç®—è®¾å¤‡ï¼š{device.upper()}")
-
-            stem_dir, guitar_diagnostics = run_uvr_separation(
-                self.input_file,
-                out_dir,
-                device=device,
-                progress=lambda value, text: self.separation_progress.emit(int(value), str(text)),
-            )
-            self.separation_progress.emit(100, "UVR å…­è½¨ + ç‹¬ç«‹ç”µå‰ä»–åˆ†ç¦»å®Œæˆ")
-            self.log.emit(
-                "UVR å…­è½¨æ¨¡å‹å¤„ç†å®Œæˆï¼›å·²ç”Ÿæˆç‹¬ç«‹æœ¨å‰ä»–ä¸ç”µå‰ä»–è½¨ã€‚"
-                f" ç”µå‰ä»–æ´»è·ƒåº¦ {guitar_diagnostics['electric_activity']:.0%}ã€‚"
-            )
-            self.done.emit(str(stem_dir))
-        except Exception as e:
-            self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
-
-
-class PipelineStageWorker(QThread):
-    """Run CPU-heavy non-Qt stages without freezing the interface."""
-
-    succeeded = Signal()
-    failed = Signal(str)
-
-    def __init__(self, operation):
-        super().__init__()
-        self.operation = operation
-
-    def run(self):
-        try:
-            self.operation()
-            self.succeeded.emit()
-        except Exception as exc:
-            self.failed.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
-
-
-class ServerCatalogWorker(QThread):
-    """Fetch the server catalog without ever blocking the Windows UI thread."""
-
-    succeeded = Signal(int, object)
-    failed = Signal(int, str)
-
-    def __init__(self, request_id, client, query, category):
-        super().__init__()
-        self.request_id = int(request_id)
-        self.client = client
-        self.query = str(query)
-        self.category = str(category)
-
-    def run(self):
-        try:
-            self.succeeded.emit(
-                self.request_id,
-                self.client.songs(self.query, self.category),
-            )
-        except Exception as exc:
-            self.failed.emit(self.request_id, str(exc))
-
-
-class LinkDownloadWorker(QThread):
-    progress = Signal(int, str)
-    done = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, url, destination, ffmpeg_path=""):
-        super().__init__()
-        self.url = str(url).strip()
-        self.destination = Path(destination)
-        self.ffmpeg_path = str(ffmpeg_path or "")
-
-    def run(self):
-        try:
-            path = download_public_audio(
-                self.url, self.destination, self.ffmpeg_path,
-                lambda value, text: self.progress.emit(int(value), str(text)),
-            )
-            self.done.emit(str(path))
-        except Exception as exc:
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
-
-
-class RemoteLibraryJobWorker(QThread):
-    """Queue and monitor one server-owned library processing job."""
-
-    progress = Signal(int, str)
-    done = Signal(str, object)
-    failed = Signal(str)
-
-    def __init__(self, client, track_id, parent=None):
-        super().__init__(parent)
-        self.client = client
-        self.track_id = int(track_id)
-
-    def run(self):
-        try:
-            queued = self.client.queue_processing(self.track_id)
-            job_id = str(queued.get("job_id") or queued.get("id") or "")
-            if not job_id:
-                raise RuntimeError("æœåŠ¡å™¨æœªè¿”å› job_id")
-            while not self.isInterruptionRequested():
-                result = self.client.job(job_id)
-                status = str(result.get("status") or "processing").lower()
-                value = int(float(result.get("progress") or 0))
-                stage = str(result.get("stage") or "æœåŠ¡å™¨å¤„ç†ä¸­")
-                self.progress.emit(max(0, min(100, value)), stage)
-                if status in {"completed", "complete", "done", "success", "succeeded"}:
-                    self.done.emit(job_id, dict(result.get("artifacts") or {}))
-                    return
-                if status in {"failed", "error", "cancelled", "canceled"}:
-                    raise RuntimeError(str(result.get("error") or result.get("message") or "æœåŠ¡å™¨ä»»åŠ¡å¤±è´¥"))
-                self.msleep(2000)
-        except Exception as exc:
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
-
-
-class MultiStemEngine:
-    def __init__(self):
-        self.files = {}
-        self.stream = None
-        self.sample_rate = 44100
-        self.channels = 2
-        self.playing = False
-        self.paused = False
-        self.mute = {k: False for k, _, _ in STEM_ORDER}
-        self.solo = {k: False for k, _, _ in STEM_ORDER}
-        self.volume = {k: 0.9 for k, _, _ in STEM_ORDER}
-        self.frames_played = 0
-        self.total_frames = 0
-        self.speed = 1.0
-        self._io_lock = threading.RLock()
-
-    def load(self, stem_dir: Path):
-        self.close()
-        paths = {}
-        for key, _, _ in STEM_ORDER:
-            p = stem_dir / f"{key}.wav"
-            if not p.exists():
-                if key == "electric_guitar":
-                    continue
-                raise FileNotFoundError(f"ç¼ºå°‘éŸ³è½¨ï¼š{p.name}")
-            paths[key] = p
-
-        info = sf.info(str(paths["vocals"]))
-        self.sample_rate = info.samplerate
-        self.channels = info.channels
-        self.total_frames = info.frames
-        self.frames_played = 0
-
-        for key, p in paths.items():
-            f = sf.SoundFile(str(p), "r")
-            if f.samplerate != self.sample_rate or f.channels != self.channels:
-                f.close()
-                raise RuntimeError(f"{key}.wav çš„é‡‡æ ·ç‡æˆ–å£°é“ä¸å…¶ä»–éŸ³è½¨ä¸ä¸€è‡´")
-            self.files[key] = f
-
-    def _callback(self, outdata, frames, time_info, status):
-        if self.paused or not self.playing:
-            outdata.fill(0)
-            return
-
-        solos = [k for k, v in self.solo.items() if v]
-        active = set(solos) if solos else {k for k in self.files if not self.mute[k]}
-
-        source_frames = max(1, int(math.ceil(frames * self.speed)))
-        mix = np.zeros((frames, self.channels), dtype=np.float32)
-        valid_frames = frames
-
-        with self._io_lock:
-            for key, f in self.files.items():
-                data = f.read(source_frames, dtype="float32", always_2d=True)
-                n = len(data)
-                output_count = min(frames, max(0, int(n / self.speed)))
-                valid_frames = min(valid_frames, output_count)
-                if key in active and n and output_count:
-                    if n == output_count:
-                        rendered = data
-                    else:
-                        old_positions = np.arange(n, dtype=np.float32)
-                        new_positions = np.linspace(0, max(0, n - 1), output_count, dtype=np.float32)
-                        rendered = np.column_stack([
-                            np.interp(new_positions, old_positions, data[:, channel])
-                            for channel in range(self.channels)
-                        ]).astype(np.float32)
-                    mix[:output_count] += rendered * float(self.volume[key])
-            if self.files:
-                self.frames_played = min(int(f.tell()) for f in self.files.values())
-
-        if valid_frames <= 0:
-            outdata.fill(0)
-            self.playing = False
-            raise sd.CallbackStop()
-
-        # ç®€å•é˜²å‰Šæ³¢ã€‚åç»­ç‰ˆæœ¬ä¼šæ¢æˆ limiter / master busã€‚
-        peak = float(np.max(np.abs(mix))) if mix.size else 0.0
-        if peak > 1.0:
-            mix /= peak
-
-        outdata[:] = mix
-        if valid_frames < frames:
-            outdata[valid_frames:] = 0
-            self.playing = False
-            raise sd.CallbackStop()
-
-    def play(self):
-        if not self.files:
-            raise RuntimeError("è¿˜æ²¡æœ‰åŠ è½½åˆ†è½¨ã€‚")
-        if self.stream is None:
-            self.stream = sd.OutputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype="float32",
-                blocksize=1024,
-                callback=self._callback
-            )
-            self.stream.start()
-        self.playing = True
-        self.paused = False
-
-    def pause(self):
-        self.paused = True
-
-    def resume(self):
-        if not self.files:
-            return
-        if self.stream is None:
-            self.play()
-        else:
-            self.playing = True
-            self.paused = False
-
-    def stop(self):
-        self.playing = False
-        self.paused = False
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
-        for f in self.files.values():
-            try:
-                f.seek(0)
-            except Exception:
-                pass
-        self.frames_played = 0
-
-    def close(self):
-        self.stop()
-        for f in self.files.values():
-            try:
-                f.close()
-            except Exception:
-                pass
-        self.files = {}
-
-    def seek_ratio(self, ratio: float):
-        if not self.files or self.total_frames <= 0:
-            return
-        pos = int(max(0.0, min(1.0, ratio)) * self.total_frames)
-        with self._io_lock:
-            for f in self.files.values():
-                f.seek(pos)
-            self.frames_played = pos
-
-    def set_speed(self, value: float):
-        self.speed = max(0.5, min(1.5, float(value)))
-
-    def position_seconds(self):
-        return self.frames_played / self.sample_rate if self.sample_rate else 0
-
-    def duration_seconds(self):
-        return self.total_frames / self.sample_rate if self.sample_rate else 0
-
-class TrackRow(QWidget):
-    changed = Signal()
-    def __init__(self, key, icon, name):
-        super().__init__()
-        self.key = key
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 5, 8, 5)
-
-        label = QLabel(f"{icon}  {name}")
-        track_colors = {"vocals":"#B071FF","drums":"#FF8B3D","bass":"#3CA8FF","guitar":"#75E44C","electric_guitar":"#FF5B65","piano":"#35D6D0","other":"#F4C04C"}
-        label.setStyleSheet(f"font-weight:700;color:{track_colors.get(key, '#EAF0FF')};")
-        label.setMinimumWidth(170)
-        self.mute = QPushButton("M")
-        self.mute.setCheckable(True)
-        self.mute.setFixedWidth(42)
-        self.solo = QPushButton("S")
-        self.solo.setCheckable(True)
-        self.solo.setFixedWidth(42)
-        self.volume = QSlider(Qt.Horizontal)
-        self.volume.setRange(0, 120)
-        self.volume.setValue(90)
-        self.value_label = QLabel("90%")
-        self.value_label.setFixedWidth(45)
-
-        self.mute.toggled.connect(lambda _: self.changed.emit())
-        self.solo.toggled.connect(lambda _: self.changed.emit())
-        self.volume.valueChanged.connect(self.on_volume)
-
-        layout.addWidget(label)
-        layout.addWidget(self.mute)
-        layout.addWidget(self.solo)
-        layout.addWidget(QLabel("éŸ³é‡"))
-        layout.addWidget(self.volume, 1)
-        layout.addWidget(self.value_label)
-
-    def on_volume(self, v):
-        self.value_label.setText(f"{v}%")
-        self.changed.emit()
-
-class StudioPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        layout = QVBoxLayout(self)
-
-        title = QLabel("AI å…­è½¨åˆ†ç¦» + ç”µå‰ä»–äºŒæ¬¡åˆ†ç¦» / å¤šè½¨å·¥ä½œå°")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        file_row = QHBoxLayout()
-        self.file_label = QLabel("å°šæœªå¯¼å…¥æ­Œæ›²")
-        btn_import = QPushButton(QIcon(icon_path("import")), "å¯¼å…¥æ­Œæ›²")
-        btn_import.clicked.connect(main.import_song)
-        self.btn_split = QPushButton(QIcon(icon_path("split")), "AI å…­è½¨åˆ†ç¦» + ç”µå‰ä»–äºŒæ¬¡åˆ†ç¦»")
-        apply_button_accent(self.btn_split, "primary")
-        self.btn_split.clicked.connect(main.start_separation)
-        file_row.addWidget(self.file_label, 1)
-        file_row.addWidget(btn_import)
-        file_row.addWidget(self.btn_split)
-        layout.addLayout(file_row)
-
-        transport = QHBoxLayout()
-        self.play_btn = QPushButton(QIcon(icon_path("play")), "æ’­æ”¾")
-        apply_button_accent(self.play_btn, "primary")
-        self.play_btn.clicked.connect(main.play_pause)
-        stop_btn = QPushButton(QIcon(icon_path("stop")), "åœæ­¢")
-        apply_button_accent(stop_btn, "danger")
-        stop_btn.clicked.connect(main.stop)
-        self.timeline = QSlider(Qt.Horizontal)
-        self.timeline.setRange(0, 1000)
-        self.timeline.sliderPressed.connect(main.begin_timeline_seek)
-        self.timeline.sliderMoved.connect(main.preview_timeline_seek)
-        self.timeline.sliderReleased.connect(main.seek_from_slider)
-        self.time_label = QLabel("00:00 / 00:00")
-        transport.addWidget(self.play_btn)
-        transport.addWidget(stop_btn)
-        transport.addWidget(self.timeline, 1)
-        transport.addWidget(self.time_label)
-        layout.addLayout(transport)
-
-        self.waveform = WaveformWidget()
-        self.waveform.seekRequested.connect(main.seek_ratio_direct)
-        layout.addWidget(self.waveform)
-
-        analysis_row = QHBoxLayout()
-        self.bpm_label = QLabel("BPMï¼šæœªåˆ†æ")
-        self.key_label = QLabel("è°ƒæ€§ï¼šæœªåˆ†æ")
-        analyze_btn = QPushButton("åˆ†æ BPM / è°ƒæ€§")
-        analyze_btn.clicked.connect(main.analyze_music)
-        add_marker_btn = QPushButton("å½“å‰ä½ç½®æ·»åŠ  Marker")
-        add_marker_btn.clicked.connect(main.add_marker)
-        analysis_row.addWidget(self.bpm_label)
-        analysis_row.addWidget(self.key_label)
-        analysis_row.addWidget(analyze_btn)
-        analysis_row.addWidget(add_marker_btn)
-        analysis_row.addStretch(1)
-        layout.addLayout(analysis_row)
-
-
-        box = QGroupBox("çœŸå®ç‹¬ç«‹ Stem æ··éŸ³å™¨")
-        box_l = QVBoxLayout(box)
-        self.rows = {}
-        for key, icon, name in STEM_ORDER:
-            row = TrackRow(key, icon, name)
-            row.changed.connect(main.sync_mix_controls)
-            self.rows[key] = row
-            box_l.addWidget(row)
-        layout.addWidget(box)
-
-        model_box = QGroupBox("AI æ¨¡å‹")
-        model_l = QVBoxLayout(model_box)
-        self.model_status = QLabel("é¦–æ¬¡ä½¿ç”¨æ—¶ä¼šä¸‹è½½ UVR htdemucs_6sï¼›å®Œæˆåç”Ÿæˆç‹¬ç«‹ç”µå‰ä»–è½¨")
-        self.model_progress = QProgressBar()
-        self.model_progress.setRange(0, 100)
-        self.model_progress.setValue(0)
-        self.model_progress.setFormat("æ¨¡å‹ä¸‹è½½ %p%")
-        model_l.addWidget(self.model_status)
-        model_l.addWidget(self.model_progress)
-        layout.addWidget(model_box)
-
-        split_box = QGroupBox("å…­è½¨åŸºç¡€åˆ†ç¦»ä¸ç”µå‰ä»–äºŒæ¬¡è¯†åˆ«è¿›åº¦")
-        split_l = QVBoxLayout(split_box)
-        self.split_status = QLabel("ç­‰å¾…å¼€å§‹")
-        self.split_progress = QProgressBar()
-        self.split_progress.setRange(0, 100)
-        self.split_progress.setValue(0)
-        self.split_progress.setFormat("åˆ†è½¨å¤„ç† %p%")
-        split_l.addWidget(self.split_status)
-        split_l.addWidget(self.split_progress)
-        layout.addWidget(split_box)
-
-        self.log = QLabel("ç­‰å¾…ä»»åŠ¡...")
-        self.log.setWordWrap(True)
-        self.log.setMinimumHeight(60)
-        layout.addWidget(self.log)
-
-        bottom = QHBoxLayout()
-        save = QPushButton("ä¿å­˜å·¥ç¨‹")
-        save.clicked.connect(main.save_project)
-        export = QPushButton(QIcon(icon_path("export")), "å¯¼å‡ºå½“å‰æ··éŸ³ WAV")
-        apply_button_accent(export, "success")
-        export.clicked.connect(main.export_mix)
-        bottom.addWidget(save)
-        bottom.addWidget(export)
-        bottom.addStretch(1)
-        layout.addLayout(bottom)
-
-class LivePage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        layout = QVBoxLayout(self)
-
-        title = QLabel("ç°åœºæ¼”å‡ºæ¨¡å¼")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        info = QLabel(
-            "AI åˆ†è½¨åªåœ¨æ¼”å‡ºå‰å®Œæˆï¼›æ­£å¼æ¼”å‡ºæ—¶ç›´æ¥è¯»å–æœ¬åœ° Stemã€‚\n"
-            "é€‰æ‹©æ¼”å‡ºèº«ä»½åï¼Œå¯¹åº”ä¹å™¨ä¼šç«‹å³é™éŸ³ï¼Œå…¶ä»–è½¨é“ç»§ç»­ä¿æŒåŒä¸€æ—¶é—´è½´åŒæ­¥æ’­æ”¾ã€‚"
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        grid = QGridLayout()
-        presets = [
-            ("ğŸ¸ å‰ä»–å¼¹å”±", "guitar"),
-            ("ğŸ¹ é’¢ç´å¼¹å”±", "piano"),
-            ("ğŸ¥ é¼“æ‰‹æ¼”å‡º", "drums"),
-            ("ğŸ¸ è´æ–¯æ¼”å‡º", "bass"),
-            ("ğŸ¤ çº¯ä¼´å¥/KTV", "vocals"),
-            ("ğŸ¼ å…¨éƒ¨æ¢å¤", None),
-        ]
-        for i, (text, key) in enumerate(presets):
-            b = QPushButton(text)
-            b.setMinimumHeight(60)
-            b.clicked.connect(lambda checked=False, k=key: main.apply_live_preset(k))
-            grid.addWidget(b, i//2, i%2)
-        layout.addLayout(grid)
-
-        
-        count_box = QGroupBox("èµ·å¥è¾…åŠ©")
-        cl = QHBoxLayout(count_box)
-        self.count_in = QCheckBox("4æ‹ Count-inï¼ˆç•Œé¢å€’è®¡æ—¶ï¼‰")
-        self.count_in.setChecked(True)
-        self.count_label = QLabel("READY")
-        self.count_label.setStyleSheet("font-size:28px;font-weight:900")
-        count_btn = QPushButton("4æ‹å€’è®¡æ—¶åå¼€å§‹")
-        count_btn.clicked.connect(self.start_count_in)
-        cl.addWidget(self.count_in)
-        cl.addWidget(self.count_label)
-        cl.addWidget(count_btn)
-        layout.addWidget(count_box)
-
-        self.status = QLabel("å½“å‰é¢„è®¾ï¼šå…¨éƒ¨éŸ³è½¨å¼€å¯")
-        self.status.setObjectName("StatusGood")
-        layout.addWidget(self.status)
-
-        play = QPushButton("â–¶ å¼€å§‹ / æš‚åœç°åœºæ’­æ”¾")
-        play.setMinimumHeight(60)
-        play.clicked.connect(main.play_pause)
-        layout.addWidget(play)
-        layout.addStretch(1)
-
-
-    def start_count_in(self):
-        if not self.count_in.isChecked():
-            self.main.play_pause()
-            return
-        self._count = 4
-        self.count_label.setText(str(self._count))
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(700)
-
-    def _tick(self):
-        self._count -= 1
-        if self._count <= 0:
-            self._timer.stop()
-            self.count_label.setText("GO")
-            self.main.play_pause()
-            QTimer.singleShot(1200, lambda: self.count_label.setText("READY"))
-        else:
-            self.count_label.setText(str(self._count))
-
-
-class Placeholder(QWidget):
-    def __init__(self, text):
-        super().__init__()
-        l = QVBoxLayout(self)
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:22px")
-        l.addWidget(label)
-
-
-class SettingsPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        layout = QVBoxLayout(self)
-        title = QLabel("éŸ³é¢‘ / GPU / ç°åœºè®¾ç½®")
-        title.setStyleSheet("font-size:24px;font-weight:800")
-        layout.addWidget(title)
-
-        gpu_box = QGroupBox("AI è¿ç®—è®¾å¤‡")
-        gl = QVBoxLayout(gpu_box)
-        self.gpu_status = QLabel("å°šæœªæ£€æµ‹")
-        detect = QPushButton("æ£€æµ‹ NVIDIA GPU / CUDA")
-        detect.clicked.connect(self.detect_gpu)
-        gl.addWidget(self.gpu_status)
-        gl.addWidget(detect)
-        layout.addWidget(gpu_box)
-
-        audio_box = QGroupBox("ç°åœºéŸ³é¢‘è®¾å¤‡")
-        al = QGridLayout(audio_box)
-        self.output_combo = QComboBox()
-        self.refresh_audio_devices()
-        refresh = QPushButton("åˆ·æ–°è®¾å¤‡")
-        refresh.clicked.connect(self.refresh_audio_devices)
-        self.block_combo = QComboBox()
-        self.block_combo.addItems(["256", "512", "1024", "2048"])
-        self.block_combo.setCurrentText("1024")
-        al.addWidget(QLabel("ä¸»è¾“å‡ºè®¾å¤‡"), 0, 0)
-        al.addWidget(self.output_combo, 0, 1)
-        al.addWidget(refresh, 0, 2)
-        al.addWidget(QLabel("éŸ³é¢‘ç¼“å†² Blocksize"), 1, 0)
-        al.addWidget(self.block_combo, 1, 1)
-        layout.addWidget(audio_box)
-
-        live_box = QGroupBox("ç°åœºå®‰å…¨")
-        ll = QVBoxLayout(live_box)
-        self.offline = QCheckBox("æ¼”å‡ºæ¨¡å¼ä¼˜å…ˆä½¿ç”¨æœ¬åœ° Stemï¼Œä¸ä¾èµ–ç½‘ç»œ")
-        self.offline.setChecked(True)
-        self.prevent_sleep = QCheckBox("æ¼”å‡ºæ—¶å»ºè®®å…³é—­ç³»ç»Ÿç¡çœ /è‡ªåŠ¨ä¼‘çœ ")
-        self.prevent_sleep.setChecked(True)
-        ll.addWidget(self.offline)
-        ll.addWidget(self.prevent_sleep)
-        layout.addWidget(live_box)
-
-        server_box = QGroupBox("AI æœåŠ¡å™¨ï¼ˆæœåŠ¡å™¨ G ç›˜æ›²åº“æ¥æºï¼‰")
-        server_layout = QGridLayout(server_box)
-        server_config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
-        self.server_edit = QLineEdit(server_config["server"])
-        self.server_edit.setPlaceholderText("https://api.example.com")
-        self.server_token_edit = QLineEdit(server_config["token"])
-        self.server_token_edit.setEchoMode(QLineEdit.Password)
-        self.server_token_edit.setPlaceholderText("è®¿é—®ä»¤ç‰Œï¼ˆæœåŠ¡å™¨æœªè®¾ç½®æ—¶å¯ç•™ç©ºï¼‰")
-        save_server = QPushButton("ä¿å­˜å¹¶åˆ·æ–°æ›²åº“")
-        test_server = QPushButton("æµ‹è¯•æœåŠ¡å™¨æ›²åº“")
-        apply_button_accent(save_server, "primary")
-        save_server.clicked.connect(self.save_server)
-        test_server.clicked.connect(self.test_server)
-        server_layout.addWidget(QLabel("æœåŠ¡å™¨åœ°å€"), 0, 0)
-        server_layout.addWidget(self.server_edit, 0, 1, 1, 3)
-        server_layout.addWidget(QLabel("è®¿é—®ä»¤ç‰Œ"), 1, 0)
-        server_layout.addWidget(self.server_token_edit, 1, 1, 1, 3)
-        server_layout.addWidget(save_server, 2, 1)
-        server_layout.addWidget(test_server, 2, 2)
-        server_layout.addWidget(QLabel("æ›²åº“å¿…é¡»ç”±æœåŠ¡å™¨ API è¯»å–ï¼Œä¸ä¼šæ‰«æå®¢æˆ·ç«¯ G ç›˜ã€‚"), 3, 0, 1, 4)
-        layout.addWidget(server_box)
-
-        legal_box = QGroupBox("åè®®ã€å¸®åŠ©ä¸å…³äº")
-        legal_layout = QHBoxLayout(legal_box)
-        documents = {
-            "å¼€æºè½¯ä»¶å£°æ˜": "æœ¬è½¯ä»¶ä½¿ç”¨ PySide6ã€FastAPIã€PyTorchã€Demucsã€audio-separator/UVRã€NumPyã€SciPyã€librosa ç­‰å¼€æºç»„ä»¶ã€‚å„ç»„ä»¶çš„ç‰ˆæƒä¸è®¸å¯æ¡æ¬¾ä»¥éšåŒ…è®¸å¯è¯åŠå®˜æ–¹å£°æ˜ä¸ºå‡†ã€‚",
-            "éšç§æ”¿ç­–": "è½¯ä»¶ä»…åœ¨ç”¨æˆ·ä¸»åŠ¨æ“ä½œæ—¶å¤„ç†å¯¼å…¥çš„éŸ³é¢‘ã€ä»»åŠ¡å‚æ•°ã€è´¦å·ä¸åé¦ˆä¿¡æ¯ã€‚æ‰‹æœº AI ä»»åŠ¡ä¼šä¸Šä¼ è‡³é…ç½®çš„ AI æœåŠ¡å™¨ã€‚",
-            "ç”¨æˆ·åè®®": "æœ¬è½¯ä»¶ç›®å‰ä»…ä¾›å­¦ä¹ ä¸ç ”ç©¶ä½¿ç”¨ï¼Œä¸æä¾›æ­Œæ›²ä¸‹è½½æœåŠ¡ã€‚åªèƒ½å¯¼å…¥è‡ªå·±åˆ›ä½œã€å·²è·æˆæƒæˆ–ä¾æ³•å¯ä½¿ç”¨çš„éŸ³é¢‘ï¼›AI ç»“æœé¡»äººå·¥å¤æ ¸ã€‚",
-            "å¸®åŠ©ä¸åé¦ˆ": "å¦‚é‡åˆ°åˆ†è½¨ã€è°±é¢ã€æ­Œè¯æˆ–è¿æ¥é—®é¢˜ï¼Œè¯·è®°å½•è½¯ä»¶ç‰ˆæœ¬ã€æ­Œæ›²æ ¼å¼ã€æ“ä½œæ­¥éª¤å’Œé”™è¯¯ä¿¡æ¯ååé¦ˆã€‚",
-            "å…³äºè½¯ä»¶": f"{APP_NAME} v{VERSION}\nAI å…­è½¨+ç”µå‰ä»–ã€äº”çº¿è°±/å…­çº¿è°±/æ­Œè¯åŒæ­¥ã€AI æ­Œè¯ä¸ç°åœºæ¼”å‡ºå·¥ä½œç«™ã€‚",
-        }
-        for name, text in documents.items():
-            button = QPushButton(name)
-            button.clicked.connect(lambda checked=False, n=name, t=text: self.show_document(n, t))
-            legal_layout.addWidget(button)
-        layout.addWidget(legal_box)
-        study_notice = QLabel("æœ¬è½¯ä»¶ç›®å‰ä»…ä¾›å­¦ä¹ ä¸ç ”ç©¶ä½¿ç”¨ï¼Œä¸æä¾›æ­Œæ›²ä¸‹è½½æœåŠ¡ã€‚")
-        study_notice.setObjectName("SectionHint")
-        layout.addWidget(study_notice)
-        layout.addStretch(1)
-
-    def save_server(self):
-        server = self.server_edit.text().strip().rstrip("/") or DEFAULT_SERVER_URL
-        token = self.server_token_edit.text().strip()
-        atomic_write_json(DESKTOP_SERVER_CONFIG, {"server": server, "token": token})
-        self.server_edit.setText(server)
-        if hasattr(self.main, "music_library"):
-            self.main.music_library.refresh_library()
-        QMessageBox.information(self, "AI æœåŠ¡å™¨", "æœåŠ¡å™¨åœ°å€å·²ä¿å­˜ï¼Œå·²åˆ·æ–°æœåŠ¡å™¨ G ç›˜æ›²åº“ã€‚")
-
-    def test_server(self):
-        try:
-            server = self.server_edit.text().strip().rstrip("/") or DEFAULT_SERVER_URL
-            token = self.server_token_edit.text().strip()
-            client = ServerLibraryClient(server, token, timeout=12)
-            health = client.health()
-            catalog = client.songs()
-            root = catalog.get("server_library_root", "æœªè¿”å›è·¯å¾„")
-            lyric_asr = "å·²å®‰è£…" if health.get("lyrics_asr_available") else "æœªå®‰è£…ï¼ˆä»…ä½¿ç”¨åŒå LRC/å†…åµŒæ­Œè¯ï¼‰"
-            QMessageBox.information(
-                self, "æœåŠ¡å™¨æ›²åº“è¿æ¥æˆåŠŸ",
-                f"æœåŠ¡çŠ¶æ€ï¼š{health.get('status', 'online')}\n"
-                f"æœåŠ¡å™¨æ›²åº“ï¼š{root}\n"
-                f"å·²å…¥åº“æ­Œæ›²ï¼š{catalog.get('count', 0)} é¦–\n"
-                f"æ­Œè¯è¯†åˆ«æ¨¡å‹ï¼š{lyric_asr}",
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "æœåŠ¡å™¨æ›²åº“è¿æ¥å¤±è´¥", str(exc))
-
-    def show_document(self, title, text):
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.resize(720, 520)
-        layout = QVBoxLayout(dialog)
-        browser = QTextBrowser()
-        browser.setPlainText(text)
-        layout.addWidget(browser)
-        close = QPushButton("å…³é—­")
-        close.clicked.connect(dialog.accept)
-        layout.addWidget(close)
-        dialog.exec()
-
-    def refresh_audio_devices(self):
-        current = self.output_combo.currentText() if hasattr(self, "output_combo") else ""
-        if hasattr(self, "output_combo"):
-            self.output_combo.clear()
-        try:
-            devices = sd.query_devices()
-            for i, d in enumerate(devices):
-                if d["max_output_channels"] > 0:
-                    self.output_combo.addItem(f'{i}: {d["name"]}', i)
-            if current:
-                idx = self.output_combo.findText(current)
-                if idx >= 0:
-                    self.output_combo.setCurrentIndex(idx)
-        except Exception as e:
-            self.output_combo.addItem("è®¾å¤‡è¯»å–å¤±è´¥")
-
-    def detect_gpu(self):
-        lines = [f"ç³»ç»Ÿï¼š{platform.system()} {platform.release()}"]
-        try:
-            p = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
-                                "--format=csv,noheader"], capture_output=True, text=True, timeout=8)
-            if p.returncode == 0 and p.stdout.strip():
-                lines.append("NVIDIA GPUï¼š" + p.stdout.strip())
-            else:
-                lines.append("æœªæ£€æµ‹åˆ°å¯ç”¨çš„ nvidia-smiã€‚")
-        except Exception:
-            lines.append("æœªæ£€æµ‹åˆ° NVIDIA é©±åŠ¨æˆ– nvidia-smiã€‚")
-        try:
-            import torch
-            lines.append(f"PyTorchï¼š{torch.__version__}")
-            lines.append(f"CUDAå¯ç”¨ï¼š{'æ˜¯' if torch.cuda.is_available() else 'å¦'}")
-            if torch.cuda.is_available():
-                lines.append(f"CUDAè®¾å¤‡ï¼š{torch.cuda.get_device_name(0)}")
-        except Exception:
-            lines.append("PyTorchï¼šå°šæœªå®‰è£…/æ— æ³•è¯»å–")
-        self.gpu_status.setText("\n".join(lines))
-
-
-class WaveformWidget(QWidget):
-    """è½»é‡æ³¢å½¢æ˜¾ç¤ºï¼Œä¸ä¾èµ–é¢å¤–ç»˜å›¾åº“ã€‚"""
-    seekRequested = Signal(float)
-
-    def __init__(self):
-        super().__init__()
-        self.samples = []
-        self.position = 0.0
-        self.markers = []
-        self.setMinimumHeight(120)
-
-    def set_waveform_from_wav(self, path):
-        self.samples = []
-        try:
-            data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-            if len(data) == 0:
-                return
-            mono = np.mean(data, axis=1)
-            target = 1200
-            step = max(1, len(mono)//target)
-            for i in range(0, len(mono), step):
-                chunk = mono[i:i+step]
-                if len(chunk):
-                    self.samples.append(float(np.max(np.abs(chunk))))
-        except Exception:
-            self.samples = []
-        self.update()
-
-    def set_position(self, ratio):
-        self.position = max(0.0, min(1.0, ratio))
-        self.update()
-
-    def set_markers(self, markers):
-        self.markers = markers or []
-        self.update()
-
-    def mousePressEvent(self, event):
-        if self.width() > 0:
-            ratio = max(0.0, min(1.0, event.position().x()/self.width()))
-            self.seekRequested.emit(ratio)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        w, h = self.width(), self.height()
-        p.fillRect(self.rect(), QColor(24, 27, 33))
-        mid = h/2
-        if self.samples:
-            pen = QPen(QColor(120, 180, 240))
-            p.setPen(pen)
-            n = len(self.samples)
-            for x in range(w):
-                idx = min(n-1, int(x*n/max(1,w)))
-                amp = self.samples[idx] * (h*0.42)
-                p.drawLine(x, int(mid-amp), x, int(mid+amp))
-        # markers
-        for m in self.markers:
-            try:
-                ratio = float(m.get("ratio", 0))
-                x = int(ratio*w)
-                p.setPen(QPen(QColor(240, 190, 80)))
-                p.drawLine(x, 0, x, h)
-                p.drawText(x+3, 14, str(m.get("name","")))
-            except Exception:
-                pass
-        # playhead
-        p.setPen(QPen(QColor(255,255,255), 2))
-        x = int(self.position*w)
-        p.drawLine(x, 0, x, h)
-
-
-class MarkerDialog(QDialog):
-    def __init__(self, parent=None, default_name="å‰¯æ­Œ"):
-        super().__init__(parent)
-        self.setWindowTitle("æ·»åŠ æ®µè½ Marker")
-        lay = QFormLayout(self)
-        self.name_edit = QLineEdit(default_name)
-        lay.addRow("åç§°", self.name_edit)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        lay.addRow(buttons)
-
-    def name(self):
-        return self.name_edit.text().strip() or "Marker"
-
-
-
-
-class MetronomeEngine:
-    """ç‹¬ç«‹è€³è¿”èŠ‚æ‹å™¨ï¼Œå¯è¾“å‡ºåˆ°æŒ‡å®šå£°å¡ï¼Œä¸è¿›å…¥ä¸»æ‰©ã€‚"""
-    def __init__(self):
-        self.stream = None
-        self.device = None
-        self.bpm = 120.0
-        self.sample_rate = 44100
-        self.enabled = False
-        self.frame_pos = 0
-        self.click_frames = int(self.sample_rate * 0.035)
-
-    def start(self, device=None, bpm=120.0):
-        self.stop()
-        self.device = device
-        self.bpm = max(30.0, min(300.0, float(bpm or 120.0)))
-        self.enabled = True
-        self.frame_pos = 0
-        self.stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            channels=2,
-            dtype="float32",
-            blocksize=512,
-            device=device,
-            callback=self._callback
-        )
-        self.stream.start()
-
-    def _callback(self, outdata, frames, time_info, status):
-        outdata.fill(0)
-        if not self.enabled:
-            return
-        beat_interval = int(self.sample_rate * 60.0 / self.bpm)
-        for i in range(frames):
-            absolute = self.frame_pos + i
-            phase = absolute % beat_interval
-            if phase < self.click_frames:
-                # çŸ­è¡°å‡ clickï¼›åªé€è€³è¿”è®¾å¤‡ã€‚
-                env = 1.0 - (phase / max(1, self.click_frames))
-                tone = math.sin(2.0 * math.pi * 1200.0 * phase / self.sample_rate)
-                v = float(0.24 * env * tone)
-                outdata[i,0] = v
-                outdata[i,1] = v
-        self.frame_pos += frames
-
-    def stop(self):
-        self.enabled = False
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-        self.stream = None
-
-
-class MidiWorker(QThread):
-    action = Signal(str)
-    status = Signal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._running = True
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        try:
-            import mido
-            names = mido.get_input_names()
-            if not names:
-                self.status.emit("æœªæ£€æµ‹åˆ° MIDI è¾“å…¥è®¾å¤‡")
-                return
-            self.status.emit("MIDI å·²è¿æ¥ï¼š" + names[0])
-            # é»˜è®¤é‡‡ç”¨ç¬¬ä¸€ä¸ªè¾“å…¥è®¾å¤‡ã€‚åç»­å¯å¢åŠ è®¾å¤‡é€‰æ‹©ã€‚
-            with mido.open_input(names[0]) as port:
-                while self._running:
-                    msg = port.poll()
-                    if msg is not None and getattr(msg, "type", "") in ("note_on", "control_change"):
-                        if msg.type == "note_on" and getattr(msg, "velocity", 0) == 0:
-                            continue
-                        code = getattr(msg, "note", None)
-                        if code is None:
-                            code = getattr(msg, "control", None)
-                        mapping = {
-                            36: "play_pause",
-                            37: "stop",
-                            38: "next",
-                            39: "previous",
-                        }
-                        if code in mapping:
-                            self.action.emit(mapping[code])
-                    self.msleep(10)
-        except Exception as e:
-            self.status.emit("MIDI ç›‘å¬å¤±è´¥ï¼š" + str(e))
-
-
-class SetlistPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.items = []
-        layout = QVBoxLayout(self)
-
-        title = QLabel("Setlist æ¼”å‡ºæ­Œå•")
-        title.setStyleSheet("font-size:24px;font-weight:800")
-        layout.addWidget(title)
-
-        bar = QHBoxLayout()
-        add_current_btn = QPushButton("åŠ å…¥å½“å‰ G ç›˜æ­Œæ›²")
-        apply_button_accent(add_current_btn, "primary")
-        add_current_btn.clicked.connect(self.add_current_song)
-        add_btn = QPushButton("æ·»åŠ æœ¬åœ°æ–‡ä»¶")
-        add_btn.clicked.connect(self.add_song)
-        remove_btn = QPushButton("åˆ é™¤æ‰€é€‰")
-        remove_btn.clicked.connect(self.remove_selected)
-        up_btn = QPushButton("ä¸Šç§»")
-        up_btn.clicked.connect(lambda: self.move_selected(-1))
-        down_btn = QPushButton("ä¸‹ç§»")
-        down_btn.clicked.connect(lambda: self.move_selected(1))
-        load_btn = QPushButton("è½½å…¥æ‰€é€‰æ­Œæ›²")
-        load_btn.clicked.connect(self.load_selected)
-        self.auto_next = QCheckBox("æ’­æ”¾ç»“æŸè‡ªåŠ¨ä¸‹ä¸€é¦–")
-        self.auto_next.setChecked(True)
-        for w in [add_current_btn, add_btn, remove_btn, up_btn, down_btn, load_btn, self.auto_next]:
-            bar.addWidget(w)
-        bar.addStretch(1)
-        layout.addLayout(bar)
-
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["åºå·","æ­Œæ›²","æ¨¡å¼","è°ƒæ€§","é€Ÿåº¦"])
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self.table)
-
-        tips = QLabel("å»ºè®®æ¼”å‡ºå‰å…ˆæŠŠæ‰€æœ‰æ­Œæ›²å®Œæˆ AI åˆ†è½¨å¹¶ä¿å­˜å·¥ç¨‹ï¼Œç°åœºåªè¯»å–æœ¬åœ° Stemã€‚")
-        tips.setWordWrap(True)
-        layout.addWidget(tips)
-
-    def add_song(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "æ·»åŠ æ¼”å‡ºæ­Œæ›²", "", "éŸ³é¢‘ (*.mp3 *.wav *.flac *.m4a *.aac)"
-        )
-        for p in files:
-            if p not in [x["path"] for x in self.items]:
-                self.items.append({"path":p,"mode":"å…¨éƒ¨å¼€å¯","key":"åŸè°ƒ","speed":"100%"})
-        self.refresh()
-
-    def add_current_song(self):
-        path = str(self.main.song_file or "")
-        if not path or not Path(path).exists():
-            QMessageBox.information(self, "Setlist", "è¯·å…ˆä»å·¦ä¾§çš„ G ç›˜æ­Œæ›²åº“é€‰æ‹©ä¸€é¦–æ­Œæ›²ã€‚")
-            self.main.open_g_drive_library()
-            return
-        if path not in [item["path"] for item in self.items]:
-            self.items.append({"path": path, "mode": "å…¨éƒ¨å¼€å¯", "key": "åŸè°ƒ", "speed": "100%"})
-        self.refresh()
-        if self.items:
-            self.table.selectRow(len(self.items) - 1)
-
-    def refresh(self):
-        self.table.setRowCount(len(self.items))
-        for i, item in enumerate(self.items):
-            vals = [str(i+1), Path(item["path"]).name, item["mode"], item["key"], item["speed"]]
-            for c,v in enumerate(vals):
-                self.table.setItem(i,c,QTableWidgetItem(v))
-
-    def remove_selected(self):
-        r = self.table.currentRow()
-        if 0 <= r < len(self.items):
-            self.items.pop(r)
-            self.refresh()
-
-    def move_selected(self, delta):
-        r = self.table.currentRow()
-        nr = r + delta
-        if 0 <= r < len(self.items) and 0 <= nr < len(self.items):
-            self.items[r], self.items[nr] = self.items[nr], self.items[r]
-            self.refresh()
-            self.table.selectRow(nr)
-
-    def load_selected(self):
-        r = self.table.currentRow()
-        if 0 <= r < len(self.items):
-            self.main.load_imported_working_file(self.items[r]["path"])
-            QMessageBox.information(self, "Setlist", "æ­Œæ›²å·²è½½å…¥ã€‚è‹¥è¯¥æ­Œæ›²å°šæœªåˆ†è½¨ï¼Œè¯·å…ˆæ‰§è¡Œ AI å…­è½¨åˆ†ç¦»ã€‚")
-
-    def current_index(self):
-        r = self.table.currentRow()
-        return r if 0 <= r < len(self.items) else -1
-
-    def select_index(self, index):
-        if 0 <= index < len(self.items):
-            self.table.selectRow(index)
-            return True
-        return False
-
-    def next_index(self):
-        if not self.items:
-            return -1
-        r = self.current_index()
-        return 0 if r < 0 else (r + 1 if r + 1 < len(self.items) else -1)
-
-    def previous_index(self):
-        if not self.items:
-            return -1
-        r = self.current_index()
-        return 0 if r <= 0 else r - 1
-
-
-class LiveProPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        layout = QVBoxLayout(self)
-
-        title = QLabel("ç°åœºæ¼”å‡º Pro")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        top = QHBoxLayout()
-        self.lock_btn = QPushButton("ğŸ”“ æ¼”å‡ºæœªé”å®š")
-        self.lock_btn.setCheckable(True)
-        self.lock_btn.toggled.connect(self.toggle_lock)
-        self.panic_btn = QPushButton("â–  ç´§æ€¥åœæ­¢")
-        self.panic_btn.setMinimumHeight(52)
-        self.panic_btn.clicked.connect(main.stop)
-        top.addWidget(self.lock_btn)
-        top.addWidget(self.panic_btn)
-        top.addStretch(1)
-        layout.addLayout(top)
-
-        preset = QGroupBox("æ¼”å‡ºèº«ä»½")
-        pg = QGridLayout(preset)
-        modes = [
-            ("ğŸ¸ æœ¨å‰ä»–å¼¹å”±","guitar"),("ğŸ¸ ç”µå‰ä»–æ‰‹","electric_guitar"),
-            ("ğŸ¹ é’¢ç´å¼¹å”±","piano"),
-            ("ğŸ¥ é¼“æ‰‹","drums"),("ğŸ¸ è´æ–¯æ‰‹","bass"),
-            ("ğŸ¤ KTV/çº¯ä¼´å¥","vocals"),("ğŸ¼ å…¨éƒ¨æ¢å¤",None)
-        ]
-        for i,(txt,key) in enumerate(modes):
-            b = QPushButton(txt)
-            b.setMinimumHeight(56)
-            b.clicked.connect(lambda checked=False,k=key: main.apply_live_preset(k))
-            pg.addWidget(b,i//2,i%2)
-        layout.addWidget(preset)
-
-        trans = QGroupBox("ç°åœºé€Ÿåº¦ / è°ƒæ€§")
-        tg = QGridLayout(trans)
-        self.transpose = QSpinBox()
-        self.transpose.setRange(-12,12)
-        self.transpose.setValue(0)
-        self.transpose.setSuffix(" åŠéŸ³")
-        self.transpose.valueChanged.connect(self.update_capo_label)
-        self.speed = QDoubleSpinBox()
-        self.speed.setRange(0.50,1.50)
-        self.speed.setSingleStep(0.05)
-        self.speed.setValue(1.00)
-        self.speed.setSuffix(" x")
-        self.speed.valueChanged.connect(main.engine.set_speed)
-        self.delay_ms = QSpinBox()
-        self.delay_ms.setRange(0,1000)
-        self.delay_ms.setSingleStep(10)
-        self.delay_ms.setSuffix(" ms")
-        self.capo_label=QLabel("æ¨èå˜è°ƒå¤¹ï¼š0 å“")
-        apply_transpose=QPushButton("åº”ç”¨å˜è°ƒåˆ°å…¨éƒ¨éŸ³è½¨")
-        apply_transpose.clicked.connect(main.apply_live_transpose)
-        tg.addWidget(QLabel("å‡é™è°ƒ"),0,0)
-        tg.addWidget(self.transpose,0,1)
-        tg.addWidget(QLabel("é€Ÿåº¦"),1,0)
-        tg.addWidget(self.speed,1,1)
-        tg.addWidget(QLabel("èŠ‚æ‹/è°±é¢å»¶æ—¶"),2,0)
-        tg.addWidget(self.delay_ms,2,1)
-        tg.addWidget(self.capo_label,3,0)
-        tg.addWidget(apply_transpose,3,1)
-        tg.addWidget(QLabel("é€Ÿåº¦å®æ—¶ä½œç”¨äºå…¨éƒ¨åˆ†è½¨ï¼›å˜è°ƒä¼šç”Ÿæˆå¹¶è½½å…¥ä¿æŒåŒæ­¥çš„æ–°éŸ³è½¨ã€‚"),4,0,1,2)
-        layout.addWidget(trans)
-
-        met = QGroupBox("è€³è¿” / èŠ‚æ‹å™¨")
-        mg = QGridLayout(met)
-        self.metronome = QCheckBox("è€³è¿”å¼€å¯èŠ‚æ‹å™¨")
-        self.metronome.setChecked(False)
-        self.metronome.toggled.connect(self.toggle_metronome_output)
-        self.countin = QCheckBox("æ¼”å‡ºå‰ 4 æ‹ Count-in")
-        self.countin.setChecked(True)
-        self.main_out = QComboBox()
-        self.monitor_out = QComboBox()
-        self.refresh_devices()
-        ref = QPushButton("åˆ·æ–°å£°å¡")
-        ref.clicked.connect(self.refresh_devices)
-        mg.addWidget(self.metronome,0,0)
-        mg.addWidget(self.countin,0,1)
-        mg.addWidget(QLabel("ä¸»è¾“å‡º"),1,0)
-        mg.addWidget(self.main_out,1,1)
-        mg.addWidget(QLabel("è€³è¿”è¾“å‡º"),2,0)
-        mg.addWidget(self.monitor_out,2,1)
-        mg.addWidget(ref,3,1)
-        layout.addWidget(met)
-
-        midi = QGroupBox("USB / MIDI è„šè¸æ¿")
-        ml = QVBoxLayout(midi)
-        self.midi_status = QLabel("å°šæœªæ£€æµ‹ MIDI è®¾å¤‡")
-        scan = QPushButton("æ‰«æ MIDI")
-        scan.clicked.connect(self.scan_midi)
-        ml.addWidget(self.midi_status)
-        ml.addWidget(scan)
-        ml.addWidget(QLabel("é»˜è®¤æ˜ å°„ï¼šæ’­æ”¾/æš‚åœã€ä¸‹ä¸€é¦–ã€ä¸Šä¸€é¦–ã€åœæ­¢ã€‚"))
-        layout.addWidget(midi)
-
-        self.status = QLabel("ç°åœºçŠ¶æ€ï¼šå¾…æœº")
-        self.status.setObjectName("StatusGood")
-        layout.addWidget(self.status)
-        layout.addStretch(1)
-
-    def update_capo_label(self,value):
-        semitones=int(value)
-        capo=semitones if 0 <= semitones <= 7 else 0
-        self.capo_label.setText(f"æ¨èå˜è°ƒå¤¹ï¼š{capo} å“" if capo else "æ¨èå˜è°ƒå¤¹ï¼š0 å“/è°ƒæ•´å’Œå¼¦æŒ‡æ³•")
-
-    def toggle_lock(self, checked):
-        if checked:
-            self.lock_btn.setText("ğŸ”’ æ¼”å‡ºå·²é”å®š")
-            self.status.setText("ç°åœºçŠ¶æ€ï¼šå·²é”å®šï¼Œé¿å…è¯¯è§¦")
-        else:
-            self.lock_btn.setText("ğŸ”“ æ¼”å‡ºæœªé”å®š")
-            self.status.setText("ç°åœºçŠ¶æ€ï¼šå¾…æœº")
-
-    def refresh_devices(self):
-        for combo in [self.main_out, self.monitor_out]:
-            combo.clear()
-        try:
-            devices = sd.query_devices()
-            outs = []
-            for i,d in enumerate(devices):
-                if d["max_output_channels"] > 0:
-                    outs.append((i,d["name"]))
-            for combo in [self.main_out,self.monitor_out]:
-                for i,name in outs:
-                    combo.addItem(f"{i}: {name}",i)
-            if self.monitor_out.count() > 1:
-                self.monitor_out.setCurrentIndex(1)
-        except Exception as e:
-            self.main_out.addItem("è®¾å¤‡è¯»å–å¤±è´¥")
-            self.monitor_out.addItem("è®¾å¤‡è¯»å–å¤±è´¥")
-
-    def scan_midi(self):
-        try:
-            import mido
-            names = mido.get_input_names()
-            if not names:
-                self.midi_status.setText("æœªæ£€æµ‹åˆ° MIDI è¾“å…¥è®¾å¤‡")
-                return
-            self.main.start_midi_worker()
-            self.midi_status.setText("æ­£åœ¨ç›‘å¬ MIDIï¼š\n" + "\n".join(names) +
-                                     "\n\n36=æ’­æ”¾/æš‚åœ  37=åœæ­¢  38=ä¸‹ä¸€é¦–  39=ä¸Šä¸€é¦–")
-        except Exception as e:
-            self.midi_status.setText("MIDI åˆå§‹åŒ–å¤±è´¥ï¼š" + str(e))
-
-    def toggle_metronome_output(self):
-        if self.metronome.isChecked():
-            bpm = self.main.analysis_result.get("bpm", 120) if getattr(self.main, "analysis_result", None) else 120
-            device = self.monitor_out.currentData()
-            try:
-                self.main.metronome_engine.start(device=device, bpm=bpm)
-                self.status.setText(f"ç°åœºçŠ¶æ€ï¼šè€³è¿”èŠ‚æ‹å™¨ {float(bpm):.1f} BPM")
-            except Exception as e:
-                self.metronome.setChecked(False)
-                QMessageBox.critical(self, "è€³è¿”èŠ‚æ‹å™¨å¤±è´¥", str(e))
-        else:
-            self.main.metronome_engine.stop()
-
-
-
-class ArrangementScorePage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        layout = QVBoxLayout(self)
-
-        title = QLabel("AI æ”¹ç¼– / ä¹è°±ä¸­å¿ƒ")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-        hint = QLabel("å…ˆåˆ†ææ­Œæ›²çš„ BPMã€è°ƒæ€§ã€å’Œå¼¦ä¸æ®µè½ï¼Œå†ç”Ÿæˆæ¼”å¥å‚è€ƒè°±å’Œæ–°çš„ MIDI ä¼´å¥ç¼–é…ã€‚åŸå§‹å½•éŸ³ä»…ä½œä¸ºåˆ†æå‚è€ƒã€‚")
-        hint.setWordWrap(True)
-        hint.setObjectName("SectionHint")
-        layout.addWidget(hint)
-
-        analysis_box = QGroupBox("â‘  éŸ³ä¹åˆ†æä¸å’Œå¼¦æ—¶é—´çº¿")
-        al = QVBoxLayout(analysis_box)
-        row = QHBoxLayout()
-        self.song_label = QLabel("å°šæœªåˆ†ææ­Œæ›²")
-        analyze = QPushButton(QIcon(icon_path("split")), "åˆ†æå’Œå¼¦ / BPM / è°ƒæ€§")
-        apply_button_accent(analyze, "primary")
-        analyze.clicked.connect(main.analyze_full_score)
-        row.addWidget(self.song_label, 1)
-        row.addWidget(analyze)
-        al.addLayout(row)
-        self.analysis_status = QLabel("ç­‰å¾…åˆ†æ")
-        self.analysis_status.setWordWrap(True)
-        al.addWidget(self.analysis_status)
-        self.chord_table = QTableWidget(0, 4)
-        self.chord_table.setHorizontalHeaderLabels(["å°èŠ‚", "æ—¶é—´", "å’Œå¼¦", "æ®µè½"])
-        self.chord_table.horizontalHeader().setStretchLastSection(True)
-        al.addWidget(self.chord_table)
-        layout.addWidget(analysis_box)
-
-        trans_box = QGroupBox("â‘¡ å‡é™è°ƒ")
-        tl = QHBoxLayout(trans_box)
-        self.transpose = QSpinBox()
-        self.transpose.setRange(-12, 12)
-        self.transpose.setValue(0)
-        self.transpose.setSuffix(" åŠéŸ³")
-        self.target_key = QLabel("ç›®æ ‡è°ƒï¼šâ€”")
-        self.transpose.valueChanged.connect(main.update_target_key_label)
-        transpose_btn = QPushButton("ç”Ÿæˆå‡é™è°ƒå…­è½¨æ¼”å‡ºç‰ˆ")
-        apply_button_accent(transpose_btn, "success")
-        transpose_btn.clicked.connect(main.generate_transposed_stems)
-        tl.addWidget(QLabel("å‡é™è°ƒ"))
-        tl.addWidget(self.transpose)
-        tl.addWidget(self.target_key)
-        tl.addStretch(1)
-        tl.addWidget(transpose_btn)
-        layout.addWidget(trans_box)
-
-        arrange_box = QGroupBox("â‘¢ AI æ”¹ç¼–æ–¹æ¡ˆ")
-        rl = QGridLayout(arrange_box)
-        self.arrange_mode = QComboBox()
-        self.arrange_mode.addItems([
-            "ä¹é˜Ÿç°åœºç‰ˆ", "æœ¨å‰ä»–å¼¹å”±ç‰ˆ", "é’¢ç´å¼¹å”±ç‰ˆ", "ä¸æ’ç”µç‰ˆ", "æµè¡Œæ”¹ç¼–ç‰ˆ", "æ‘‡æ»šæ”¹ç¼–ç‰ˆ"
-        ])
-        self.use_player_settings = QCheckBox("ä½¿ç”¨â€œä¹æ‰‹æ¼”å¥ä¸­å¿ƒâ€å‚æ•°å‚ä¸ç¼–é…")
-        self.use_player_settings.setChecked(True)
-        self.musical_intelligence = QCheckBox("å¯ç”¨æ®µè½éŸ³ä¹æ€§æ™ºèƒ½ç¼–æ’")
-        self.musical_intelligence.setChecked(True)
-        self.energy_curve = QComboBox()
-        self.energy_curve.addItems(["è‡ªåŠ¨åˆ¤æ–­","æ¸è¿›å¢å¼º","å¹³ç¨³ç°åœº","å¼ºå¼±å¯¹æ¯”","æŠ’æƒ…å…‹åˆ¶"])
-        self.arrange_note = QLabel("ç”Ÿæˆçš„æ˜¯æ–°çš„ MIDI ä¼´å¥ç»“æ„ï¼Œä¸ç›´æ¥å¤åˆ¶åŸå½•éŸ³ä¸­çš„ä¹å™¨éŸ³é¢‘ã€‚")
-        self.arrange_note.setWordWrap(True)
-        midi_btn = QPushButton("ç”ŸæˆéŸ³ä¹æ€§æ™ºèƒ½ç¼–é… MIDI")
-        apply_button_accent(midi_btn, "primary")
-        midi_btn.clicked.connect(main.generate_musical_intelligence_midi)
-        rl.addWidget(QLabel("æ”¹ç¼–æ¨¡å¼"),0,0)
-        rl.addWidget(self.arrange_mode,0,1)
-        rl.addWidget(midi_btn,0,2)
-        rl.addWidget(self.use_player_settings,1,0,1,3)
-        rl.addWidget(self.musical_intelligence,2,0,1,2)
-        rl.addWidget(self.energy_curve,2,2)
-        rl.addWidget(self.arrange_note,3,0,1,3)
-        layout.addWidget(arrange_box)
-
-        smart_box = QGroupBox("æ™ºèƒ½ç¼–é…å‚æ•°é¢„è§ˆ")
-        sbl = QVBoxLayout(smart_box)
-        self.smart_summary = QLabel("å°šæœªè¯»å–ä¹æ‰‹å‚æ•°")
-        self.smart_summary.setWordWrap(True)
-        refresh_smart = QPushButton("è¯»å–å½“å‰ä¹æ‰‹è®¾ç½®")
-        refresh_smart.clicked.connect(main.refresh_smart_arranger_summary)
-        sbl.addWidget(self.smart_summary)
-        sbl.addWidget(refresh_smart)
-        layout.addWidget(smart_box)
-
-        intelligence_box = QGroupBox("æ®µè½éŸ³ä¹æ€§é¢„è§ˆ")
-        ibl = QVBoxLayout(intelligence_box)
-        self.intelligence_summary = QLabel("å°šæœªåˆ†ææ®µè½èƒ½é‡")
-        self.intelligence_summary.setWordWrap(True)
-        analyze_music_btn = QPushButton("åˆ†ææ®µè½å¹¶ç”Ÿæˆç¼–é…ç­–ç•¥")
-        analyze_music_btn.clicked.connect(main.refresh_musical_intelligence_preview)
-        ibl.addWidget(self.intelligence_summary)
-        ibl.addWidget(analyze_music_btn)
-        layout.addWidget(intelligence_box)
-
-        manual_box = QGroupBox("äººå·¥å¾®è°ƒ / A-B ç‰ˆæœ¬")
-        mbl = QGridLayout(manual_box)
-        self.manual_section = QComboBox()
-        self.manual_section.currentIndexChanged.connect(main.load_manual_section_settings)
-
-        self.manual_guitar = QSlider(Qt.Horizontal)
-        self.manual_guitar.setRange(-50,50); self.manual_guitar.setValue(0)
-        self.manual_bass = QSlider(Qt.Horizontal)
-        self.manual_bass.setRange(-50,50); self.manual_bass.setValue(0)
-        self.manual_drums = QSlider(Qt.Horizontal)
-        self.manual_drums.setRange(-50,50); self.manual_drums.setValue(0)
-        self.manual_piano = QSlider(Qt.Horizontal)
-        self.manual_piano.setRange(-50,50); self.manual_piano.setValue(0)
-        self.manual_fill = QSlider(Qt.Horizontal)
-        self.manual_fill.setRange(-50,50); self.manual_fill.setValue(0)
-        self.manual_space = QSlider(Qt.Horizontal)
-        self.manual_space.setRange(-50,50); self.manual_space.setValue(0)
-
-        self.manual_label = QLabel("è°ƒæ•´èŒƒå›´ï¼š-50% ï½ +50%ï¼Œ0 è¡¨ç¤ºæ²¿ç”¨æ©˜å‘³å„¿éŸ³ä¹è‡ªåŠ¨ç­–ç•¥")
-        self.manual_label.setObjectName("SectionHint")
-        self.manual_label.setWordWrap(True)
-
-        save_a = QPushButton("ä¿å­˜ç‰ˆæœ¬ A")
-        save_b = QPushButton("ä¿å­˜ç‰ˆæœ¬ B")
-        apply_button_accent(save_a,"primary")
-        apply_button_accent(save_b,"success")
-        save_a.clicked.connect(lambda: main.save_arrangement_variant("A"))
-        save_b.clicked.connect(lambda: main.save_arrangement_variant("B"))
-
-        gen_a = QPushButton("ç”Ÿæˆ A ç‰ˆ MIDI")
-        gen_b = QPushButton("ç”Ÿæˆ B ç‰ˆ MIDI")
-        gen_a.clicked.connect(lambda: main.generate_variant_midi("A"))
-        gen_b.clicked.connect(lambda: main.generate_variant_midi("B"))
-
-        mbl.addWidget(QLabel("æ®µè½"),0,0); mbl.addWidget(self.manual_section,0,1,1,3)
-        mbl.addWidget(QLabel("å‰ä»–"),1,0); mbl.addWidget(self.manual_guitar,1,1,1,3)
-        mbl.addWidget(QLabel("Bass"),2,0); mbl.addWidget(self.manual_bass,2,1,1,3)
-        mbl.addWidget(QLabel("é¼“"),3,0); mbl.addWidget(self.manual_drums,3,1,1,3)
-        mbl.addWidget(QLabel("é”®ç›˜"),4,0); mbl.addWidget(self.manual_piano,4,1,1,3)
-        mbl.addWidget(QLabel("Fill"),5,0); mbl.addWidget(self.manual_fill,5,1,1,3)
-        mbl.addWidget(QLabel("ç•™ç™½"),6,0); mbl.addWidget(self.manual_space,6,1,1,3)
-        mbl.addWidget(self.manual_label,7,0,1,4)
-        mbl.addWidget(save_a,8,0); mbl.addWidget(gen_a,8,1)
-        mbl.addWidget(save_b,8,2); mbl.addWidget(gen_b,8,3)
-        layout.addWidget(manual_box)
-
-        compare_box = QGroupBox("A/B å®æ—¶è¯•å¬ä¸ç‰ˆæœ¬å†å²")
-        cbl = QGridLayout(compare_box)
-
-        self.compare_section = QComboBox()
-        self.compare_section.setMinimumWidth(220)
-
-        render_a = QPushButton("æ¸²æŸ“ A")
-        render_b = QPushButton("æ¸²æŸ“ B")
-        render_a.clicked.connect(lambda: main.render_variant_audio("A"))
-        render_b.clicked.connect(lambda: main.render_variant_audio("B"))
-
-        play_a = QPushButton("è¯•å¬ A")
-        play_b = QPushButton("è¯•å¬ B")
-        apply_button_accent(play_a,"primary")
-        apply_button_accent(play_b,"success")
-        play_a.clicked.connect(lambda: main.preview_variant("A"))
-        play_b.clicked.connect(lambda: main.preview_variant("B"))
-
-        stop_ab = QPushButton("åœæ­¢è¯•å¬")
-        stop_ab.clicked.connect(main.stop_variant_preview)
-
-        self.loop_compare = QCheckBox("åªå¾ªç¯å½“å‰æ®µè½å¯¹æ¯”")
-        self.loop_compare.setChecked(True)
-
-        adopt_a = QPushButton("é‡‡ç”¨ A")
-        adopt_b = QPushButton("é‡‡ç”¨ B")
-        adopt_a.clicked.connect(lambda: main.adopt_variant("A"))
-        adopt_b.clicked.connect(lambda: main.adopt_variant("B"))
-
-        undo = QPushButton("Undo")
-        redo = QPushButton("Redo")
-        undo.clicked.connect(main.undo_arrangement_change)
-        redo.clicked.connect(main.redo_arrangement_change)
-
-        snapshot = QPushButton("ä¿å­˜å†å²å¿«ç…§")
-        snapshot.clicked.connect(main.save_arrangement_snapshot)
-        restore_history = QPushButton("æ¢å¤æ‰€é€‰å†å²")
-        restore_history.clicked.connect(main.restore_selected_history)
-
-        self.history_table = QTableWidget(0,4)
-        self.history_table.setHorizontalHeaderLabels(["æ—¶é—´","ç‰ˆæœ¬","è¯´æ˜","æ–‡ä»¶"])
-        self.history_table.horizontalHeader().setStretchLastSection(True)
-
-        cbl.addWidget(QLabel("å¯¹æ¯”æ®µè½"),0,0)
-        cbl.addWidget(self.compare_section,0,1)
-        cbl.addWidget(self.loop_compare,0,2,1,2)
-        cbl.addWidget(render_a,1,0); cbl.addWidget(play_a,1,1)
-        cbl.addWidget(render_b,1,2); cbl.addWidget(play_b,1,3)
-        cbl.addWidget(stop_ab,2,0)
-        cbl.addWidget(adopt_a,2,1)
-        cbl.addWidget(adopt_b,2,2)
-        cbl.addWidget(snapshot,2,3)
-        cbl.addWidget(undo,3,0)
-        cbl.addWidget(redo,3,1)
-        cbl.addWidget(restore_history,3,2,1,2)
-        cbl.addWidget(self.history_table,4,0,1,4)
-        layout.addWidget(compare_box)
-
-        pro_compare = QGroupBox("A/B ä¸“ä¸šå¯¹æ¯”")
-        pcl = QGridLayout(pro_compare)
-
-        self.ab_wave_a = WaveformWidget()
-        self.ab_wave_b = WaveformWidget()
-        self.ab_wave_a.setMinimumHeight(90)
-        self.ab_wave_b.setMinimumHeight(90)
-
-        self.loudness_match = QCheckBox("è‡ªåŠ¨å“åº¦åŒ¹é…")
-        self.loudness_match.setChecked(True)
-        self.instant_switch = QCheckBox("ç¬æ—¶ A/B åˆ‡æ¢")
-        self.instant_switch.setChecked(True)
-
-        switch_a = QPushButton("åˆ‡åˆ° A")
-        switch_b = QPushButton("åˆ‡åˆ° B")
-        apply_button_accent(switch_a,"primary")
-        apply_button_accent(switch_b,"success")
-        switch_a.clicked.connect(lambda: main.instant_switch_variant("A"))
-        switch_b.clicked.connect(lambda: main.instant_switch_variant("B"))
-
-        analyze_diff = QPushButton("åˆ†æ A/B å·®å¼‚")
-        analyze_diff.clicked.connect(main.analyze_ab_difference)
-
-        self.diff_label = QLabel("A/B å·®å¼‚ï¼šå°šæœªåˆ†æ")
-        self.diff_label.setWordWrap(True)
-        self.diff_label.setObjectName("SectionHint")
-
-        pcl.addWidget(QLabel("A æ³¢å½¢"),0,0)
-        pcl.addWidget(self.ab_wave_a,0,1,1,4)
-        pcl.addWidget(QLabel("B æ³¢å½¢"),1,0)
-        pcl.addWidget(self.ab_wave_b,1,1,1,4)
-        pcl.addWidget(self.loudness_match,2,0)
-        pcl.addWidget(self.instant_switch,2,1)
-        pcl.addWidget(switch_a,2,2)
-        pcl.addWidget(switch_b,2,3)
-        pcl.addWidget(analyze_diff,2,4)
-        pcl.addWidget(self.diff_label,3,0,1,5)
-
-        layout.addWidget(pro_compare)
-
-        render_box = QGroupBox("â‘£ æ–°ç¼–é…éŸ³æºæ¸²æŸ“")
-        rbl = QGridLayout(render_box)
-        self.soundfont_edit = QLineEdit()
-        self.soundfont_edit.setPlaceholderText("é€‰æ‹© .sf2 / .sf3 SoundFont")
-        sf_btn = QPushButton("é€‰æ‹© SoundFont")
-        sf_btn.clicked.connect(main.choose_soundfont)
-        render_wav_btn = QPushButton("æ¸²æŸ“æ–°ç¼–é… WAV")
-        apply_button_accent(render_wav_btn, "success")
-        render_wav_btn.clicked.connect(main.render_arrangement_wav)
-        render_mp3_btn = QPushButton("æ¸²æŸ“æ–°ç¼–é… MP3")
-        render_mp3_btn.clicked.connect(main.render_arrangement_mp3)
-        rbl.addWidget(QLabel("SoundFont"),0,0)
-        rbl.addWidget(self.soundfont_edit,0,1)
-        rbl.addWidget(sf_btn,0,2)
-        rbl.addWidget(render_wav_btn,1,1)
-        rbl.addWidget(render_mp3_btn,1,2)
-        layout.addWidget(render_box)
-
-        score_box = QGroupBox("â‘¤ ä¹æ‰‹æ¼”å¥è°±")
-        sl = QHBoxLayout(score_box)
-        lead = QPushButton("å¯¼å‡º Lead Sheet / å’Œå¼¦è°±")
-        lead.clicked.connect(main.export_lead_sheet)
-        guitar = QPushButton("å‰ä»–æ¼”å¥å‚è€ƒè°±")
-        guitar.clicked.connect(lambda: main.export_instrument_score("guitar"))
-        bass = QPushButton("è´æ–¯æ¼”å¥å‚è€ƒè°±")
-        bass.clicked.connect(lambda: main.export_instrument_score("bass"))
-        drums = QPushButton("é¼“æ‰‹æ¼”å¥å‚è€ƒè°±")
-        drums.clicked.connect(lambda: main.export_instrument_score("drums"))
-        piano = QPushButton("é”®ç›˜æ¼”å¥å‚è€ƒè°±")
-        piano.clicked.connect(lambda: main.export_instrument_score("piano"))
-        musicxml = QPushButton("å¯¼å‡º MusicXML")
-        musicxml.clicked.connect(main.export_musicxml)
-        melody = QPushButton("ä¸»æ—‹å¾‹å‚è€ƒè½¬å†™")
-        melody.clicked.connect(main.export_melody_reference)
-        for b in [lead,guitar,bass,drums,piano,musicxml,melody]:
-            sl.addWidget(b)
-        xml_row = QHBoxLayout()
-        for label,inst in [("å‰ä»– MusicXML","guitar"),("Bass MusicXML","bass"),("é¼“ MusicXML","drums"),("é”®ç›˜ MusicXML","piano")]:
-            b=QPushButton(label)
-            b.clicked.connect(lambda checked=False, x=inst: main.export_instrument_musicxml(x))
-            xml_row.addWidget(b)
-        layout.addLayout(xml_row)
-        layout.addWidget(score_box)
-
-        self.progress = QProgressBar()
-        self.progress.setRange(0,100)
-        self.progress.setValue(0)
-        self.progress.setFormat("æ”¹ç¼– / å‡ºè°± %p%")
-        layout.addWidget(self.progress)
-
-
-
-class DesktopScoreCanvas(QWidget):
-    def __init__(self,main):
-        super().__init__()
-        self.main=main
-        self.mode="äº”çº¿è°±"
-        self.position=0.0
-        self.show_lyrics=True
-        self.setMinimumHeight(230)
-
-    def set_mode(self,mode):
-        self.mode=str(mode)
-        self.update()
-
-    def set_position(self,seconds):
-        self.position=max(0,float(seconds))
-        self.update()
-
-    def set_show_lyrics(self,enabled):
-        self.show_lyrics=bool(enabled)
-        self.update()
-
-    def _midi(self,note):
-        if "midi" in note:
-            return int(note.get("midi",60))
-        match=re.match(r"^([A-G])([#b]?)(-?\d+)$",str(note.get("note","C4")))
-        if not match:
-            return 60
-        pitch={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}[match.group(1)]
-        pitch += 1 if match.group(2)=="#" else -1 if match.group(2)=="b" else 0
-        return 12*(int(match.group(3))+1)+pitch
-
-    def paintEvent(self,event):
-        painter=QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(),QColor("#0d1018"))
-        width=max(100,self.width())
-        top=40
-        gap=22
-        tablature=self.mode=="å…­çº¿è°±"
-        line_count=6 if tablature else 5
-        painter.setPen(QPen(QColor("#BDAAB5"),1))
-        for index in range(line_count):
-            y=top+index*gap
-            painter.drawLine(24,y,width-24,y)
-        painter.setPen(QPen(QColor("#FF7A18"),2))
-        painter.drawLine(34,top-18,34,top+(line_count-1)*gap+18)
-
-        notes=[
-            note for note in getattr(self.main,"melody_reference",[])
-            if self.position-1 <= float(note.get("start",0)) <= self.position+15
-        ][:32]
-        tuning=[64,59,55,50,45,40]
-        for note in notes:
-            start=float(note.get("start",0))
-            x=52+(start-(self.position-1))/16*max(20,width-92)
-            midi=self._midi(note)
-            if tablature:
-                choices=[(midi-open_note,index) for index,open_note in enumerate(tuning) if 0<=midi-open_note<=24]
-                fret,string=min(choices,default=(0,0),key=lambda item:item[0])
-                painter.setPen(QColor("#FF9A2A"))
-                painter.drawText(QRectF(x-11,top+string*gap-11,24,22),Qt.AlignCenter,str(fret))
-            else:
-                y=max(18,min(top+4*gap+18,top+4*gap-(midi-60)*gap/3.5))
-                painter.setBrush(QColor("#FF7A18")); painter.setPen(Qt.NoPen)
-                painter.drawEllipse(QPointF(x,y),7,5)
-                painter.setPen(QPen(QColor("#FF7A18"),2)); painter.drawLine(QPointF(x+6,y),QPointF(x+6,y-30))
-
-        if self.show_lyrics:
-            lyric=""
-            for row in getattr(self.main,"lyric_reference",[]):
-                if self.position>=float(row.get("start",0)):
-                    lyric=str(row.get("text",""))
-                else:
-                    break
-            painter.setPen(QColor("#FFFFFF"))
-            font=painter.font(); font.setPointSize(15); font.setBold(True); painter.setFont(font)
-            painter.drawText(QRectF(24,self.height()-55,width-48,42),Qt.AlignCenter,lyric or "å½“å‰æ­Œæ›²æ²¡æœ‰å¯ç”¨æ­Œè¯")
-        if not notes:
-            painter.setPen(QColor("#A995A6"))
-            painter.drawText(QRectF(24,top+line_count*gap+5,width-48,30),Qt.AlignCenter,"è¯·å…ˆè¿è¡Œä¹è°±åˆ†æï¼Œè‡ªåŠ¨ç”Ÿæˆä¸»æ—‹å¾‹äº”çº¿è°±å’Œå…­çº¿è°±")
-
-
-class ScorePerformancePage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.current_bar = -1
-
-        layout = QVBoxLayout(self)
-        title = QLabel("æ¼”å‡ºè°±é¢ / è‡ªåŠ¨ç¿»è°±")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        top = QHBoxLayout()
-        self.score_type = QComboBox()
-        self.score_type.addItems(["Lead Sheet","äº”çº¿è°±","å…­çº¿è°±","è´æ–¯è°±","é¼“è°±","é”®ç›˜è°±"])
-        self.score_type.currentIndexChanged.connect(self.refresh_score)
-        self.auto_follow = QCheckBox("è·Ÿéšæ’­æ”¾å¤´è‡ªåŠ¨ç¿»è°±")
-        self.auto_follow.setChecked(True)
-        self.big_mode = QCheckBox("æ¼”å‡ºå¤§å­—æ¨¡å¼")
-        self.big_mode.setChecked(True)
-        self.big_mode.toggled.connect(self.refresh_score)
-        self.lyrics_toggle = QCheckBox("æ˜¾ç¤ºæ­Œè¯")
-        self.lyrics_toggle.setChecked(
-            QSettings("NOVRIA", "JuweierMusic").value("score/show_lyrics", True, type=bool)
-        )
-        self.lyrics_toggle.toggled.connect(self._toggle_lyrics)
-        refresh = QPushButton("åˆ·æ–°è°±é¢")
-        refresh.clicked.connect(self.refresh_score)
-        top.addWidget(QLabel("è°±é¢"))
-        top.addWidget(self.score_type)
-        top.addWidget(self.auto_follow)
-        top.addWidget(self.big_mode)
-        top.addWidget(self.lyrics_toggle)
-        top.addWidget(refresh)
-        top.addStretch(1)
-        layout.addLayout(top)
-
-        self.now = QLabel("å½“å‰å°èŠ‚ï¼šâ€”")
-        self.now.setObjectName("StatusGood")
-        layout.addWidget(self.now)
-
-        self.canvas=DesktopScoreCanvas(main)
-        self.canvas.set_show_lyrics(self.lyrics_toggle.isChecked())
-        layout.addWidget(self.canvas)
-
-        self.browser = QTextBrowser()
-        self.browser.setOpenExternalLinks(False)
-        layout.addWidget(self.browser, 1)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.follow_playback)
-        self.timer.start(250)
-
-    def _tab_for_chord(self, chord):
-        # Practical chord-shape reference, not a melody transcription.
-        shapes = {
-            "C":"x32010","C#":"x46664","D":"xx0232","D#":"x68886",
-            "E":"022100","F":"133211","F#":"244322","G":"320003",
-            "G#":"466544","A":"x02220","A#":"x13331","B":"x24442",
-            "Cm":"x35543","C#m":"x46654","Dm":"xx0231","D#m":"x68876",
-            "Em":"022000","Fm":"133111","F#m":"244222","Gm":"355333",
-            "G#m":"466444","Am":"x02210","A#m":"x13321","Bm":"x24432",
-        }
-        import re as _re
-        m=_re.match(r"^([A-G](?:#|b)?m?)", chord or "")
-        key=m.group(1) if m else chord
-        return shapes.get(key, "æŒ‰å’Œå¼¦æ ¹éŸ³/è½¬ä½é€‰æ‹©æŠŠä½")
-
-    def _html(self):
-        rows=self.main._score_rows_transposed() if hasattr(self.main,"_score_rows_transposed") else []
-        if not rows:
-            return "<h2>å°šæ— è°±é¢</h2><p>è¯·å…ˆåœ¨â€œAI æ”¹ç¼– / ä¹è°±â€ä¸­åˆ†ææ­Œæ›²ã€‚</p>"
-
-        mode=self.score_type.currentText()
-        font="24px" if self.big_mode.isChecked() else "16px"
-        blocks=[]
-        for row_index,row in enumerate(rows):
-            chord=" / ".join(row.get("chords") or ["N"])
-            extra=""
-            notes=[n for n in getattr(self.main,"melody_reference",[]) if row["seconds"] <= float(n.get("start",n.get("seconds",0))) < row["seconds"]+12]
-            next_seconds=rows[row_index+1]["seconds"] if row_index+1<len(rows) else row["seconds"]+12
-            lyric_lines=[
-                str(item.get("text","")) for item in getattr(self.main,"lyric_reference",[])
-                if row["seconds"] <= float(item.get("start",0)) < next_seconds
-            ]
-            if mode=="äº”çº¿è°±":
-                pitches="  ".join(html.escape(str(n.get("note",""))) for n in notes[:16]) or "è¯·ç‚¹å‡»â€œä¸»æ—‹å¾‹å‚è€ƒè½¬å†™â€ç”Ÿæˆå®é™…éŸ³ç¬¦"
-                extra=f"<div class='staff'><div>ğ„ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€</div><div>ã€€â”€â”€â”€â”€â”€â”€â”€â”€ {pitches} â”€â”€â”€â”€â”€â”€â”€â”€</div><div>ã€€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€</div><div>ã€€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€</div><div>ã€€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€</div></div>"
-            elif mode=="å…­çº¿è°±":
-                tuning=[("e",64),("B",59),("G",55),("D",50),("A",45),("E",40)]
-                lanes={name:[] for name,_ in tuning}
-                for note in notes[:16]:
-                    raw=str(note.get("note","C4"))
-                    match=re.match(r"^([A-G])([#b]?)(-?\d+)$",raw)
-                    pitch={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}.get(match.group(1),0) if match else 0
-                    if match and match.group(2)=="#": pitch+=1
-                    if match and match.group(2)=="b": pitch-=1
-                    midi=int(note.get("midi",12*(int(match.group(3))+1)+pitch if match else 60))
-                    choices=[(midi-open_note,name) for name,open_note in tuning if 0<=midi-open_note<=24]
-                    fret,string=min(choices,default=(0,"e"),key=lambda x:x[0])
-                    for name,_ in tuning:
-                        lanes[name].append(str(fret) if name==string else "-")
-                tab="<br>".join(f"{name}|"+"-".join(lanes[name] or ["-"])+"|" for name,_ in tuning)
-                extra=f"<div class='tab'>{tab}</div>"
-            elif mode=="å‰ä»– TAB":
-                first=(row.get("chords") or ["C"])[0]
-                extra=f"<div class='tab'>Chord Shape: {self._tab_for_chord(first)}<br>E A D G B e</div>"
-            elif mode=="è´æ–¯è°±":
-                first=(row.get("chords") or ["C"])[0]
-                extra=f"<div class='hint'>æ ¹éŸ³ï¼š{html.escape(first)} Â· å¼ºæ‹æ ¹éŸ³ï¼Œå¼±æ‹å¯ç”¨äº”åº¦/ç»è¿‡éŸ³</div>"
-            elif mode=="é¼“è°±":
-                extra="<div class='tab'>HH x-x-x-x-x-x-x-x-<br>SD ----o-------o---<br>BD o-------o-------</div>"
-            elif mode=="é”®ç›˜è°±":
-                extra="<div class='hint'>å·¦æ‰‹ï¼šæ ¹éŸ³/äº”åº¦ Â· å³æ‰‹ï¼šå’Œå¼¦è½¬ä½/åˆ†è§£</div>"
-            if lyric_lines and self.lyrics_toggle.isChecked():
-                extra += "<div class='lyrics'>"+"<br>".join(html.escape(line) for line in lyric_lines)+"</div>"
-            blocks.append(
-                f"<div id='bar{row['bar']}' class='bar'>"
-                f"<div class='sec'>{html.escape(row.get('section',''))}</div>"
-                f"<div class='num'>#{row['bar']} &nbsp; {self.main._format_time(row['seconds'])}</div>"
-                f"<div class='chord'>{html.escape(chord)}</div>{extra}</div>"
-            )
-        return f"""<html><style>
-        body{{background:#08101d;color:#eaf0ff;font-family:'Microsoft YaHei UI';font-size:{font};}}
-        .bar{{padding:18px;margin:10px 2px;border:1px solid #243551;border-radius:12px;background:#0d1728;}}
-        .sec{{color:#8ca0c5;font-size:0.65em}} .num{{color:#6f82a5;font-size:0.6em}}
-        .chord{{color:#65e1ce;font-weight:800;font-size:1.35em;margin:8px 0}}
-        .tab{{font-family:Consolas,monospace;color:#f4c04c;font-size:0.75em}}
-        .staff{{font-family:'Segoe UI Symbol',Consolas,monospace;color:#f4c04c;font-size:0.72em;line-height:1.0}}
-        .hint{{color:#b8c4dc;font-size:0.72em}}
-        .lyrics{{color:#fff;font-size:0.9em;text-align:center;margin-top:12px;padding:8px;background:#251721;border-radius:8px}}
-        .active{{border:2px solid #8b6cff;background:#21194a}}
-        </style><body>{''.join(blocks)}</body></html>"""
-
-    def refresh_score(self):
-        self.canvas.set_mode(self.score_type.currentText())
-        self.browser.setHtml(self._html())
-
-    def _toggle_lyrics(self,enabled):
-        QSettings("NOVRIA", "JuweierMusic").setValue("score/show_lyrics", bool(enabled))
-        self.canvas.set_show_lyrics(enabled)
-        self.refresh_score()
-
-    def follow_playback(self):
-        if not self.auto_follow.isChecked():
-            return
-        rows=getattr(self.main,"chord_timeline",[])
-        if not rows:
-            return
-        delay=(self.main.live_pro.delay_ms.value()/1000 if hasattr(self.main,"live_pro") else 0)
-        pos=max(0,self.main.engine.position_seconds()-delay)
-        self.canvas.set_position(pos)
-        current=rows[0]["bar"]
-        for row in rows:
-            if pos >= row["seconds"]:
-                current=row["bar"]
-            else:
-                break
-        if current != self.current_bar:
-            self.current_bar=current
-            lyric=""
-            if self.lyrics_toggle.isChecked():
-                for item in getattr(self.main,"lyric_reference",[]):
-                    if pos >= float(item.get("start",0)):
-                        lyric=str(item.get("text",""))
-                    else:
-                        break
-            self.now.setText(f"å½“å‰å°èŠ‚ï¼š{current}" + (f"ã€€æ­Œè¯ï¼š{lyric}" if lyric else ""))
-            self.browser.scrollToAnchor(f"bar{current}")
-
-
-class LyricsStudioPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.results = []
-        layout = QVBoxLayout(self)
-        title = QLabel("AI æ­Œè¯åˆ›ä½œï¼ˆæ™®é€šè¯ / ç²¤è¯­ / è‹±è¯­ï¼‰")
-        title.setStyleSheet("font-size:24px;font-weight:800")
-        layout.addWidget(title)
-        notice = QLabel(
-            "æ ¹æ®ä¸»é¢˜ç”Ÿæˆå¯ç¼–è¾‘åˆç¨¿ï¼Œä¸æœç´¢æˆ–å¤åˆ¶å·²æœ‰æ­Œæ›²ã€‚"
-            "ç²¤è¯­æ”¯æŒå¸¸ç”¨å£è¯­ï¼Œå‘éŸ³ã€æŠ¼éŸµå’Œåœ°åŸŸç”¨è¯è¯·ç”±æ¯è¯­ä½¿ç”¨è€…å¤æ ¸ã€‚"
-        )
-        notice.setWordWrap(True)
-        notice.setObjectName("SectionHint")
-        layout.addWidget(notice)
-        form = QGroupBox("åˆ›ä½œå‚æ•°")
-        grid = QGridLayout(form)
-        self.theme = QLineEdit()
-        self.theme.setPlaceholderText("ä¾‹ï¼šç¦»å¼€å®¶ä¹¡åçš„é‡é€¢")
-        self.language = QComboBox(); self.language.addItems(["æ™®é€šè¯", "ç²¤è¯­", "è‹±è¯­"])
-        self.style = QComboBox(); self.style.addItems(["æµè¡Œ", "æ‘‡æ»š", "æ°‘è°£", "R&B"])
-        self.mood = QComboBox(); self.mood.addItems(["æ¸©æš–", "çƒ­è¡€", "ä¼¤æ„Ÿ", "æ²»æ„ˆ"])
-        generate = QPushButton("ç”Ÿæˆ 3 ä¸ªæ–¹æ¡ˆ")
-        apply_button_accent(generate, "primary")
-        generate.clicked.connect(self.generate)
-        grid.addWidget(QLabel("ä¸»é¢˜ / æ•…äº‹"), 0, 0); grid.addWidget(self.theme, 0, 1, 1, 5)
-        grid.addWidget(QLabel("è¯­è¨€"), 1, 0); grid.addWidget(self.language, 1, 1)
-        grid.addWidget(QLabel("é£æ ¼"), 1, 2); grid.addWidget(self.style, 1, 3)
-        grid.addWidget(QLabel("æƒ…ç»ª"), 1, 4); grid.addWidget(self.mood, 1, 5)
-        grid.addWidget(generate, 2, 5)
-        layout.addWidget(form)
-        self.variant = QComboBox()
-        self.variant.currentIndexChanged.connect(self.show_variant)
-        layout.addWidget(self.variant)
-        self.editor = QPlainTextEdit()
-        self.editor.setPlaceholderText("ç”Ÿæˆçš„æ­Œè¯ä¼šæ˜¾ç¤ºåœ¨è¿™é‡Œï¼Œå¯ç›´æ¥ä¿®æ”¹ã€‚")
-        layout.addWidget(self.editor, 1)
-        buttons = QHBoxLayout()
-        save_txt = QPushButton("å¯¼å‡º TXT"); save_lrc = QPushButton("å¯¼å‡º LRC")
-        use_current = QPushButton("è®¾ä¸ºå½“å‰æ­Œæ›²æ­Œè¯")
-        save_txt.clicked.connect(lambda: self.save("txt"))
-        save_lrc.clicked.connect(lambda: self.save("lrc"))
-        use_current.clicked.connect(self.use_current)
-        buttons.addWidget(save_txt); buttons.addWidget(save_lrc); buttons.addWidget(use_current); buttons.addStretch(1)
-        layout.addLayout(buttons)
-
-    def generate(self):
-        theme = self.theme.text().strip()
-        if not theme:
-            QMessageBox.information(self, "AI æ­Œè¯", "è¯·å…ˆå¡«å†™ä¸»é¢˜æˆ–æ•…äº‹ã€‚")
-            return
-        self.results = generate_lyrics(theme, self.language.currentText(), self.style.currentText(), self.mood.currentText(), 3)
-        self.variant.blockSignals(True); self.variant.clear()
-        self.variant.addItems([item["title"] for item in self.results])
-        self.variant.blockSignals(False); self.variant.setCurrentIndex(0); self.show_variant(0)
-
-    def show_variant(self, index):
-        if 0 <= index < len(self.results):
-            self.editor.setPlainText(self.results[index]["lyrics"])
-
-    def save(self, kind):
-        text = self.editor.toPlainText().strip()
-        if not text: return
-        path, _ = QFileDialog.getSaveFileName(self, "å¯¼å‡ºæ­Œè¯", str(EXPORTS_DIR / f"lyrics.{kind}"), f"{kind.upper()} (*.{kind})")
-        if path:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_text(lyrics_to_lrc(text) if kind == "lrc" else text + "\n", encoding="utf-8")
-
-    def use_current(self):
-        text = self.editor.toPlainText().strip()
-        if not text: return
-        self.main.lyric_reference = [{"time": i * 3.3, "text": line.strip()} for i, line in enumerate(text.splitlines()) if line.strip() and not line.startswith("[")]
-        self.main.statusBar().showMessage("å·²å°† AI æ­Œè¯åˆç¨¿è®¾ä¸ºå½“å‰æ­Œæ›²æ­Œè¯")
-
-
-class VoiceLabPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main=main
-        layout=QVBoxLayout(self)
-        title=QLabel("AI æ­Œå£°è½¬æ¢")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        notice=QLabel(
-            "v1.0.0 å…ˆå»ºç«‹ç‹¬ç«‹æ­Œå£°è½¬æ¢å·¥ä½œæµï¼šé€‰æ‹©å‚è€ƒäººå£°ã€é€‰æ‹©å¾…è½¬æ¢ Vocal Stemã€"
-            "ç”Ÿæˆä»»åŠ¡é…ç½®ã€‚æ¨¡å‹æ¨ç†å¼•æ“ä¸ä¸»æ’­æ”¾å™¨è§£è€¦ï¼Œåç»­å¯æ¥æœ¬åœ° Seed-VC/RVC æˆ–äº‘ç«¯ GPUã€‚"
-        )
-        notice.setWordWrap(True)
-        notice.setObjectName("SectionHint")
-        layout.addWidget(notice)
-
-        box=QGroupBox("æ­Œå£°è½¬æ¢ä»»åŠ¡")
-        gl=QGridLayout(box)
-        self.reference=QLineEdit()
-        self.source=QLineEdit()
-        ref_btn=QPushButton("é€‰æ‹©å‚è€ƒäººå£°")
-        src_btn=QPushButton("é€‰æ‹© Vocal Stem")
-        ref_btn.clicked.connect(self.pick_reference)
-        src_btn.clicked.connect(self.pick_source)
-        self.engine=QComboBox()
-        self.engine.addItems(["Seed-VC æ¥å£","RVC æ¥å£","äº‘ç«¯ GPU æ¥å£"])
-        self.strength=QSlider(Qt.Horizontal)
-        self.strength.setRange(0,100)
-        self.strength.setValue(75)
-        save=QPushButton("ç”Ÿæˆæ­Œå£°è½¬æ¢ä»»åŠ¡")
-        apply_button_accent(save,"primary")
-        save.clicked.connect(self.save_job)
-        gl.addWidget(QLabel("å‚è€ƒäººå£°"),0,0); gl.addWidget(self.reference,0,1); gl.addWidget(ref_btn,0,2)
-        gl.addWidget(QLabel("å¾…è½¬æ¢äººå£°"),1,0); gl.addWidget(self.source,1,1); gl.addWidget(src_btn,1,2)
-        gl.addWidget(QLabel("å¼•æ“"),2,0); gl.addWidget(self.engine,2,1)
-        gl.addWidget(QLabel("éŸ³è‰²å¼ºåº¦"),3,0); gl.addWidget(self.strength,3,1)
-        gl.addWidget(save,4,2)
-        layout.addWidget(box)
-
-        rights=QLabel("ä½¿ç”¨çœŸå®äººç‰©å£°éŸ³å‰åº”ç¡®è®¤æ‹¥æœ‰å¿…è¦æˆæƒ/åŒæ„ï¼›æ©˜å‘³å„¿éŸ³ä¹ä¿å­˜ä»»åŠ¡æ¥æºä¿¡æ¯ï¼Œä¾¿äºåç»­æˆæƒç®¡ç†ã€‚")
-        rights.setWordWrap(True)
-        layout.addWidget(rights)
-        layout.addStretch(1)
-
-    def pick_reference(self):
-        p,_=QFileDialog.getOpenFileName(self,"å‚è€ƒäººå£°","","éŸ³é¢‘ (*.wav *.mp3 *.flac *.m4a)")
-        if p: self.reference.setText(p)
-
-    def pick_source(self):
-        default=""
-        if self.main.stem_dir:
-            p=Path(self.main.stem_dir)/"vocals.wav"
-            if p.exists(): default=str(p)
-        p,_=QFileDialog.getOpenFileName(self,"Vocal Stem",default,"éŸ³é¢‘ (*.wav *.mp3 *.flac)")
-        if p: self.source.setText(p)
-
-    def save_job(self):
-        ref=self.reference.text().strip()
-        src=self.source.text().strip()
-        if not ref or not Path(ref).exists() or not src or not Path(src).exists():
-            QMessageBox.warning(self,"æç¤º","è¯·é€‰æ‹©æœ‰æ•ˆçš„å‚è€ƒäººå£°ä¸ Vocal Stemã€‚")
-            return
-        jobs=BASE_DIR/"voice_jobs"
-        jobs.mkdir(parents=True,exist_ok=True)
-        job={
-            "version":VERSION,
-            "engine":self.engine.currentText(),
-            "reference_audio":ref,
-            "source_vocal":src,
-            "timbre_strength":self.strength.value()/100.0,
-            "created_at":time.time(),
-            "authorization_note":"User is responsible for having necessary rights/consent for the target voice."
-        }
-        name=f"voice_job_{int(time.time())}.json"
-        p=jobs/name
-        p.write_text(json.dumps(job,ensure_ascii=False,indent=2),encoding="utf-8")
-        QMessageBox.information(self,"ä»»åŠ¡å·²åˆ›å»º",f"æ­Œå£°è½¬æ¢ä»»åŠ¡é…ç½®å·²ä¿å­˜ï¼š\n{p}")
-
-
-
-class InstrumentExperiencePage(QWidget):
-    """
-    ä¹æ‰‹å‹å¥½æ§åˆ¶ä¸­å¿ƒï¼š
-    æ¯ç§ä¹å™¨åªæ˜¾ç¤ºæœ€ç›¸å…³çš„è®¾ç½®ï¼ŒæŠŠå¤æ‚å·¥ä½œç«™å‚æ•°è½¬æˆå¯ç†è§£çš„æ¼”å¥é€‰é¡¹ã€‚
-    """
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.loop_section_index = -1
-
-        layout = QVBoxLayout(self)
-        title = QLabel("ä¹æ‰‹æ¼”å¥ä¸­å¿ƒ")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        hint = QLabel("é€‰æ‹©ä½ ç°åœºæ¼”å¥çš„ä¹å™¨ï¼Œæ©˜å‘³å„¿éŸ³ä¹è‡ªåŠ¨å…³é—­å¯¹åº”åŸä¹å™¨è½¨ï¼Œå¹¶æ˜¾ç¤ºè¯¥ä¹æ‰‹æœ€éœ€è¦çš„è°±é¢ã€æ’ç»ƒå’Œæ¼”å¥å‚æ•°ã€‚")
-        hint.setObjectName("SectionHint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        # One-tap performer mode
-        quick = QGroupBox("ä¸€é”®è¿›å…¥æ¼”å¥æ¨¡å¼")
-        ql = QHBoxLayout(quick)
-        self.instrument_buttons = {}
-        items = [
-            ("ğŸ¸ æœ¨å‰ä»–æ‰‹","guitar"),
-            ("ğŸ¸ ç”µå‰ä»–æ‰‹","electric_guitar"),
-            ("ğŸ¸ è´æ–¯æ‰‹","bass"),
-            ("ğŸ¥ é¼“æ‰‹","drums"),
-            ("ğŸ¹ é”®ç›˜æ‰‹","piano"),
-        ]
-        for text,key in items:
-            b=QPushButton(text)
-            b.setCheckable(True)
-            b.setMinimumHeight(48)
-            b.clicked.connect(lambda checked=False,k=key: self.select_instrument(k))
-            self.instrument_buttons[key]=b
-            ql.addWidget(b)
-        layout.addWidget(quick)
-
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_guitar_tab(), "æœ¨å‰ä»–")
-        self.tabs.addTab(self._build_electric_guitar_tab(), "ç”µå‰ä»–")
-        self.tabs.addTab(self._build_bass_tab(), "è´æ–¯")
-        self.tabs.addTab(self._build_drums_tab(), "é¼“")
-        self.tabs.addTab(self._build_piano_tab(), "é”®ç›˜")
-        layout.addWidget(self.tabs, 1)
-
-        practice = QGroupBox("æ’ç»ƒåŠ©æ‰‹")
-        pl = QGridLayout(practice)
-        self.section_combo = QComboBox()
-        self.refresh_sections_btn = QPushButton("åˆ·æ–°æ®µè½")
-        self.refresh_sections_btn.clicked.connect(self.refresh_sections)
-        self.loop_checkbox = QCheckBox("å¾ªç¯å½“å‰æ®µè½")
-        self.loop_checkbox.toggled.connect(self.toggle_section_loop)
-        self.countin_checkbox = QCheckBox("æ¯æ¬¡å¼€å§‹å‰ 4 æ‹ Count-in")
-        self.countin_checkbox.setChecked(True)
-        self.practice_speed = QComboBox()
-        self.practice_speed.addItems(["70% æ…¢ç»ƒ","85% æ’ç»ƒ","100% åŸé€Ÿ"])
-        self.practice_speed.setCurrentIndex(2)
-        self.current_bar = QLabel("å½“å‰ï¼šâ€”")
-        self.current_bar.setObjectName("StatusGood")
-        jump_btn = QPushButton("è·³åˆ°æ‰€é€‰æ®µè½")
-        jump_btn.clicked.connect(self.jump_to_section)
-        pl.addWidget(QLabel("æ®µè½"),0,0)
-        pl.addWidget(self.section_combo,0,1)
-        pl.addWidget(self.refresh_sections_btn,0,2)
-        pl.addWidget(jump_btn,0,3)
-        pl.addWidget(self.loop_checkbox,1,0)
-        pl.addWidget(self.countin_checkbox,1,1)
-        pl.addWidget(QLabel("ç»ƒä¹ é€Ÿåº¦é¢„è®¾"),1,2)
-        pl.addWidget(self.practice_speed,1,3)
-        pl.addWidget(self.current_bar,2,0,1,4)
-        layout.addWidget(practice)
-
-        bottom = QHBoxLayout()
-        save = QPushButton("ä¿å­˜æœ¬æ­Œæ›²ä¹æ‰‹è®¾ç½®")
-        apply_button_accent(save,"primary")
-        save.clicked.connect(self.save_instrument_profile)
-        score = QPushButton("æ‰“å¼€æ¼”å‡ºè°±é¢")
-        score.clicked.connect(self.open_score_page)
-        play = QPushButton("å¼€å§‹ / æš‚åœ")
-        apply_button_accent(play,"success")
-        play.clicked.connect(self.play_with_countin)
-        bottom.addWidget(save)
-        bottom.addWidget(score)
-        bottom.addStretch(1)
-        bottom.addWidget(play)
-        layout.addLayout(bottom)
-
-        self.timer=QTimer(self)
-        self.timer.timeout.connect(self.update_practice_status)
-        self.timer.start(200)
-
-    def _common_difficulty(self):
-        combo=QComboBox()
-        combo.addItems(["ç®€åŒ–","æ ‡å‡†","ä¸°å¯Œ","ä¸“ä¸š"])
-        combo.setCurrentText("æ ‡å‡†")
-        return combo
-
-    def _build_guitar_tab(self):
-        w=QWidget()
-        l=QGridLayout(w)
-        self.guitar_difficulty=self._common_difficulty()
-        self.guitar_tuning=QComboBox()
-        self.guitar_tuning.addItems(["æ ‡å‡† EADGBE","Drop D","é™åŠéŸ³ Eb","è‡ªå®šä¹‰"])
-        self.guitar_capo=QSpinBox()
-        self.guitar_capo.setRange(0,12)
-        self.guitar_capo.setSuffix(" å“")
-        self.guitar_style=QComboBox()
-        self.guitar_style.addItems(["è‡ªåŠ¨æ¨è","æ‰«å¼¦","åˆ†è§£å’Œå¼¦","Power Chord","æ‹¨ç‰‡èŠ‚å¥","Fingerstyleå‚è€ƒ"])
-        self.guitar_density=QSlider(Qt.Horizontal)
-        self.guitar_density.setRange(1,10); self.guitar_density.setValue(5)
-        l.addWidget(QLabel("æ¼”å¥éš¾åº¦"),0,0); l.addWidget(self.guitar_difficulty,0,1)
-        l.addWidget(QLabel("è°ƒå¼¦"),1,0); l.addWidget(self.guitar_tuning,1,1)
-        l.addWidget(QLabel("Capo"),2,0); l.addWidget(self.guitar_capo,2,1)
-        l.addWidget(QLabel("ä¼´å¥æ–¹å¼"),3,0); l.addWidget(self.guitar_style,3,1)
-        l.addWidget(QLabel("æ¼”å¥å¯†åº¦"),4,0); l.addWidget(self.guitar_density,4,1)
-        tips=QLabel("å»ºè®®ï¼šæ­Œæ‰‹è‡ªå¼¹å‰ä»–æ—¶å¯é€‰æ‹©â€œç®€åŒ– + æ‰«å¼¦â€ï¼›ä¹é˜ŸåŒå‰ä»–æ—¶å¯é™ä½å¯†åº¦ï¼Œé¿å…ä¸é”®ç›˜/å¦ä¸€æŠŠå‰ä»–æŠ¢é¢‘æ®µã€‚")
-        tips.setWordWrap(True); tips.setObjectName("SectionHint")
-        l.addWidget(tips,5,0,1,2)
-        return w
-
-    def _build_bass_tab(self):
-        w=QWidget()
-        l=QGridLayout(w)
-        self.bass_difficulty=self._common_difficulty()
-        self.bass_strings=QComboBox()
-        self.bass_strings.addItems(["4å¼¦æ ‡å‡† EADG","5å¼¦ BEADG"])
-        self.bass_pattern=QComboBox()
-        self.bass_pattern.addItems(["æ ¹éŸ³ä¼˜å…ˆ","æ ¹éŸ³+äº”åº¦","æ ¹éŸ³+å…«åº¦","Walkingå‚è€ƒ","æ›´æ—‹å¾‹åŒ–"])
-        self.bass_density=QSlider(Qt.Horizontal)
-        self.bass_density.setRange(1,10); self.bass_density.setValue(5)
-        self.bass_octave=QComboBox()
-        self.bass_octave.addItems(["æ­£å¸¸éŸ³åŒº","ä½éŸ³æ›´ç¨³","é«˜æŠŠä½æ›´å¤š"])
-        l.addWidget(QLabel("æ¼”å¥éš¾åº¦"),0,0); l.addWidget(self.bass_difficulty,0,1)
-        l.addWidget(QLabel("ä¹å™¨"),1,0); l.addWidget(self.bass_strings,1,1)
-        l.addWidget(QLabel("Bass Line"),2,0); l.addWidget(self.bass_pattern,2,1)
-        l.addWidget(QLabel("éŸ³ç¬¦å¯†åº¦"),3,0); l.addWidget(self.bass_density,3,1)
-        l.addWidget(QLabel("éŸ³åŒº"),4,0); l.addWidget(self.bass_octave,4,1)
-        tips=QLabel("å»ºè®®ï¼šç°åœºä¼´å”±ä¼˜å…ˆâ€œæ ¹éŸ³+äº”åº¦â€ï¼Œç¨³å®šä½é¢‘ï¼›éœ€è¦æ›´ç°ä»£çš„æ„Ÿè§‰æ—¶å†å¢åŠ å…«åº¦å’Œç»è¿‡éŸ³ã€‚")
-        tips.setWordWrap(True); tips.setObjectName("SectionHint")
-        l.addWidget(tips,5,0,1,2)
-        return w
-
-    def _build_electric_guitar_tab(self):
-        w=QWidget()
-        l=QGridLayout(w)
-        self.electric_difficulty=self._common_difficulty()
-        self.electric_tuning=QComboBox()
-        self.electric_tuning.addItems(["æ ‡å‡† EADGBE","Drop D","é™åŠéŸ³ Eb","Drop C"])
-        self.electric_role=QComboBox()
-        self.electric_role.addItems(["è‡ªåŠ¨è¯†åˆ«","èŠ‚å¥å‰ä»–","ä¸»éŸ³å‰ä»–","Power Chord","æ¸…éŸ³é“ºåº•","Solo"])
-        self.electric_tone=QComboBox()
-        self.electric_tone.addItems(["è·ŸéšåŸæ›²","Clean","Crunch","Overdrive","High Gain"])
-        self.electric_density=QSlider(Qt.Horizontal)
-        self.electric_density.setRange(1,10); self.electric_density.setValue(5)
-        l.addWidget(QLabel("æ¼”å¥éš¾åº¦"),0,0); l.addWidget(self.electric_difficulty,0,1)
-        l.addWidget(QLabel("è°ƒå¼¦"),1,0); l.addWidget(self.electric_tuning,1,1)
-        l.addWidget(QLabel("æ¼”å¥è§’è‰²"),2,0); l.addWidget(self.electric_role,2,1)
-        l.addWidget(QLabel("éŸ³è‰²å»ºè®®"),3,0); l.addWidget(self.electric_tone,3,1)
-        l.addWidget(QLabel("æ¼”å¥å¯†åº¦"),4,0); l.addWidget(self.electric_density,4,1)
-        tips=QLabel("UVR å…¼å®¹å…­è½¨æ¨¡å‹å…ˆç”ŸæˆçœŸå® Guitar stemï¼Œå†è¿›è¡Œæœ¨å‰ä»–/ç”µå‰ä»–äºŒé˜¶æ®µè¯†åˆ«ï¼›æ’ç»ƒæ—¶é€‰æ‹©ç”µå‰ä»–æ‰‹ä¼šè‡ªåŠ¨å…³é—­ç”µå‰ä»–åŸè½¨ã€‚")
-        tips.setWordWrap(True); tips.setObjectName("SectionHint")
-        l.addWidget(tips,5,0,1,2)
-        return w
-
-    def _build_drums_tab(self):
-        w=QWidget()
-        l=QGridLayout(w)
-        self.drums_difficulty=self._common_difficulty()
-        self.drums_groove=QComboBox()
-        self.drums_groove.addItems(["è‡ªåŠ¨æ¨è","Pop 8Beat","Rock 8Beat","Ballad","Funkå‚è€ƒ","Shuffleå‚è€ƒ"])
-        self.drums_hihat=QComboBox()
-        self.drums_hihat.addItems(["å…«åˆ†éŸ³ç¬¦","åå…­åˆ†éŸ³ç¬¦","å¼€é—­é•²æ··åˆ","Rideä¸ºä¸»"])
-        self.drums_fill=QComboBox()
-        self.drums_fill.addItems(["å°‘é‡ Fill","æ®µè½å‰ Fill","å‰¯æ­ŒåŠ å¼º","ä¸°å¯Œ Fill"])
-        self.drums_strength=QSlider(Qt.Horizontal)
-        self.drums_strength.setRange(1,10); self.drums_strength.setValue(5)
-        l.addWidget(QLabel("æ¼”å¥éš¾åº¦"),0,0); l.addWidget(self.drums_difficulty,0,1)
-        l.addWidget(QLabel("Groove"),1,0); l.addWidget(self.drums_groove,1,1)
-        l.addWidget(QLabel("Hi-Hat/Ride"),2,0); l.addWidget(self.drums_hihat,2,1)
-        l.addWidget(QLabel("Fill"),3,0); l.addWidget(self.drums_fill,3,1)
-        l.addWidget(QLabel("åŠ›åº¦"),4,0); l.addWidget(self.drums_strength,4,1)
-        tips=QLabel("å»ºè®®ï¼šé¼“æ‰‹æ’ç»ƒæ—¶ä¼˜å…ˆçœ‹æ®µè½å’Œå°èŠ‚æç¤ºï¼›å‰¯æ­Œã€é—´å¥å‰çš„ Fill ç”¨ Marker å¯¹é½ä¼šæ¯”å•çº¯çœ‹æ—¶é—´æ›´æ–¹ä¾¿ã€‚")
-        tips.setWordWrap(True); tips.setObjectName("SectionHint")
-        l.addWidget(tips,5,0,1,2)
-        return w
-
-    def _build_piano_tab(self):
-        w=QWidget()
-        l=QGridLayout(w)
-        self.piano_difficulty=self._common_difficulty()
-        self.piano_left=QComboBox()
-        self.piano_left.addItems(["æ ¹éŸ³","æ ¹éŸ³+äº”åº¦","å…«åº¦ä½éŸ³","åˆ†è§£å’Œå¼¦"])
-        self.piano_right=QComboBox()
-        self.piano_right.addItems(["ä¸‰å’Œå¼¦","è½¬ä½ä¼˜å…ˆ","åˆ†è§£å’Œå¼¦","Padé“ºåº•","RhodesèŠ‚å¥å‹"])
-        self.piano_sustain=QComboBox()
-        self.piano_sustain.addItems(["è‡ªåŠ¨æ¨è","å°‘å»¶éŸ³","ä¸­ç­‰å»¶éŸ³","æ°›å›´é•¿å»¶éŸ³"])
-        self.piano_density=QSlider(Qt.Horizontal)
-        self.piano_density.setRange(1,10); self.piano_density.setValue(5)
-        l.addWidget(QLabel("æ¼”å¥éš¾åº¦"),0,0); l.addWidget(self.piano_difficulty,0,1)
-        l.addWidget(QLabel("å·¦æ‰‹"),1,0); l.addWidget(self.piano_left,1,1)
-        l.addWidget(QLabel("å³æ‰‹"),2,0); l.addWidget(self.piano_right,2,1)
-        l.addWidget(QLabel("å»¶éŸ³"),3,0); l.addWidget(self.piano_sustain,3,1)
-        l.addWidget(QLabel("ç»‡ä½“å¯†åº¦"),4,0); l.addWidget(self.piano_density,4,1)
-        tips=QLabel("å»ºè®®ï¼šé’¢ç´å¼¹å”±å¯ç”¨â€œå·¦æ‰‹æ ¹éŸ³+å³æ‰‹è½¬ä½â€ï¼›ä¹é˜Ÿé‡Œåˆ™é™ä½å·¦æ‰‹å¯†åº¦ï¼ŒæŠŠä½é¢‘ç©ºé—´ç•™ç»™ Bassã€‚")
-        tips.setWordWrap(True); tips.setObjectName("SectionHint")
-        l.addWidget(tips,5,0,1,2)
-        return w
-
-    def select_instrument(self,key):
-        index={"guitar":0,"electric_guitar":1,"bass":2,"drums":3,"piano":4}.get(key,0)
-        self.tabs.setCurrentIndex(index)
-        for k,b in self.instrument_buttons.items():
-            b.setChecked(k==key)
-        self.main.apply_live_preset(key)
-        if hasattr(self.main,"score_performance"):
-            mapping={"guitar":"å…­çº¿è°±","electric_guitar":"å…­çº¿è°±","bass":"è´æ–¯è°±","drums":"é¼“è°±","piano":"é”®ç›˜è°±"}
-            idx=self.main.score_performance.score_type.findText(mapping[key])
-            if idx>=0:
-                self.main.score_performance.score_type.setCurrentIndex(idx)
-                self.main.score_performance.refresh_score()
-
-    def refresh_sections(self):
-        self.section_combo.clear()
-        sections=getattr(self.main,"section_timeline",[]) or []
-        for i,s in enumerate(sections):
-            self.section_combo.addItem(f"{i+1}. {s.get('name','æ®µè½')}  {self.main._format_time(s.get('seconds',0))}",i)
-
-    def jump_to_section(self):
-        idx=self.section_combo.currentData()
-        sections=getattr(self.main,"section_timeline",[]) or []
-        dur=self.main.engine.duration_seconds()
-        if idx is None or not sections or dur<=0:
-            return
-        sec=float(sections[int(idx)].get("seconds",0))
-        self.main.engine.seek_ratio(sec/dur)
-
-    def toggle_section_loop(self,checked):
-        idx=self.section_combo.currentData()
-        self.loop_section_index=int(idx) if checked and idx is not None else -1
-
-    def update_practice_status(self):
-        rows=getattr(self.main,"chord_timeline",[]) or []
-        pos=self.main.engine.position_seconds()
-        current=None
-        for row in rows:
-            if pos>=row.get("seconds",0):
-                current=row
-            else:
-                break
-        if current:
-            self.current_bar.setText(
-                f"å½“å‰ï¼š{current.get('section','')} Â· ç¬¬ {current.get('bar','-')} å°èŠ‚ Â· "
-                f"{' / '.join(current.get('chords') or [])}"
-            )
-
-        if self.loop_checkbox.isChecked() and self.loop_section_index>=0:
-            sections=getattr(self.main,"section_timeline",[]) or []
-            i=self.loop_section_index
-            if i < len(sections):
-                start=float(sections[i].get("seconds",0))
-                end=float(sections[i+1].get("seconds",self.main.engine.duration_seconds())) if i+1<len(sections) else self.main.engine.duration_seconds()
-                if end>start and pos>=end-0.05:
-                    dur=self.main.engine.duration_seconds()
-                    if dur>0:
-                        self.main.engine.seek_ratio(start/dur)
-
-    def play_with_countin(self):
-        if self.countin_checkbox.isChecked() and hasattr(self.main,"live"):
-            try:
-                self.main.live.start_count_in()
-                return
-            except Exception:
-                pass
-        self.main.play_pause()
-
-    def open_score_page(self):
-        # Navigation order: import 0, AI split 1, arrange 2, score 3
-        self.main.nav.setCurrentRow(4)
-        self.main.score_performance.refresh_score()
-
-    def _profile_data(self):
-        key=["guitar","electric_guitar","bass","drums","piano"][self.tabs.currentIndex()]
-        data={"instrument":key,"practice_speed":self.practice_speed.currentText()}
-        if key=="guitar":
-            data.update({
-                "difficulty":self.guitar_difficulty.currentText(),
-                "tuning":self.guitar_tuning.currentText(),
-                "capo":self.guitar_capo.value(),
-                "style":self.guitar_style.currentText(),
-                "density":self.guitar_density.value()
-            })
-        elif key=="electric_guitar":
-            data.update({
-                "difficulty":self.electric_difficulty.currentText(),
-                "tuning":self.electric_tuning.currentText(),
-                "role":self.electric_role.currentText(),
-                "tone":self.electric_tone.currentText(),
-                "density":self.electric_density.value()
-            })
-        elif key=="bass":
-            data.update({
-                "difficulty":self.bass_difficulty.currentText(),
-                "strings":self.bass_strings.currentText(),
-                "pattern":self.bass_pattern.currentText(),
-                "density":self.bass_density.value(),
-                "range":self.bass_octave.currentText()
-            })
-        elif key=="drums":
-            data.update({
-                "difficulty":self.drums_difficulty.currentText(),
-                "groove":self.drums_groove.currentText(),
-                "hihat":self.drums_hihat.currentText(),
-                "fill":self.drums_fill.currentText(),
-                "strength":self.drums_strength.value()
-            })
-        else:
-            data.update({
-                "difficulty":self.piano_difficulty.currentText(),
-                "left":self.piano_left.currentText(),
-                "right":self.piano_right.currentText(),
-                "sustain":self.piano_sustain.currentText(),
-                "density":self.piano_density.value()
-            })
-        return data
-
-    def save_instrument_profile(self):
-        if not self.main.song_file:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆå¯¼å…¥æ­Œæ›²ã€‚")
-            return
-        song=Path(self.main.song_file).stem
-        folder=BASE_DIR/"instrument_profiles"
-        folder.mkdir(parents=True,exist_ok=True)
-        data=self._profile_data()
-        data["song"]=self.main.song_file
-        data["saved_at"]=time.time()
-        p=folder/f"{song}_{data['instrument']}.json"
-        p.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
-        QMessageBox.information(self,"ä¿å­˜æˆåŠŸ",f"æœ¬æ­Œæ›²çš„ä¹æ‰‹è®¾ç½®å·²ä¿å­˜ï¼š\n{p}")
-
-
-
-class UniversalImportPage(QWidget):
-    SUPPORTED_EXTS = {
-        ".mp3",".wav",".flac",".m4a",".aac",".ogg",".opus",".wma",
-        ".aiff",".aif",".alac",".ac3",".ape",".mka",".caf"
-    }
-
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.queue = []
-        self.clipboard_timer = None
-
-        layout = QVBoxLayout(self)
-        title = QLabel("ç»Ÿä¸€éŸ³ä¹å¯¼å…¥ä¸­å¿ƒ")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        hint = QLabel(
-            "æ”¯æŒæœ¬åœ°å¤šæ ¼å¼ã€æ‰¹é‡æ–‡ä»¶ã€åˆ†äº«æ–‡æœ¬/é“¾æ¥ã€å‰ªè´´æ¿å¯¼å…¥ã€‚"
-            "å¯¼å…¥åç»Ÿä¸€è½¬ä¸ºæ©˜å‘³å„¿éŸ³ä¹å·¥ä½œ WAVï¼Œä¸ä¿®æ”¹åŸæ–‡ä»¶ã€‚"
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("SectionHint")
-        layout.addWidget(hint)
-
-        tabs = QTabWidget()
-        tabs.addTab(self._build_local_tab(), "æœ¬åœ° / æ‰¹é‡")
-        tabs.addTab(self._build_link_tab(), "åˆ†äº«é“¾æ¥")
-        tabs.addTab(self._build_queue_tab(), "å¯¼å…¥é˜Ÿåˆ—")
-        layout.addWidget(tabs, 1)
-
-    def _build_local_tab(self):
-        w=QWidget()
-        l=QVBoxLayout(w)
-
-        bar=QHBoxLayout()
-        one=QPushButton("é€‰æ‹©éŸ³ä¹æ–‡ä»¶")
-        many=QPushButton("æ‰¹é‡é€‰æ‹©")
-        folder=QPushButton("å¯¼å…¥æ•´ä¸ªæ–‡ä»¶å¤¹")
-        one.clicked.connect(self.pick_one)
-        many.clicked.connect(self.pick_many)
-        folder.clicked.connect(self.pick_folder)
-        bar.addWidget(one); bar.addWidget(many); bar.addWidget(folder); bar.addStretch(1)
-        l.addLayout(bar)
-
-        self.local_list=QTableWidget(0,5)
-        self.local_list.setHorizontalHeaderLabels(["æ–‡ä»¶","æ ¼å¼","å¤§å°","çŠ¶æ€","ç›®æ ‡å·¥ä½œæ–‡ä»¶"])
-        self.local_list.horizontalHeader().setStretchLastSection(True)
-        self.local_list.cellDoubleClicked.connect(self.open_local_item)
-        l.addWidget(self.local_list)
-
-        opts=QHBoxLayout()
-        self.auto_convert=QCheckBox("è‡ªåŠ¨è½¬æ¢ä¸º WAV å·¥ä½œæ ¼å¼")
-        self.auto_convert.setChecked(True)
-        self.auto_fingerprint=QCheckBox("è‡ªåŠ¨éŸ³é¢‘æŒ‡çº¹å»é‡")
-        self.auto_fingerprint.setChecked(True)
-        self.auto_preanalyze=QCheckBox("å¯¼å…¥ååŠ å…¥ BPM/è°ƒæ€§é¢„åˆ†æ")
-        self.auto_preanalyze.setChecked(True)
-        start=QPushButton("å¼€å§‹å¯¼å…¥")
-        apply_button_accent(start,"primary")
-        start.clicked.connect(self.process_local_queue)
-        opts.addWidget(self.auto_convert)
-        opts.addWidget(self.auto_fingerprint)
-        opts.addWidget(self.auto_preanalyze)
-        opts.addStretch(1)
-        opts.addWidget(start)
-        l.addLayout(opts)
-        return w
-
-    def _build_link_tab(self):
-        w=QWidget()
-        l=QVBoxLayout(w)
-
-        self.share_text=QPlainTextEdit()
-        self.share_text.setPlaceholderText(
-            "ç²˜è´´æœ¬äººæœ‰æƒä½¿ç”¨çš„å…¬å¼€éŸ³é¢‘ç›´é“¾ï¼Œä¾‹å¦‚ï¼š\n"
-            "æ­Œæ›²ï¼šXXXX\nhttps://example.com/audio.mp3"
-        )
-        l.addWidget(self.share_text)
-
-        bar=QHBoxLayout()
-        paste=QPushButton("ä»å‰ªè´´æ¿ç²˜è´´")
-        parse=QPushButton("æå–é“¾æ¥")
-        download=QPushButton("å¯¼å…¥æˆæƒéŸ³é¢‘")
-        paste.clicked.connect(self.paste_clipboard)
-        parse.clicked.connect(self.parse_share_text)
-        download.clicked.connect(self.download_selected_link)
-        self.clip_watch=QCheckBox("ç›‘å¬å‰ªè´´æ¿ä¸­çš„éŸ³ä¹é“¾æ¥")
-        self.clip_watch.toggled.connect(self.toggle_clipboard_watch)
-        bar.addWidget(paste); bar.addWidget(parse); bar.addWidget(download)
-        bar.addWidget(self.clip_watch); bar.addStretch(1)
-        l.addLayout(bar)
-
-        self.link_table=QTableWidget(0,4)
-        self.link_table.setHorizontalHeaderLabels(["URL","ç±»å‹åˆ¤æ–­","çŠ¶æ€","è¯´æ˜"])
-        self.link_table.horizontalHeader().setStretchLastSection(True)
-        l.addWidget(self.link_table)
-
-        notice=QLabel(
-            "æœ¬è½¯ä»¶ç›®å‰ä»…ä¾›å­¦ä¹ ä¸ç ”ç©¶ä½¿ç”¨ï¼Œä¸æä¾›æ­Œæ›²ä¸‹è½½æœåŠ¡ã€‚"
-            "ä»…å¯å¯¼å…¥ç”¨æˆ·æœ¬äººæœ‰æƒä½¿ç”¨çš„æœ¬åœ°éŸ³é¢‘æˆ–å…¬å¼€ç›´é“¾ï¼›"
-            "ä¸ä¼šç»•è¿‡ DRMã€ä¼šå‘˜ã€ä»˜è´¹ã€ç™»å½•éªŒè¯æˆ–å¹³å°è®¿é—®æ§åˆ¶ã€‚"
-        )
-        notice.setWordWrap(True)
-        notice.setObjectName("SectionHint")
-        l.addWidget(notice)
-        return w
-
-    def _build_queue_tab(self):
-        w=QWidget()
-        l=QVBoxLayout(w)
-        self.queue_table=QTableWidget(0,6)
-        self.queue_table.setHorizontalHeaderLabels(["æ¥æº","æ–‡ä»¶","æŒ‡çº¹","è½¬æ¢","é¢„åˆ†æ","çŠ¶æ€"])
-        self.queue_table.horizontalHeader().setStretchLastSection(True)
-        l.addWidget(self.queue_table)
-        return w
-
-    def _audio_filter(self):
-        return (
-            "éŸ³é¢‘æ–‡ä»¶ (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma "
-            "*.aiff *.aif *.alac *.ac3 *.ape *.mka *.caf);;æ‰€æœ‰æ–‡ä»¶ (*.*)"
-        )
-
-
-    def open_local_item(self,row,col):
-        local=[x for x in self.queue if x.get("kind")=="local"]
-        if row<0 or row>=len(local):
-            return
-        item=local[row]
-        path=item.get("working") or item.get("source")
-        if path and Path(path).exists():
-            self.main.load_imported_working_file(path)
-
-    def pick_one(self):
-        p,_=QFileDialog.getOpenFileName(self,"é€‰æ‹©éŸ³ä¹æ–‡ä»¶","",self._audio_filter())
-        if p: self.add_local_files([p])
-
-    def pick_many(self):
-        files,_=QFileDialog.getOpenFileNames(self,"æ‰¹é‡é€‰æ‹©éŸ³ä¹æ–‡ä»¶","",self._audio_filter())
-        if files: self.add_local_files(files)
-
-    def pick_folder(self):
-        folder=QFileDialog.getExistingDirectory(self,"é€‰æ‹©éŸ³ä¹æ–‡ä»¶å¤¹")
-        if not folder: return
-        files=[]
-        for p in Path(folder).rglob("*"):
-            if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTS:
-                files.append(str(p))
-        self.add_local_files(files)
-
-    def add_local_files(self, files):
-        existing={x.get("source") for x in self.queue}
-        for f in files:
-            p=Path(f)
-            if not p.exists() or p.suffix.lower() not in self.SUPPORTED_EXTS:
-                continue
-            if str(p) in existing:
-                continue
-            item={"source":str(p),"kind":"local","status":"ç­‰å¾…å¯¼å…¥"}
-            self.queue.append(item)
-            existing.add(str(p))
-        self.refresh_tables()
-
-    def _fingerprint(self, path):
-        h=hashlib.sha256()
-        with open(path,"rb") as f:
-            while True:
-                b=f.read(1024*1024)
-                if not b: break
-                h.update(b)
-        return h.hexdigest()
-
-    def _working_dir(self):
-        if hasattr(self.main,"music_library"):
-            d=self.main.music_library.library_paths["temp"]/"working"
-        else:
-            d=BASE_DIR/"imports"/"working"
-        d.mkdir(parents=True,exist_ok=True)
-        return d
-
-    def _original_dir(self):
-        if hasattr(self.main,"music_library"):
-            d=self.main.music_library.library_paths["originals"]/"æœ¬åœ°å¯¼å…¥"
-        else:
-            d=BASE_DIR/"imports"/"originals"
-        d.mkdir(parents=True,exist_ok=True)
-        return d
-
-    def _convert_to_wav(self, src):
-        src=Path(src)
-        try:
-            fingerprint=self._fingerprint(src)[:12]
-        except Exception:
-            fingerprint=hashlib.sha256(normalized_path(src).encode("utf-8")).hexdigest()[:12]
-        out=self._working_dir()/(safe_file_stem(src.stem)+f"_{fingerprint}_work.wav")
-        ffmpeg=self.main._find_ffmpeg() if hasattr(self.main,"_find_ffmpeg") else ""
-        if not ffmpeg:
-            # WAV can be used directly when ffmpeg isn't available.
-            if src.suffix.lower()==".wav":
-                return str(src)
-            raise RuntimeError("æœªæ‰¾åˆ° FFmpegï¼Œæ— æ³•æŠŠè¯¥æ ¼å¼è½¬æ¢æˆç»Ÿä¸€å·¥ä½œ WAVã€‚")
-        cmd=[
-            ffmpeg,"-y","-i",str(src),
-            "-vn","-ac","2","-ar","44100","-c:a","pcm_s24le",str(out)
-        ]
-        p=subprocess.run(cmd,capture_output=True,text=True,timeout=600)
-        if p.returncode!=0 or not out.exists():
-            raise RuntimeError((p.stderr or "FFmpeg è½¬æ¢å¤±è´¥")[-1800:])
-        return str(out)
-
-    def process_local_queue(self):
-        if not self.queue:
-            QMessageBox.information(self,"å¯¼å…¥","å½“å‰æ²¡æœ‰å¾…å¯¼å…¥æ–‡ä»¶ã€‚")
-            return
-
-        fingerprint_db=BASE_DIR/"imports"/"fingerprints.json"
-        fingerprint_db.parent.mkdir(parents=True,exist_ok=True)
-        try:
-            fpdb=json.loads(fingerprint_db.read_text(encoding="utf-8")) if fingerprint_db.exists() else {}
-        except Exception:
-            fpdb={}
-
-        completed=0
-        for idx,item in enumerate(self.queue):
-            if item.get("status") in ("å·²å¯¼å…¥", "å·²å»é‡/å¤ç”¨"):
-                continue
-            src=item["source"]
-            try:
-                item["status"]="å¤„ç†ä¸­"
-                self.refresh_tables()
-                QApplication.processEvents()
-
-                fp=""
-                if self.auto_fingerprint.isChecked():
-                    fp=self._fingerprint(src)
-                    item["fingerprint"]=fp
-                    if fp in fpdb and Path(fpdb[fp].get("working","")).exists():
-                        item["working"]=fpdb[fp]["working"]
-                        item["status"]="å·²å»é‡/å¤ç”¨"
-                        completed+=1
-                        continue
-
-                # preserve original
-                op=Path(src)
-                original_dst=self._original_dir()/op.name
-                if not original_dst.exists():
-                    try:
-                        shutil.copy2(op, original_dst)
-                    except Exception:
-                        original_dst=op
-
-                working=str(op)
-                if self.auto_convert.isChecked():
-                    working=self._convert_to_wav(op)
-                item["working"]=working
-
-                if fp:
-                    fpdb[fp]={
-                        "source":str(op),
-                        "original":str(original_dst),
-                        "working":working,
-                        "imported_at":time.time()
-                    }
-
-                item["preanalyze"]="å¾…åˆ†æ" if self.auto_preanalyze.isChecked() else "å…³é—­"
-                item["status"]="å·²å¯¼å…¥"
-                completed+=1
-            except Exception as e:
-                item["status"]="å¤±è´¥ï¼š"+str(e)[:120]
-            finally:
-                self.refresh_tables()
-                QApplication.processEvents()
-
-        atomic_write_json(fingerprint_db, fpdb)
-        if hasattr(self.main,"music_library"):
-            self.main.music_library.scan_imports()
-        QMessageBox.information(self,"å¯¼å…¥å®Œæˆ",f"å·²å¤„ç† {completed} ä¸ªéŸ³ä¹ç´ æï¼Œå¹¶åŒæ­¥åˆ°éŸ³ä¹åº“ã€‚")
-
-    def paste_clipboard(self):
-        text=QApplication.clipboard().text()
-        if text:
-            self.share_text.setPlainText(text)
-            self.parse_share_text()
-
-    def _extract_urls(self, text):
-        import re as _re
-        urls=_re.findall(r'https?://[^\s<>"\']+',text or "")
-        clean=[]
-        for u in urls:
-            u=u.rstrip("ï¼Œã€‚ï¼›;ï¼‰)]}")
-            if u not in clean:
-                clean.append(u)
-        return clean
-
-    def _classify_url(self,url):
-        path=urllib.parse.urlparse(url).path.lower()
-        ext=Path(path).suffix.lower()
-        if ext in self.SUPPORTED_EXTS:
-            return "ç›´æ¥éŸ³é¢‘é“¾æ¥","å¯å°è¯•ç›´æ¥ä¸‹è½½"
-        if ext in {".zip",".7z",".rar"}:
-            return "å‹ç¼©åŒ…é“¾æ¥","ä¸è‡ªåŠ¨è§£å‹ä¸ºéŸ³ä¹"
-        host=urllib.parse.urlparse(url).netloc.lower()
-        if host:
-            return "åˆ†äº«/ç½‘é¡µé“¾æ¥","éœ€è¦å¹³å°æä¾›å…¬å¼€å¯ä¸‹è½½åª’ä½“åœ°å€"
-        return "æœªçŸ¥",""
-
-    def parse_share_text(self):
-        urls=self._extract_urls(self.share_text.toPlainText())
-        self.link_table.setRowCount(len(urls))
-        for r,u in enumerate(urls):
-            kind,note=self._classify_url(u)
-            vals=[u,kind,"å¾…å¤„ç†",note]
-            for c,v in enumerate(vals):
-                self.link_table.setItem(r,c,QTableWidgetItem(v))
-
-    def _selected_url(self):
-        r=self.link_table.currentRow()
-        if r<0 and self.link_table.rowCount()==1:
-            r=0
-        if r<0: return ""
-        item=self.link_table.item(r,0)
-        return item.text().strip() if item else ""
-
-    def download_selected_link(self):
-        url=self._selected_url()
-        if not url:
-            QMessageBox.information(self,"é“¾æ¥å¯¼å…¥","è¯·å…ˆæå–å¹¶é€‰æ‹©ä¸€ä¸ªé“¾æ¥ã€‚")
-            return
-        kind,note=self._classify_url(url)
-        if kind!="ç›´æ¥éŸ³é¢‘é“¾æ¥":
-            QMessageBox.information(
-                self,"æš‚ä¸ç›´æ¥ä¸‹è½½",
-                "è¯¥é“¾æ¥ä¸æ˜¯æ˜ç¡®çš„å…¬å¼€éŸ³é¢‘ç›´é“¾ã€‚\n\n"
-                "æ©˜å‘³å„¿éŸ³ä¹ä¸ä¼šç»•è¿‡ç™»å½•ã€DRMã€ä¼šå‘˜ã€ä»˜è´¹æˆ–å¹³å°è®¿é—®æ§åˆ¶ã€‚"
-                "å¦‚æœå¹³å°èƒ½æä¾›å…¬å¼€ä¸‹è½½åœ°å€æˆ–ç”¨æˆ·è‡ªå·±çš„æ–‡ä»¶ç›´é“¾ï¼Œå¯å†ç²˜è´´è¯¥ç›´é“¾ã€‚"
-            )
-            return
-        try:
-            downloads=(
-                self.main.music_library.library_paths["temp"]/"é“¾æ¥å¯¼å…¥"
-                if hasattr(self.main,"music_library")
-                else BASE_DIR/"imports"/"downloads"
-            )
-            downloads.mkdir(parents=True,exist_ok=True)
-            parsed=urllib.parse.urlparse(url)
-            name=Path(parsed.path).name or "downloaded_audio"
-            dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.2.8"})
-            with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
-                total=int(resp.headers.get("Content-Length") or 0)
-                read=0
-                while True:
-                    chunk=resp.read(256*1024)
-                    if not chunk: break
-                    f.write(chunk); read+=len(chunk)
-                    if total>0:
-                        pct=int(read/total*100)
-                        self.link_table.setItem(self.link_table.currentRow() if self.link_table.currentRow()>=0 else 0,2,QTableWidgetItem(f"ä¸‹è½½ {pct}%"))
-                        QApplication.processEvents()
-            self.add_local_files([str(dest)])
-            if hasattr(self.main,"music_library"):
-                self.main.music_library.scan_imports()
-            QMessageBox.information(self,"ä¸‹è½½å®Œæˆ",f"å·²ä¸‹è½½å¹¶åŠ å…¥æœ¬åœ°å¯¼å…¥é˜Ÿåˆ—ï¼š\n{dest}")
-        except Exception as e:
-            QMessageBox.critical(self,"é“¾æ¥ä¸‹è½½å¤±è´¥",str(e))
-
-    def toggle_clipboard_watch(self,checked):
-        if checked:
-            if self.clipboard_timer is None:
-                self.clipboard_timer=QTimer(self)
-                self.clipboard_timer.timeout.connect(self.check_clipboard)
-            self._last_clipboard=""
-            self.clipboard_timer.start(1200)
-        else:
-            if self.clipboard_timer:
-                self.clipboard_timer.stop()
-
-    def check_clipboard(self):
-        text=QApplication.clipboard().text().strip()
-        if not text or text==getattr(self,"_last_clipboard",""):
-            return
-        self._last_clipboard=text
-        urls=self._extract_urls(text)
-        if not urls:
-            return
-        direct=[u for u in urls if self._classify_url(u)[0]=="ç›´æ¥éŸ³é¢‘é“¾æ¥"]
-        if direct:
-            self.share_text.setPlainText(text)
-            self.parse_share_text()
-
-    def refresh_tables(self):
-        local=[x for x in self.queue if x.get("kind")=="local"]
-        self.local_list.setRowCount(len(local))
-        for r,item in enumerate(local):
-            p=Path(item["source"])
-            try:
-                size=f"{p.stat().st_size/1024/1024:.1f} MB"
-            except Exception:
-                size="-"
-            vals=[
-                p.name,p.suffix.lower().lstrip(".").upper(),size,
-                item.get("status",""),
-                item.get("working","")
-            ]
-            for c,v in enumerate(vals):
-                self.local_list.setItem(r,c,QTableWidgetItem(str(v)))
-
-        self.queue_table.setRowCount(len(self.queue))
-        for r,item in enumerate(self.queue):
-            vals=[
-                item.get("kind",""),
-                Path(item.get("source","")).name,
-                (item.get("fingerprint","")[:12] if item.get("fingerprint") else "-"),
-                ("å®Œæˆ" if item.get("working") else "å¾…å¤„ç†"),
-                item.get("preanalyze","-"),
-                item.get("status","")
-            ]
-            for c,v in enumerate(vals):
-                self.queue_table.setItem(r,c,QTableWidgetItem(str(v)))
-
-
-
-class MusicLibraryPage(QWidget):
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.remote_rows = {}
-        self.remote_artist_rows = {}
-        self._catalog_workers = []
-        self._catalog_request_id = 0
-        self.server_library_root = r"G:\JuweierMusicLibrary\01_Originals\æŒ‰æ­Œæ‰‹åˆ†ç±»(MP3ï¼‰"
-        # Client state must stay inside the application data directory.  The
-        # G: path belongs to the AI server and is never opened by this process.
-        client_state = BASE_DIR / "library" / "client_state"
-        client_state.mkdir(parents=True, exist_ok=True)
-        self.library_paths = {
-            "originals": BASE_DIR / "imports" / "local_test",
-            "temp": BASE_DIR / "imports" / "local_test",
-            "covers": client_state / "covers",
-            "database": client_state,
-        }
-        self.db_path = client_state / "desktop_local_test.sqlite3"
-        self.cover_dir = client_state / "covers"
-        self.cover_dir.mkdir(parents=True, exist_ok=True)
-        self.scan_roots_file = client_state / "legacy_scan_roots.json"
-        self.catalog_cache_file = client_state / "server_catalog_cache.json"
-        self.scan_roots = []
-        self.link_worker = None
-        self.batch_queue = []
-        self.batch_index = -1
-        self.batch_worker = None
-        self.batch_running = False
-        self.batch_paused = False
-        self.batch_retry_failed = True
-        self.batch_completed = 0
-        self.batch_failed = 0
-        self.pipeline_jobs = []
-        self.pipeline_running = False
-        self.pipeline_paused = False
-        self.pipeline_job_index = -1
-        self.pipeline_stage = ""
-        self.pipeline_batch_worker = None
-        self.pipeline_stage_worker = None
-        self.pipeline_stage_order = [
-            "stems","analysis","chords","score","arrangement","render","library"
-        ]
-        self.scheduler_backoff_seconds = 15
-        self.scheduler_last_gpu_state = {}
-        self.scheduler_timer = QTimer(self)
-        self.scheduler_timer.timeout.connect(self._scheduler_tick)
-        self.scheduler_timer.start(5000)
-        self.cover_dir.mkdir(parents=True,exist_ok=True)
-        self._ensure_db()
-
-        layout=QVBoxLayout(self)
-        title=QLabel("éŸ³ä¹åº“ / è‡ªåŠ¨åˆ†æ")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-
-        hint=QLabel(
-            f"æœåŠ¡å™¨æ­Œæ›²ç›®å½•ï¼š{self.server_library_root}ã€‚åªé€šè¿‡æœåŠ¡å™¨ API è¯»å–ï¼Œä¸æ‰«æå®¢æˆ·ç«¯ G ç›˜ï¼›"
-            "åˆ†è½¨ä½¿ç”¨ UVR å…¼å®¹å…­è½¨å¼•æ“ï¼ŒGuitar stem å®Œæˆåå†è¯†åˆ«æœ¨å‰ä»–ä¸ç”µå‰ä»–ã€‚"
-        )
-        hint.setObjectName("SectionHint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        top=QHBoxLayout()
-        scan=QPushButton("æ‰«ææœåŠ¡å™¨ G ç›˜æ›²åº“")
-        choose_root=QPushButton("è®¾ç½®æœåŠ¡å™¨")
-        import_local=QPushButton("å¯¼å…¥æœ¬åœ°éŸ³ä¹")
-        import_link=QPushButton("å¯¼å…¥æˆæƒéŸ³é¢‘é“¾æ¥")
-        analyze=QPushButton("æ‰¹é‡ BPM / è°ƒæ€§åˆ†æ")
-        stems=QPushButton("å»ºç«‹å…­è½¨+ç”µå‰ä»–é˜Ÿåˆ—")
-        refresh=QPushButton("åˆ·æ–°éŸ³ä¹åº“")
-        apply_button_accent(scan,"primary")
-        scan.clicked.connect(self.scan_imports)
-        choose_root.clicked.connect(self.open_server_settings)
-        import_local.clicked.connect(self.import_local_music)
-        import_link.clicked.connect(self.import_share_link)
-        analyze.clicked.connect(self.batch_analyze)
-        stems.clicked.connect(self.enqueue_stems)
-        refresh.clicked.connect(self.refresh_library)
-        for b in [scan,choose_root,import_local,import_link,analyze,stems,refresh]:
-            top.addWidget(b)
-        top.addStretch(1)
-        layout.addLayout(top)
-
-        search_row=QHBoxLayout()
-        self.library_search=QLineEdit()
-        self.library_search.setPlaceholderText("æœç´¢æ­Œæ›²ã€æ­Œæ‰‹æˆ–ä¸“è¾‘")
-        self.library_category=QComboBox()
-        self.library_category.addItems(["å…¨éƒ¨","æœ¬åœ°å¯¼å…¥","ä¸´æ—¶æ­Œæ›²åº“","æŠ–éŸ³æµè¡Œ","é…·ç‹—æ’è¡Œæ¦œ"])
-        search_button=QPushButton("ğŸ” æœç´¢")
-        clear_button=QPushButton("æ¸…ç©º")
-        apply_button_accent(search_button,"primary")
-        self.library_search.returnPressed.connect(self.refresh_library)
-        self.library_category.currentTextChanged.connect(self.refresh_library)
-        search_button.clicked.connect(self.refresh_library)
-        clear_button.clicked.connect(lambda: (self.library_search.clear(), self.refresh_library()))
-        search_row.addWidget(self.library_search,1)
-        search_row.addWidget(self.library_category)
-        search_row.addWidget(search_button)
-        search_row.addWidget(clear_button)
-        layout.addLayout(search_row)
-
-        self.library_initial = "å…¨éƒ¨"
-        self.library_initial_buttons = {}
-        initial_row = QHBoxLayout()
-        initial_row.addWidget(QLabel("æ­Œæ‰‹é¦–å­—æ¯"))
-        for value in ["å…¨éƒ¨", *list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "#"]:
-            button = QPushButton(value)
-            button.setCheckable(True)
-            button.setChecked(value == "å…¨éƒ¨")
-            button.setFixedWidth(50 if value == "å…¨éƒ¨" else 36)
-            button.setStyleSheet(
-                "QPushButton{padding:2px 3px;color:#FFF2E8;font-weight:700;}"
-                "QPushButton:checked{background:#F46A0A;border-color:#FF8B2C;color:#FFFFFF;}"
-            )
-            button.clicked.connect(lambda checked=False, item=value: self._set_library_initial(item))
-            self.library_initial_buttons[value] = button
-            initial_row.addWidget(button)
-        initial_row.addStretch(1)
-        layout.addLayout(initial_row)
-
-        self.library_scan_status=QLabel("æœåŠ¡å™¨æ›²åº“ï¼šç­‰å¾…è¿æ¥")
-        self.library_scan_status.setObjectName("SectionHint")
-        self.library_scan_status.setWordWrap(True)
-        layout.addWidget(self.library_scan_status)
-
-        library_box=QGroupBox("æœåŠ¡å™¨ G ç›˜æ­Œæ‰‹æ­Œæ›²åº“ï¼ˆå±•å¼€æ­Œæ‰‹å³å¯æŸ¥çœ‹å…¨éƒ¨æ­Œæ›²ï¼‰")
-        library_layout=QHBoxLayout(library_box)
-        self.tree=QTreeWidget()
-        self.tree.setHeaderLabels(["æ­Œæ‰‹åˆ†ç±» / æ­Œæ›²","æ•°é‡ Â· åˆ†ç±» Â· ä¸“è¾‘ Â· éŸ³è´¨"])
-        self.tree.setMinimumHeight(330)
-        self.tree.itemSelectionChanged.connect(self.show_selected)
-        self.tree.itemDoubleClicked.connect(lambda item,col: self.load_selected_to_workspace())
-        self.tree.itemExpanded.connect(self._populate_artist_children)
-        library_layout.addWidget(self.tree,2)
-
-        right=QVBoxLayout()
-        self.cover=QLabel("æ— å°é¢")
-        self.cover.setFixedSize(180,180)
-        self.cover.setAlignment(Qt.AlignCenter)
-        self.cover.setStyleSheet("border:1px solid #293957;border-radius:12px;background:#0c1424;")
-        right.addWidget(self.cover)
-
-        self.detail=QLabel("è¯·é€‰æ‹©æ­Œæ›²")
-        self.detail.setWordWrap(True)
-        right.addWidget(self.detail)
-
-        self.task_table=QTableWidget(0,6)
-        self.task_table.setHorizontalHeaderLabels(["åºå·","æ­Œæ›²","è®¾å¤‡","çŠ¶æ€","è¿›åº¦","å¤±è´¥åŸå› "])
-        self.task_table.horizontalHeader().setStretchLastSection(True)
-        right.addWidget(QLabel("æ‰¹é‡ä»»åŠ¡"))
-        right.addWidget(self.task_table,1)
-        library_layout.addLayout(right,1)
-        layout.addWidget(library_box,2)
-
-        batch_box=QGroupBox("æ‰¹é‡ AI å¤„ç†å™¨")
-        bgl=QGridLayout(batch_box)
-
-        self.device_mode=QComboBox()
-        self.device_mode.addItems(["è‡ªåŠ¨ GPU/CPU","ä¼˜å…ˆ NVIDIA GPU","ä»… CPU"])
-        self.after_analysis=QCheckBox("åˆ†è½¨å®Œæˆåè‡ªåŠ¨ BPM/è°ƒæ€§åˆ†æ")
-        self.after_analysis.setChecked(True)
-        self.after_score=QCheckBox("åˆ†è½¨å®Œæˆåæ ‡è®°ä¸ºå¾…å‡ºè°±")
-        self.after_score.setChecked(True)
-        self.retry_failed=QCheckBox("å¤±è´¥ä»»åŠ¡è‡ªåŠ¨é‡è¯• 1 æ¬¡")
-        self.retry_failed.setChecked(True)
-
-        self.btn_batch_start=QPushButton("â–¶ å¼€å§‹æ‰¹å¤„ç†")
-        self.btn_batch_pause=QPushButton("â¸ æš‚åœ")
-        self.btn_batch_retry=QPushButton("â†» é‡è¯•å¤±è´¥")
-        apply_button_accent(self.btn_batch_start,"success")
-        self.btn_batch_start.clicked.connect(self.start_batch_processing)
-        self.btn_batch_pause.clicked.connect(self.toggle_batch_pause)
-        self.btn_batch_retry.clicked.connect(self.retry_failed_tasks)
-
-        self.batch_status=QLabel("æ‰¹å¤„ç†ï¼šå¾…æœº")
-        self.batch_status.setObjectName("StatusGood")
-        self.total_progress=QProgressBar()
-        self.total_progress.setRange(0,100)
-        self.total_progress.setValue(0)
-        self.current_progress=QProgressBar()
-        self.current_progress.setRange(0,100)
-        self.current_progress.setValue(0)
-
-        bgl.addWidget(QLabel("è¿ç®—æ¨¡å¼"),0,0)
-        bgl.addWidget(self.device_mode,0,1)
-        bgl.addWidget(self.after_analysis,0,2)
-        bgl.addWidget(self.after_score,0,3)
-        bgl.addWidget(self.retry_failed,0,4)
-        bgl.addWidget(self.btn_batch_start,1,0)
-        bgl.addWidget(self.btn_batch_pause,1,1)
-        bgl.addWidget(self.btn_batch_retry,1,2)
-        bgl.addWidget(self.batch_status,1,3,1,2)
-        bgl.addWidget(QLabel("å½“å‰æ­Œæ›²"),2,0)
-        bgl.addWidget(self.current_progress,2,1,1,4)
-        bgl.addWidget(QLabel("æ€»è¿›åº¦"),3,0)
-        bgl.addWidget(self.total_progress,3,1,1,4)
-        layout.addWidget(batch_box)
-
-        pipeline_box=QGroupBox("v2.0 è‡ªåŠ¨ç”Ÿäº§æµæ°´çº¿")
-        pgl=QGridLayout(pipeline_box)
-
-        self.pipeline_executor=QComboBox()
-        self.pipeline_executor.addItems(["æœåŠ¡å™¨æ‰§è¡Œå™¨ï¼ˆæ¨èï¼‰","æœ¬åœ°æµ‹è¯•æ‰§è¡Œå™¨"])
-        self.pipeline_output=QComboBox()
-        self.pipeline_output.addItems(["WAV","WAV + MP3"])
-
-        self.pipe_stems=QCheckBox("å…­è½¨+ç”µå‰ä»–")
-        self.pipe_analysis=QCheckBox("BPM/è°ƒæ€§")
-        self.pipe_chords=QCheckBox("å’Œå¼¦/æ®µè½")
-        self.pipe_score=QCheckBox("ä¹è°±")
-        self.pipe_arrange=QCheckBox("æ™ºèƒ½ç¼–é…")
-        self.pipe_render=QCheckBox("æ¸²æŸ“")
-        for cb in [self.pipe_stems,self.pipe_analysis,self.pipe_chords,self.pipe_score,self.pipe_arrange,self.pipe_render]:
-            cb.setChecked(True)
-
-        self.pipe_start=QPushButton("å¼€å§‹è‡ªåŠ¨æµæ°´çº¿")
-        self.pipe_pause=QPushButton("æš‚åœæµæ°´çº¿")
-        self.pipe_resume_failed=QPushButton("ç»§ç»­å¤±è´¥ä»»åŠ¡")
-        apply_button_accent(self.pipe_start,"primary")
-        self.pipe_start.clicked.connect(self.start_auto_pipeline)
-        self.pipe_pause.clicked.connect(self.toggle_pipeline_pause)
-        self.pipe_resume_failed.clicked.connect(self.resume_failed_pipeline_jobs)
-
-        self.pipeline_status=QLabel("æµæ°´çº¿ï¼šå¾…æœº")
-        self.pipeline_status.setObjectName("StatusGood")
-        self.pipeline_progress=QProgressBar()
-        self.pipeline_progress.setRange(0,100)
-        self.pipeline_progress.setValue(0)
-
-        self.pipeline_table=QTableWidget(0,10)
-        self.pipeline_table.setHorizontalHeaderLabels(
-            ["ä¼˜å…ˆçº§","æ­Œæ›²","å…­è½¨+ç”µå‰ä»–","åˆ†æ","å’Œå¼¦","ä¹è°±","æ”¹ç¼–","æ¸²æŸ“","å…¥åº“","çŠ¶æ€"]
-        )
-        self.pipeline_table.horizontalHeader().setStretchLastSection(True)
-
-        pgl.addWidget(QLabel("æ‰§è¡Œå™¨"),0,0)
-        pgl.addWidget(self.pipeline_executor,0,1)
-        pgl.addWidget(QLabel("è¾“å‡º"),0,2)
-        pgl.addWidget(self.pipeline_output,0,3)
-
-        pgl.addWidget(self.pipe_stems,1,0)
-        pgl.addWidget(self.pipe_analysis,1,1)
-        pgl.addWidget(self.pipe_chords,1,2)
-        pgl.addWidget(self.pipe_score,1,3)
-        pgl.addWidget(self.pipe_arrange,1,4)
-        pgl.addWidget(self.pipe_render,1,5)
-
-        pgl.addWidget(self.pipe_start,2,0)
-        pgl.addWidget(self.pipe_pause,2,1)
-        pgl.addWidget(self.pipe_resume_failed,2,2)
-        pgl.addWidget(self.pipeline_status,2,3,1,3)
-        pgl.addWidget(self.pipeline_progress,3,0,1,6)
-        pgl.addWidget(self.pipeline_table,4,0,1,6)
-
-        layout.addWidget(pipeline_box)
-
-        scheduler_box=QGroupBox("ä¸“ä¸šä»»åŠ¡è°ƒåº¦")
-        sgl=QGridLayout(scheduler_box)
-
-        self.gpu_selector=QComboBox()
-        self.refresh_gpu_btn=QPushButton("åˆ·æ–° GPU")
-        self.refresh_gpu_btn.clicked.connect(self.refresh_gpu_list)
-        self.gpu_memory_limit=QSpinBox()
-        self.gpu_memory_limit.setRange(0,100)
-        self.gpu_memory_limit.setValue(85)
-        self.gpu_memory_limit.setSuffix("%")
-        self.gpu_temp_limit=QSpinBox()
-        self.gpu_temp_limit.setRange(50,95)
-        self.gpu_temp_limit.setValue(82)
-        self.gpu_temp_limit.setSuffix(" Â°C")
-
-        self.night_mode=QCheckBox("å¯ç”¨å¤œé—´æ‰¹å¤„ç†")
-        self.night_start=QComboBox()
-        self.night_end=QComboBox()
-        for h in range(24):
-            self.night_start.addItem(f"{h:02d}:00",h)
-            self.night_end.addItem(f"{h:02d}:00",h)
-        self.night_start.setCurrentIndex(23)
-        self.night_end.setCurrentIndex(7)
-
-        self.default_priority=QComboBox()
-        self.default_priority.addItems(["é«˜","æ™®é€š","ä½"])
-        self.default_priority.setCurrentText("æ™®é€š")
-
-        self.scheduler_status=QLabel("è°ƒåº¦å™¨ï¼šå¾…æœº")
-        self.scheduler_status.setObjectName("StatusGood")
-
-        self.queue_sort_btn=QPushButton("æŒ‰ä¼˜å…ˆçº§é‡æ’")
-        self.queue_sort_btn.clicked.connect(self.sort_pipeline_by_priority)
-        self.refresh_gpu_list()
-
-        sgl.addWidget(QLabel("GPU"),0,0)
-        sgl.addWidget(self.gpu_selector,0,1)
-        sgl.addWidget(self.refresh_gpu_btn,0,2)
-        sgl.addWidget(QLabel("æœ€å¤§æ˜¾å­˜å ç”¨"),0,3)
-        sgl.addWidget(self.gpu_memory_limit,0,4)
-        sgl.addWidget(QLabel("æ¸©åº¦ä¸Šé™"),0,5)
-        sgl.addWidget(self.gpu_temp_limit,0,6)
-
-        sgl.addWidget(self.night_mode,1,0)
-        sgl.addWidget(QLabel("å¼€å§‹"),1,1)
-        sgl.addWidget(self.night_start,1,2)
-        sgl.addWidget(QLabel("ç»“æŸ"),1,3)
-        sgl.addWidget(self.night_end,1,4)
-        sgl.addWidget(QLabel("é»˜è®¤ä¼˜å…ˆçº§"),1,5)
-        sgl.addWidget(self.default_priority,1,6)
-
-        sgl.addWidget(self.queue_sort_btn,2,0)
-        sgl.addWidget(self.scheduler_status,2,1,1,6)
-
-        layout.addWidget(scheduler_box)
-
-        self.progress=QProgressBar()
-        self.progress.setRange(0,100)
-        self.progress.setValue(0)
-        layout.addWidget(self.progress)
-
-        self.library_scan_status.setText("æœåŠ¡å™¨æ›²åº“ï¼šç¨‹åºå¯åŠ¨åè‡ªåŠ¨è¿æ¥â€¦")
-        QTimer.singleShot(800, self.refresh_library)
-        self._load_batch_queue()
-        self.refresh_task_table()
-        self._load_pipeline_jobs()
-        self.refresh_pipeline_table()
-
-    def _server_client(self, timeout=30):
-        config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
-        settings = getattr(self.main, "settings_page", None)
-        if settings is not None:
-            config["server"] = settings.server_edit.text().strip().rstrip("/") or config["server"]
-            config["token"] = settings.server_token_edit.text().strip()
-        return ServerLibraryClient(config["server"], config["token"], timeout=timeout)
-
-    def open_server_settings(self):
-        if hasattr(self.main, "nav"):
-            self.main.nav.setCurrentRow(12)
-        self.main.statusBar().showMessage("è¯·é…ç½®æœåŠ¡å™¨ API åœ°å€ï¼›æ­¤é¡µé¢ä¸ä¼šæ‰«æå®¢æˆ·ç«¯ G ç›˜")
-
-    def _load_scan_roots(self):
-        defaults=[self.library_paths["originals"],self.library_paths["temp"]/"é“¾æ¥å¯¼å…¥"]
-        try:
-            rows=json.loads(self.scan_roots_file.read_text(encoding="utf-8"))
-            saved=[Path(row) for row in rows if str(row).strip()]
-        except Exception:
-            saved=[]
-        result=[]
-        legacy_temp=normalized_path(self.library_paths["temp"])
-        for path in [*defaults,*saved]:
-            if normalized_path(path)==legacy_temp:
-                continue
-            key=normalized_path(path)
-            if key not in {normalized_path(item) for item in result}:
-                result.append(Path(path))
-        return result
-
-    def _save_scan_roots(self):
-        atomic_write_json(self.scan_roots_file,[str(path) for path in self.scan_roots])
-
-    def choose_scan_folder(self):
-        selected=QFileDialog.getExistingDirectory(
-            self,"é€‰æ‹©åŒ…å«æ­Œæ‰‹åˆ†ç±»çš„éŸ³ä¹ç›®å½•",str(self.library_paths["originals"])
-        )
-        if not selected:
-            return
-        path=Path(selected)
-        if normalized_path(path) not in {normalized_path(item) for item in self.scan_roots}:
-            self.scan_roots.append(path)
-            self._save_scan_roots()
-        self.library_scan_status.setText("æ‰«æç›®å½•ï¼š"+"ï¼›".join(str(item) for item in self.scan_roots))
-        self.scan_imports()
-
-    def import_local_music(self):
-        files,_=QFileDialog.getOpenFileNames(
-            self,"å¯¼å…¥æœ¬åœ°éŸ³ä¹","",
-            "éŸ³é¢‘æ–‡ä»¶ (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aiff *.aif *.alac)"
-        )
-        if not files:
-            return
-        # A local import is a one-song test input only.  Never copy it to a
-        # client G: path or mix it into the server-owned catalog.
-        target=BASE_DIR/"imports"/"local_test"
-        target.mkdir(parents=True,exist_ok=True)
-        copied=0
-        imported_paths=[]
-        for raw in files:
-            source=Path(raw)
-            destination=target/source.name
-            if destination.exists() and source.resolve()!=destination.resolve():
-                destination=target/f"{safe_file_stem(source.stem)}_{int(time.time()*1000)}{source.suffix}"
-            if source.resolve()!=destination.resolve():
-                shutil.copy2(source,destination)
-            copied+=1
-            imported_paths.append(destination)
-        first = imported_paths[0]
-        if first.exists():
-            self.main.load_imported_working_file(first)
-            self.main.selected_library_source = "local_test"
-        self.library_scan_status.setText(
-            f"æœ¬åœ°æµ‹è¯•å¯¼å…¥å®Œæˆï¼š{copied} é¦– Â· æœªåŠ å…¥æœåŠ¡å™¨ G ç›˜æ›²åº“"
-        )
-        QMessageBox.information(
-            self, "æœ¬åœ°æµ‹è¯•éŸ³ä¹",
-            "æœ¬åœ°æ­Œæ›²åªä½œä¸ºå½“å‰ç”µè„‘çš„å•æ›²æµ‹è¯•è¾“å…¥ï¼Œä¸ä¼šåŠ å…¥æˆ–æ›¿ä»£æœåŠ¡å™¨ G ç›˜æ›²åº“ã€‚",
-        )
-
-    def import_share_link(self):
-        value,ok=QInputDialog.getMultiLineText(
-            self,"å¯¼å…¥æˆæƒéŸ³é¢‘é“¾æ¥",
-            "æœ¬è½¯ä»¶ç›®å‰ä»…ä¾›å­¦ä¹ ä¸ç ”ç©¶ä½¿ç”¨ï¼Œä¸æä¾›æ­Œæ›²ä¸‹è½½æœåŠ¡ã€‚\nä»…ç²˜è´´æœ¬äººæœ‰æƒä½¿ç”¨çš„å…¬å¼€éŸ³é¢‘ç›´é“¾ã€‚",
-            QApplication.clipboard().text().strip(),
-        )
-        if not ok or not value.strip():
-            return
-        match=re.search(r"https?://[^\s<>\"']+",value)
-        if not match:
-            QMessageBox.warning(self,"åˆ†äº«é“¾æ¥","æ²¡æœ‰è¯†åˆ«åˆ° http/https é“¾æ¥ã€‚")
-            return
-        url=match.group(0).rstrip("ï¼Œã€‚ï¼›;ï¼‰)]}")
-        self.progress.setValue(10)
-        try:
-            result = self._server_client(timeout=90).import_link(url)
-            self.progress.setValue(100)
-            self.refresh_library()
-            QMessageBox.information(
-                self, "æœåŠ¡å™¨ä¸´æ—¶æ›²åº“",
-                f"å·²ç”±æœåŠ¡å™¨å¯¼å…¥ï¼š{result.get('file_name', 'éŸ³é¢‘')}",
-            )
-        except Exception as exc:
-            self.progress.setValue(0)
-            QMessageBox.critical(self, "é“¾æ¥å¯¼å…¥å¤±è´¥", str(exc))
-
-    def _link_progress(self,value,text):
-        self.progress.setValue(max(0,min(100,int(value))))
-        self.library_scan_status.setText(text)
-
-    def _link_done(self,path):
-        self.library_scan_status.setText(f"åˆ†äº«æ­Œæ›²å·²ä¸‹è½½åˆ°ä¸´æ—¶æ­Œæ›²åº“ï¼š{path}")
-        self.scan_imports()
-
-    def _link_failed(self,error):
-        self.progress.setValue(0)
-        self.library_scan_status.setText("åˆ†äº«é“¾æ¥å¯¼å…¥å¤±è´¥")
-        QMessageBox.critical(self,"åˆ†äº«é“¾æ¥å¯¼å…¥å¤±è´¥",str(error))
-
-    def _db(self):
-        return connect_catalog(self.db_path)
-
-    def _ensure_db(self):
-        self.db_path.parent.mkdir(parents=True,exist_ok=True)
-        con=self._db()
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS tracks(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fingerprint TEXT UNIQUE,
-            source_path TEXT,
-            working_path TEXT,
-            title TEXT,
-            artist TEXT,
-            album TEXT,
-            year TEXT,
-            duration REAL DEFAULT 0,
-            bitrate INTEGER DEFAULT 0,
-            samplerate INTEGER DEFAULT 0,
-            channels INTEGER DEFAULT 0,
-            format TEXT,
-            quality TEXT,
-            cover_path TEXT,
-            bpm REAL,
-            musical_key TEXT,
-            analysis_status TEXT DEFAULT 'æœªåˆ†æ',
-            stems_status TEXT DEFAULT 'æœªåˆ†è½¨',
-            imported_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_tracks_artist_album ON tracks(artist,album);
-        """)
-        # Lightweight migrations for v2 pipeline state.
-        cols={row["name"] for row in con.execute("PRAGMA table_info(tracks)").fetchall()}
-        for col,ddl in {
-            "chords_status":"TEXT DEFAULT 'æœªå¤„ç†'",
-            "score_status":"TEXT DEFAULT 'æœªå¤„ç†'",
-            "arrangement_status":"TEXT DEFAULT 'æœªå¤„ç†'",
-            "render_status":"TEXT DEFAULT 'æœªå¤„ç†'",
-            "final_audio_path":"TEXT DEFAULT ''"
-        }.items():
-            if col not in cols:
-                con.execute(f"ALTER TABLE tracks ADD COLUMN {col} {ddl}")
-        con.commit()
-        con.close()
-
-    def _tag_first(self,tags,keys,default=""):
-        if not tags:
-            return default
-        for k in keys:
-            try:
-                v=tags.get(k)
-                if v:
-                    if isinstance(v,(list,tuple)):
-                        v=v[0]
-                    return repair_text(v, default)
-            except Exception:
-                pass
-        return repair_text(default, default)
-
-    def _extract_metadata(self,path):
-        p=Path(path)
-        data={
-            "title":repair_text(p.stem,p.stem),"artist":"æœªçŸ¥æ­Œæ‰‹","album":"æœªåˆ†ç±»ä¸“è¾‘","year":"",
-            "duration":0.0,"bitrate":0,"samplerate":0,"channels":0,
-            "format":p.suffix.lower().lstrip(".").upper(),"cover_path":""
-        }
-        try:
-            import mutagen
-            audio=mutagen.File(str(p),easy=False)
-            if audio is not None:
-                info=getattr(audio,"info",None)
-                if info:
-                    data["duration"]=float(getattr(info,"length",0) or 0)
-                    data["bitrate"]=int(getattr(info,"bitrate",0) or 0)
-                    data["samplerate"]=int(getattr(info,"sample_rate",getattr(info,"samplerate",0)) or 0)
-                    data["channels"]=int(getattr(info,"channels",0) or 0)
-
-                tags=getattr(audio,"tags",None)
-                if tags:
-                    try:
-                        if "TIT2" in tags: data["title"]=repair_text(tags["TIT2"],p.stem)
-                        if "TPE1" in tags: data["artist"]=repair_text(tags["TPE1"],"æœªçŸ¥æ­Œæ‰‹")
-                        if "TALB" in tags: data["album"]=repair_text(tags["TALB"],"æœªåˆ†ç±»ä¸“è¾‘")
-                        if "TDRC" in tags: data["year"]=repair_text(tags["TDRC"],"")
-                    except Exception:
-                        pass
-
-                    data["title"]=self._tag_first(tags,["title","TITLE"],data["title"])
-                    data["artist"]=self._tag_first(tags,["artist","ARTIST"],data["artist"])
-                    data["album"]=self._tag_first(tags,["album","ALBUM"],data["album"])
-                    data["year"]=self._tag_first(tags,["date","year","DATE"],data["year"])
-
-                    cover_bytes=None
-                    try:
-                        for key in tags.keys():
-                            obj=tags[key]
-                            if str(key).startswith("APIC"):
-                                cover_bytes=getattr(obj,"data",None)
-                                if cover_bytes:
-                                    break
-                    except Exception:
-                        pass
-                    try:
-                        pics=getattr(audio,"pictures",[])
-                        if pics and not cover_bytes:
-                            cover_bytes=pics[0].data
-                    except Exception:
-                        pass
-                    try:
-                        covr=tags.get("covr") if hasattr(tags,"get") else None
-                        if covr and not cover_bytes:
-                            cover_bytes=bytes(covr[0])
-                    except Exception:
-                        pass
-
-                    if cover_bytes:
-                        import hashlib as _hashlib
-                        cp=self.cover_dir/(_hashlib.md5(str(p).encode("utf-8")).hexdigest()+".jpg")
-                        cp.write_bytes(cover_bytes)
-                        data["cover_path"]=str(cp)
-        except Exception:
-            pass
-
-        br=data["bitrate"]
-        sr=data["samplerate"]
-        ext=p.suffix.lower()
-        if ext in (".wav",".flac",".aiff",".aif",".alac"):
-            q="æ— æŸ/PCM"
-        elif br>=320000:
-            q="é«˜ç ç‡"
-        elif br>=192000:
-            q="æ ‡å‡†"
-        elif br>0:
-            q="è¾ƒä½ç ç‡"
-        else:
-            q="å¾…æ£€æµ‹"
-        if sr and sr<32000:
-            q+=" Â· ä½é‡‡æ ·ç‡"
-        data["quality"]=q
-        return data
-
-    def _fingerprint(self,path):
-        h=hashlib.sha256()
-        with open(path,"rb") as f:
-            while True:
-                b=f.read(1024*1024)
-                if not b:
-                    break
-                h.update(b)
-        return h.hexdigest()
-
-    def scan_imports(self):
-        self.progress.setValue(2)
-        QApplication.processEvents()
-        self.library_scan_status.setText("æ­£åœ¨è¯·æ±‚ AI æœåŠ¡å™¨æ‰«ææœåŠ¡å™¨ G ç›˜â€¦")
-        try:
-            result = self._server_client(timeout=300).scan()
-            self.server_library_root = str(result.get("root") or self.server_library_root)
-            self.progress.setValue(100)
-            self.refresh_library()
-            self.library_scan_status.setText(
-                f"æœåŠ¡å™¨æ‰«æå®Œæˆï¼š{self.server_library_root} Â· "
-                f"å‘ç° {result.get('total', 0)} é¦–ï¼Œæ–°å¢ {result.get('added', 0)}ã€"
-                f"æ›´æ–° {result.get('updated', 0)}ã€å·²æœ‰ {result.get('skipped', 0)}ã€"
-                f"å¤±è´¥ {result.get('failed', 0)}ã€‚"
-            )
-            QMessageBox.information(
-                self, "æœåŠ¡å™¨ G ç›˜æ›²åº“æ‰«æå®Œæˆ",
-                f"æ‰«æä½ç½®ï¼ˆæœåŠ¡å™¨ï¼‰ï¼š\n{self.server_library_root}\n\n"
-                f"å‘ç° {result.get('total', 0)} ä¸ªå®Œæ•´éŸ³é¢‘æ–‡ä»¶ã€‚\n"
-                "æœ¬æ¬¡æœªè¯»å–ã€æœªæ‰«æå®¢æˆ·ç«¯ G ç›˜ã€‚",
-            )
-        except Exception as exc:
-            self.progress.setValue(0)
-            self.remote_rows.clear()
-            self.tree.clear()
-            self.library_scan_status.setText(f"æœåŠ¡å™¨ G ç›˜æ‰«æå¤±è´¥ï¼š{exc}")
-            QMessageBox.critical(
-                self, "æœåŠ¡å™¨ G ç›˜æ›²åº“ä¸å¯ç”¨",
-                f"{exc}\n\nè¯·åœ¨â€˜è®¾ç½®â€™æ£€æŸ¥ AI æœåŠ¡å™¨åœ°å€ã€‚\n"
-                "ä¸ºé¿å…æ··å…¥å®¢æˆ·ç«¯æ­Œæ›²ï¼Œè½¯ä»¶ä¸ä¼šå›é€€æ‰«æå®¢æˆ·ç«¯ G ç›˜ã€‚",
-            )
-        return
-        candidates=[]
-        fpfile=BASE_DIR/"imports"/"fingerprints.json"
-        if fpfile.exists():
-            try:
-                fpdb=json.loads(fpfile.read_text(encoding="utf-8"))
-                workdir=BASE_DIR/"imports"/"working"
-                candidates=unique_import_candidates(
-                    fpdb,
-                    workdir.glob("*.wav") if workdir.exists() else [],
-                    self._fingerprint,
-                )
-            except Exception:
-                pass
-        else:
-            workdir=BASE_DIR/"imports"/"working"
-            if workdir.exists():
-                candidates=unique_import_candidates({},workdir.glob("*.wav"),self._fingerprint)
-
-        total=max(1,len(candidates))
-        con=self._db()
-        added=0
-        # Clean legacy duplicates created when a converted work WAV was scanned
-        # once as an original source and once as a generated work file.
-        existing_rows=con.execute(
-            "SELECT id,source_path,working_path FROM tracks ORDER BY id"
-        ).fetchall()
-        keep_by_work={}
-        for row in existing_rows:
-            raw_work=row["working_path"] or row["source_path"] or ""
-            if not raw_work:
-                continue
-            key=normalized_path(raw_work)
-            current=keep_by_work.get(key)
-            source_diff=normalized_path(row["source_path"] or "") != normalized_path(raw_work)
-            if current is None:
-                keep_by_work[key]=(int(row["id"]),source_diff)
-            elif source_diff and not current[1]:
-                con.execute("DELETE FROM tracks WHERE id=?",(current[0],))
-                keep_by_work[key]=(int(row["id"]),True)
-            else:
-                con.execute("DELETE FROM tracks WHERE id=?",(row["id"],))
-        for i,(fp,src,work,imported) in enumerate(candidates):
-            self.progress.setValue(int(i/total*95))
-            QApplication.processEvents()
-            meta=self._extract_metadata(src if Path(src).exists() else work)
-            try:
-                same_work=con.execute(
-                    "SELECT id,fingerprint FROM tracks WHERE working_path=? LIMIT 1",(work,)
-                ).fetchone()
-                if same_work and same_work["fingerprint"] != fp:
-                    con.execute("DELETE FROM tracks WHERE id=?",(same_work["id"],))
-                con.execute("""
-                INSERT INTO tracks(
-                    fingerprint,source_path,working_path,title,artist,album,year,
-                    duration,bitrate,samplerate,channels,format,quality,cover_path,imported_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(fingerprint) DO UPDATE SET
-                    source_path=excluded.source_path,
-                    working_path=excluded.working_path,
-                    title=excluded.title,
-                    artist=excluded.artist,
-                    album=excluded.album,
-                    year=excluded.year,
-                    duration=excluded.duration,
-                    bitrate=excluded.bitrate,
-                    samplerate=excluded.samplerate,
-                    channels=excluded.channels,
-                    format=excluded.format,
-                    quality=excluded.quality,
-                    cover_path=CASE WHEN excluded.cover_path<>'' THEN excluded.cover_path ELSE tracks.cover_path END
-                """,(
-                    fp,src,work,meta["title"],meta["artist"],meta["album"],meta["year"],
-                    meta["duration"],meta["bitrate"],meta["samplerate"],meta["channels"],
-                    meta["format"],meta["quality"],meta["cover_path"],imported
-                ))
-                added+=1
-            except Exception:
-                pass
-        con.commit()
-        con.close()
-        self.progress.setValue(100)
-        self.refresh_library()
-        QMessageBox.information(self,"éŸ³ä¹åº“",f"æ‰«æå®Œæˆï¼Œå…±å¤„ç† {added} é¦–éŸ³ä¹ã€‚")
-
-    def _prune_stale_jobs(self):
-        active_workers=(
-            getattr(self,"batch_worker",None),
-            getattr(self,"pipeline_batch_worker",None),
-            getattr(self,"pipeline_stage_worker",None),
-        )
-        if any(worker and worker.isRunning() for worker in active_workers):
-            return
-        con=self._db()
-        valid_ids={int(row["id"]) for row in con.execute("SELECT id FROM tracks").fetchall()}
-        con.close()
-        old_batch=len(self.batch_queue)
-        old_pipeline=len(self.pipeline_jobs)
-        self.batch_queue=[
-            item for item in self.batch_queue
-            if item.get("remote") or int(item.get("id",-1)) in valid_ids
-        ]
-        self.pipeline_jobs=[item for item in self.pipeline_jobs if int(item.get("track_id",-1)) in valid_ids]
-        if len(self.batch_queue)!=old_batch:
-            self._save_batch_queue()
-            self.refresh_task_table()
-        if len(self.pipeline_jobs)!=old_pipeline:
-            self._save_pipeline_jobs()
-            self.refresh_pipeline_table()
-
-    def _load_cached_catalog(self):
-        if not self.catalog_cache_file.is_file():
-            return False
-        try:
-            payload = json.loads(self.catalog_cache_file.read_text(encoding="utf-8"))
-            rows = [dict(row) for row in payload.get("songs", [])]
-            if not rows:
-                return False
-            self.server_library_root = str(payload.get("server_library_root") or self.server_library_root)
-            self._render_library_rows(rows, "å·²æ˜¾ç¤ºä¸Šæ¬¡ä¿å­˜çš„æœåŠ¡å™¨ç´¢å¼•ï¼Œæ­£åœ¨åå°æ£€æŸ¥æ›´æ–°")
-            return True
-        except Exception:
-            return False
-
-    def refresh_library(self):
-        query=self.library_search.text() if hasattr(self,"library_search") else ""
-        category=self.library_category.currentText() if hasattr(self,"library_category") else "å…¨éƒ¨"
-        if not self.remote_rows and not query.strip() and category == "å…¨éƒ¨":
-            self._load_cached_catalog()
-        self._catalog_request_id += 1
-        request_id = self._catalog_request_id
-        self.library_scan_status.setText("æ­£åœ¨åå°è¯»å–æœåŠ¡å™¨æ­Œæ›²ç´¢å¼•ï¼Œç•Œé¢å¯ç»§ç»­æ“ä½œâ€¦")
-        worker = ServerCatalogWorker(request_id, self._server_client(timeout=30), query, category)
-        self._catalog_workers.append(worker)
-        worker.succeeded.connect(self._catalog_loaded)
-        worker.failed.connect(self._catalog_failed)
-        worker.finished.connect(lambda current=worker: self._release_catalog_worker(current))
-        worker.start()
-
-    def _release_catalog_worker(self, worker):
-        if worker in self._catalog_workers:
-            self._catalog_workers.remove(worker)
-        worker.deleteLater()
-
-    def _catalog_loaded(self, request_id, result):
-        if int(request_id) != self._catalog_request_id:
-            return
-        if result.get("source_scope") != "server":
-            self._catalog_failed(request_id, "æœåŠ¡å™¨æœªè¿”å› server æ›²åº“æ ‡è¯†")
-            return
-        self.server_library_root = str(result.get("server_library_root") or self.server_library_root)
-        rows = [dict(row) for row in result.get("songs", [])]
-        query=self.library_search.text() if hasattr(self,"library_search") else ""
-        category=self.library_category.currentText() if hasattr(self,"library_category") else "å…¨éƒ¨"
-        if not query.strip() and category == "å…¨éƒ¨":
-            try:
-                atomic_write_json(self.catalog_cache_file, {
-                    "songs": rows,
-                    "server_library_root": self.server_library_root,
-                    "updated_at": time.time(),
-                })
-            except Exception:
-                pass
-        self._render_library_rows(rows)
-
-    def _catalog_failed(self, request_id, error):
-        if int(request_id) != self._catalog_request_id:
-            return
-        suffix = "ï¼›å½“å‰ç»§ç»­æ˜¾ç¤ºå·²ç¼“å­˜æ­Œæ›²" if self.remote_rows else ""
-        self.library_scan_status.setText(
-            f"æœåŠ¡å™¨æ›²åº“è¯»å–å¤±è´¥ï¼š{error}{suffix} Â· å·²ç¦æ­¢å›é€€æ‰«æå®¢æˆ·ç«¯ G ç›˜"
-        )
-
-    def _render_library_rows(self, all_rows, status_prefix=""):
-        self.tree.setUpdatesEnabled(False)
-        self.tree.clear()
-        all_rows = [dict(row) for row in all_rows]
-        self.remote_rows = {int(row["id"]): row for row in all_rows}
-        rows = all_rows
-        if self.library_initial != "å…¨éƒ¨":
-            rows = [
-                row for row in rows
-                if str(row.get("artist_initial") or "#").upper() == self.library_initial
-            ]
-        artists={}
-        for row in rows:
-            artist=str(row.get("artist") or "æœªçŸ¥æ­Œæ‰‹")
-            if artist not in artists:
-                artists[artist]=[]
-            artists[artist].append(row)
-
-        self.remote_artist_rows = artists
-        for artist in sorted(artists, key=lambda value: value.casefold()):
-            ai=QTreeWidgetItem([artist,f"{len(artists[artist])} é¦–"])
-            ai.setData(0,Qt.UserRole,("artist",artist))
-            placeholder=QTreeWidgetItem(["å±•å¼€ååŠ è½½æ­Œæ›²",""])
-            placeholder.setData(0,Qt.UserRole,("placeholder",artist))
-            ai.addChild(placeholder)
-            self.tree.addTopLevelItem(ai)
-            ai.setExpanded(False)
-        if rows:
-            prefix = f"{status_prefix} Â· " if status_prefix else ""
-            self.library_scan_status.setText(
-                f"{prefix}å½“å‰æ˜¾ç¤º {len(artists)} ä½æ­Œæ‰‹ã€{len(rows)} é¦–æœåŠ¡å™¨æ­Œæ›² Â· "
-                f"æœåŠ¡å™¨ç›®å½•ï¼š{self.server_library_root} Â· æœªæ‰«æå®¢æˆ·ç«¯ G ç›˜"
-            )
-        self.tree.setUpdatesEnabled(True)
-
-    def _populate_artist_children(self, item):
-        data=item.data(0,Qt.UserRole)
-        if not data or data[0] != "artist":
-            return
-        if item.childCount() and (item.child(0).data(0,Qt.UserRole) or (None,))[0] != "placeholder":
-            return
-        artist=str(data[1])
-        item.takeChildren()
-        for row in self.remote_artist_rows.get(artist, []):
-            duration=float(row.get("duration") or 0)
-            ti=QTreeWidgetItem([
-                str(row.get("title") or "æœªå‘½åæ­Œæ›²"),
-                f'{row.get("category") or "æœåŠ¡å™¨æ›²åº“"} Â· '
-                f'{row.get("album") or "æœªåˆ†ç±»ä¸“è¾‘"} Â· {duration:.0f}s Â· '
-                f'{row.get("quality") or "å¾…æ£€æµ‹"}'
-            ])
-            ti.setData(0,Qt.UserRole,("track",int(row["id"])))
-            item.addChild(ti)
-
-    def _set_library_initial(self, value):
-        self.library_initial = str(value or "å…¨éƒ¨")
-        for key, button in self.library_initial_buttons.items():
-            button.setChecked(key == self.library_initial)
-        self._render_library_rows(list(self.remote_rows.values()))
-
-    def _selected_track_id(self):
-        items=self.tree.selectedItems()
-        if not items:
-            return None
-        data=items[0].data(0,Qt.UserRole)
-        if data and data[0]=="track":
-            return int(data[1])
-        return None
-
-    def show_selected(self):
-        tid=self._selected_track_id()
-        if not tid:
-            return
-        row=self.remote_rows.get(tid)
-        if not row:
-            return
-
-        dur=self.main._format_time(float(row.get("duration") or 0))
-        bitrate=float(row.get("bitrate") or 0)
-        samplerate=float(row.get("samplerate") or 0)
-        br=f'{bitrate/1000:.0f} kbps' if bitrate else "-"
-        sr=f'{samplerate/1000:.1f} kHz' if samplerate else "-"
-        self.detail.setText(
-            f'æ¥æºï¼šæœåŠ¡å™¨ G ç›˜\næ­Œæ›²ï¼š{row.get("title", "")}\n'
-            f'æ­Œæ‰‹ï¼š{row.get("artist", "æœªçŸ¥æ­Œæ‰‹")}\nä¸“è¾‘ï¼š{row.get("album") or "æœªåˆ†ç±»ä¸“è¾‘"}\n'
-            f'æ—¶é•¿ï¼š{dur}\næ ¼å¼ï¼š{row.get("format") or "-"}\nç ç‡ï¼š{br}\né‡‡æ ·ç‡ï¼š{sr}\n'
-            f'å£°é“ï¼š{row.get("channels") or "-"}\néŸ³è´¨ï¼š{row.get("quality") or "å¾…æ£€æµ‹"}\n'
-            f'BPMï¼š{row.get("bpm") if row.get("bpm") is not None else "æœªåˆ†æ"}\n'
-            f'è°ƒæ€§ï¼š{row.get("musical_key") or "æœªåˆ†æ"}\n'
-            f'å…­è½¨ï¼š{row.get("stems_status") or "æœªåˆ†è½¨"}'
-        )
-        self.cover.setPixmap(QPixmap())
-        self.cover.setText("æœåŠ¡å™¨æ›²åº“")
-
-    def batch_analyze(self):
-        if not self.remote_rows:
-            self.refresh_library()
-        if not self.remote_rows:
-            QMessageBox.information(self, "æ‰¹é‡åˆ†æ", "æœåŠ¡å™¨æ›²åº“ä¸­æ²¡æœ‰å¯å¤„ç†æ­Œæ›²ã€‚")
-            return
-        self.enqueue_stems(show_message=False)
-        QMessageBox.information(
-            self, "æœåŠ¡å™¨æ‰¹é‡åˆ†æ",
-            "å·²æŒ‰æœåŠ¡å™¨ G ç›˜æ›²åº“å»ºç«‹ä»»åŠ¡ã€‚æœåŠ¡å™¨æµæ°´çº¿ä¼šä¾æ¬¡å®Œæˆåˆ†è½¨ã€BPM/è°ƒæ€§ã€å’Œå¼¦ã€æ­Œè¯æ—¶é—´è½´å’Œè°±é¢ã€‚",
-        )
-        self.start_batch_processing()
-
-    def enqueue_stems(self, show_message=True):
-        rows=sorted(
-            self.remote_rows.values(),
-            key=lambda row: (str(row.get("artist") or ""), str(row.get("album") or ""), str(row.get("title") or "")),
-        )
-        self.batch_queue=[]
-        for row in rows:
-            artist = str(row.get("artist") or "æœªçŸ¥æ­Œæ‰‹")
-            title = str(row.get("title") or f"æœåŠ¡å™¨æ­Œæ›² {row.get('id')}")
-            self.batch_queue.append({
-                "id":int(row["id"]),
-                "library_id":int(row["id"]),
-                "remote":True,
-                "title":f"{artist} - {title}",
-                "path":"",
-                "status":"å¾…å¤„ç†",
-                "progress":0,
-                "attempts":0,
-                "error":"",
-                "stem_dir":""
-            })
-        self._save_batch_queue()
-        self.refresh_task_table()
-        self.total_progress.setValue(0)
-        self.current_progress.setValue(0)
-        self.batch_status.setText(f"æ‰¹å¤„ç†ï¼šå·²æ’é˜Ÿ {len(self.batch_queue)} é¦–")
-        if show_message:
-            QMessageBox.information(
-                self,"æœåŠ¡å™¨å¤„ç†é˜Ÿåˆ—",
-                f"å·²ä»æœåŠ¡å™¨ G ç›˜æ›²åº“å»ºç«‹ {len(self.batch_queue)} é¦–æ­Œæ›²çš„å¤„ç†ä»»åŠ¡ã€‚",
-            )
-
-    def _batch_queue_file(self):
-        return BASE_DIR/"library"/"stem_queue.json"
-
-    def _save_batch_queue(self):
-        p=self._batch_queue_file()
-        atomic_write_json(p, self.batch_queue)
-
-    def _load_batch_queue(self):
-        p=self._batch_queue_file()
-        if not p.exists():
-            return
-        try:
-            self.batch_queue=json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            self.batch_queue=[]
-
-    def refresh_task_table(self):
-        self.task_table.setRowCount(len(self.batch_queue))
-        for r,item in enumerate(self.batch_queue):
-            vals=[
-                str(r+1),
-                item.get("title",""),
-                item.get("device","-"),
-                item.get("status",""),
-                f'{int(item.get("progress",0))}%',
-                item.get("error","")
-            ]
-            for c,v in enumerate(vals):
-                self.task_table.setItem(r,c,QTableWidgetItem(str(v)))
-
-    def _next_batch_index(self):
-        for i,item in enumerate(self.batch_queue):
-            if item.get("status") in ("å¾…å¤„ç†","ç­‰å¾…é‡è¯•"):
-                return i
-        return -1
-
-    def start_batch_processing(self):
-        if self.batch_running:
-            if self.batch_paused:
-                self.batch_paused=False
-                self.btn_batch_pause.setText("â¸ æš‚åœ")
-                self.batch_status.setText("æ‰¹å¤„ç†ï¼šç»§ç»­æ‰§è¡Œ")
-                self._start_next_batch_task()
-            return
-
-        if not self.batch_queue:
-            self._load_batch_queue()
-        if not self.batch_queue:
-            self.enqueue_stems()
-        if not self.batch_queue:
-            QMessageBox.information(self,"æ‰¹å¤„ç†","æ²¡æœ‰å¾…å¤„ç†æ­Œæ›²ã€‚")
-            return
-
-        self.batch_running=True
-        self.batch_paused=False
-        self.batch_completed=sum(1 for x in self.batch_queue if x.get("status")=="å®Œæˆ")
-        self.batch_failed=sum(1 for x in self.batch_queue if x.get("status")=="å¤±è´¥")
-        self.btn_batch_pause.setText("â¸ æš‚åœ")
-        self.batch_status.setText("æ‰¹å¤„ç†ï¼šæ­£åœ¨å¯åŠ¨")
-        self._update_total_progress()
-        self._start_next_batch_task()
-
-    def toggle_batch_pause(self):
-        if not self.batch_running:
-            return
-        self.batch_paused=not self.batch_paused
-        if self.batch_paused:
-            self.btn_batch_pause.setText("â–¶ ç»§ç»­")
-            if self.batch_worker and self.batch_worker.isRunning():
-                self.batch_status.setText("æ‰¹å¤„ç†ï¼šå°†åœ¨å½“å‰æ­Œæ›²å®Œæˆåæš‚åœ")
-            else:
-                self.batch_status.setText("æ‰¹å¤„ç†ï¼šå·²æš‚åœ")
-        else:
-            self.btn_batch_pause.setText("â¸ æš‚åœ")
-            self.batch_status.setText("æ‰¹å¤„ç†ï¼šç»§ç»­æ‰§è¡Œ")
-            if not self.batch_worker or not self.batch_worker.isRunning():
-                self._start_next_batch_task()
-
-    def retry_failed_tasks(self):
-        count=0
-        for item in self.batch_queue:
-            if item.get("status")=="å¤±è´¥":
-                item["status"]="ç­‰å¾…é‡è¯•"
-                item["progress"]=0
-                item["error"]=""
-                count+=1
-        self._save_batch_queue()
-        self.refresh_task_table()
-        if count:
-            self.batch_running=True
-            self.batch_paused=False
-            self._start_next_batch_task()
-        else:
-            QMessageBox.information(self,"é‡è¯•å¤±è´¥","å½“å‰æ²¡æœ‰å¤±è´¥ä»»åŠ¡ã€‚")
-
-    def _device_for_batch(self):
-        mode=self.device_mode.currentText()
-        if mode=="ä»… CPU":
-            return "cpu"
-        try:
-            import torch
-            cuda=torch.cuda.is_available()
-        except Exception:
-            cuda=False
-        if mode=="ä¼˜å…ˆ NVIDIA GPU" and not cuda:
-            return "cpu"
-        return "cuda" if cuda else "cpu"
-
-    def _start_next_batch_task(self):
-        if not self.batch_running or self.batch_paused:
-            return
-        if self.batch_worker and self.batch_worker.isRunning():
-            return
-
-        idx=self._next_batch_index()
-        if idx<0:
-            self.batch_running=False
-            self.batch_status.setText(
-                f"æ‰¹å¤„ç†å®Œæˆï¼šæˆåŠŸ {sum(1 for x in self.batch_queue if x.get('status')=='å®Œæˆ')} / "
-                f"å¤±è´¥ {sum(1 for x in self.batch_queue if x.get('status')=='å¤±è´¥')}"
-            )
-            self.current_progress.setValue(100)
-            self.total_progress.setValue(100)
-            self._save_batch_queue()
-            self.refresh_library()
-            return
-
-        self.batch_index=idx
-        item=self.batch_queue[idx]
-        item["status"]="å¤„ç†ä¸­"
-        item["attempts"]=int(item.get("attempts",0))+1
-        item["device"]="SERVER" if item.get("remote") else self._device_for_batch().upper()
-        item["progress"]=0
-        item["error"]=""
-        self.current_progress.setValue(0)
-        self.batch_status.setText(
-            f"æ‰¹å¤„ç†ï¼š{idx+1}/{len(self.batch_queue)} Â· {item.get('title','')}"
-        )
-        self.refresh_task_table()
-        self._save_batch_queue()
-
-        if item.get("remote"):
-            self.batch_worker=RemoteLibraryJobWorker(
-                self._server_client(timeout=60), item.get("library_id", item["id"]), self,
-            )
-            active_worker=self.batch_worker
-            self.batch_worker.progress.connect(self._on_batch_song_progress)
-            self.batch_worker.done.connect(self._on_remote_batch_done)
-            self.batch_worker.failed.connect(self._on_batch_song_failed)
-            self.batch_worker.finished.connect(lambda w=active_worker:self._release_batch_worker(w))
-            self.batch_worker.start()
-            return
-
-        # Local test imports can still use the single-song worker explicitly.
-        self.batch_worker=SeparationWorker(item["path"])
-        active_worker=self.batch_worker
-        self.batch_worker.model_progress.connect(self._on_batch_model_progress)
-        self.batch_worker.separation_progress.connect(self._on_batch_song_progress)
-        self.batch_worker.done.connect(self._on_batch_song_done)
-        self.batch_worker.failed.connect(self._on_batch_song_failed)
-        self.batch_worker.finished.connect(lambda w=active_worker:self._release_batch_worker(w))
-        self.batch_worker.start()
-
-    def _release_batch_worker(self,worker):
-        if self.batch_worker is worker:
-            self.batch_worker=None
-            if self.batch_running and not self.batch_paused:
-                QTimer.singleShot(0,self._start_next_batch_task)
-
-    def _on_batch_model_progress(self,value,text):
-        # Model preparation occupies the first 5% of the task display.
-        v=min(5,max(0,int(value*0.05)))
-        if 0<=self.batch_index<len(self.batch_queue):
-            self.batch_queue[self.batch_index]["progress"]=v
-        self.current_progress.setValue(v)
-        self.batch_status.setText(text)
-        self.refresh_task_table()
-
-    def _on_batch_song_progress(self,value,text):
-        v=5+int(max(0,min(100,value))*0.95)
-        if 0<=self.batch_index<len(self.batch_queue):
-            self.batch_queue[self.batch_index]["progress"]=min(100,v)
-        self.current_progress.setValue(min(100,v))
-        self.batch_status.setText(
-            f"{self.batch_index+1}/{len(self.batch_queue)} Â· {text}"
-        )
-        self.refresh_task_table()
-        self._update_total_progress()
-
-    def _on_batch_song_done(self,stem_dir):
-        if not (0<=self.batch_index<len(self.batch_queue)):
-            return
-        item=self.batch_queue[self.batch_index]
-        item["status"]="å®Œæˆ"
-        item["progress"]=100
-        item["stem_dir"]=stem_dir
-        item["error"]=""
-        self.batch_completed+=1
-
-        if not item.get("remote"):
-            con=self._db()
-            con.execute("UPDATE tracks SET stems_status='å®Œæˆ' WHERE id=?",(item["id"],))
-            con.commit()
-            con.close()
-
-        if self.after_analysis.isChecked() and not item.get("remote"):
-            self._post_analyze_track(item)
-        if self.after_score.isChecked():
-            item["score_status"]="å¾…å‡ºè°±"
-
-        self._save_batch_queue()
-        self.refresh_task_table()
-        self._update_total_progress()
-        if self.batch_paused:
-            self.batch_status.setText("æ‰¹å¤„ç†ï¼šå½“å‰æ­Œæ›²å®Œæˆï¼Œå·²æš‚åœ")
-        else:
-            QTimer.singleShot(250,self._start_next_batch_task)
-
-    def _on_remote_batch_done(self, job_id, artifacts):
-        if not (0<=self.batch_index<len(self.batch_queue)):
-            return
-        item=self.batch_queue[self.batch_index]
-        item["status"]="å®Œæˆ"
-        item["progress"]=100
-        item["device"]="SERVER"
-        item["server_job_id"]=str(job_id)
-        item["artifacts"]=dict(artifacts or {})
-        item["stem_dir"]=f"server://{job_id}"
-        item["error"]=""
-        self.batch_completed+=1
-        self._save_batch_queue()
-        self.refresh_task_table()
-        self._update_total_progress()
-        if self.batch_paused:
-            self.batch_status.setText("æ‰¹å¤„ç†ï¼šå½“å‰æœåŠ¡å™¨ä»»åŠ¡å®Œæˆï¼Œå·²æš‚åœ")
-        else:
-            QTimer.singleShot(250,self._start_next_batch_task)
-
-    def _on_batch_song_failed(self,error):
-        if not (0<=self.batch_index<len(self.batch_queue)):
-            return
-        item=self.batch_queue[self.batch_index]
-        attempts=int(item.get("attempts",1))
-        auto_retry=self.retry_failed.isChecked() and attempts<2
-        if auto_retry:
-            item["status"]="ç­‰å¾…é‡è¯•"
-            item["error"]=str(error).splitlines()[0][:180]
-            item["progress"]=0
-        else:
-            item["status"]="å¤±è´¥"
-            item["error"]=str(error).splitlines()[0][:180]
-            item["progress"]=0
-            self.batch_failed+=1
-            if not item.get("remote"):
-                con=self._db()
-                con.execute(
-                    "UPDATE tracks SET stems_status=? WHERE id=?",
-                    (f"å¤±è´¥:{item['error'][:80]}",item["id"])
-                )
-                con.commit()
-                con.close()
-
-        self._save_batch_queue()
-        self.refresh_task_table()
-        self._update_total_progress()
-        if self.batch_paused:
-            self.batch_status.setText("æ‰¹å¤„ç†ï¼šå·²æš‚åœ")
-        else:
-            QTimer.singleShot(400,self._start_next_batch_task)
-
-    def _post_analyze_track(self,item):
-        try:
-            import librosa
-            y,sr=librosa.load(item["path"],sr=22050,mono=True,duration=240)
-            tempo,_=librosa.beat.beat_track(y=y,sr=sr)
-            bpm=float(np.asarray(tempo).reshape(-1)[0])
-            chroma=librosa.feature.chroma_cqt(y=y,sr=sr)
-            names=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-            key=names[int(np.argmax(np.mean(chroma,axis=1)))]
-            con=self._db()
-            con.execute(
-                "UPDATE tracks SET bpm=?,musical_key=?,analysis_status='å®Œæˆ' WHERE id=?",
-                (round(bpm,1),key,item["id"])
-            )
-            con.commit()
-            con.close()
-            item["analysis_status"]="å®Œæˆ"
-        except Exception as e:
-            item["analysis_status"]="å¤±è´¥:"+str(e)[:80]
-
-    def _update_total_progress(self):
-        total=max(1,len(self.batch_queue))
-        progress=sum(float(x.get("progress",0)) for x in self.batch_queue)/total
-        self.total_progress.setValue(int(progress))
-
-
-
-
-    def refresh_gpu_list(self):
-        if not hasattr(self,"gpu_selector"):
-            return
-        self.gpu_selector.clear()
-        added=0
-        try:
-            import torch
-            count=torch.cuda.device_count()
-            for i in range(count):
-                name=torch.cuda.get_device_name(i)
-                self.gpu_selector.addItem(f"GPU {i}: {name}",i)
-                added+=1
-        except Exception:
-            pass
-        if added==0:
-            self.gpu_selector.addItem("CPU / æœªæ£€æµ‹åˆ° CUDA",-1)
-
-    def _query_gpu_state(self):
-        idx=self.gpu_selector.currentData() if hasattr(self,"gpu_selector") else -1
-        if idx is None or int(idx)<0:
-            return {"available":False,"index":-1,"memory_percent":0,"temperature":0}
-        state={"available":True,"index":int(idx),"memory_percent":0,"temperature":0}
-        try:
-            import torch
-            props=torch.cuda.get_device_properties(int(idx))
-            total=float(props.total_memory)
-            reserved=float(torch.cuda.memory_reserved(int(idx)))
-            state["memory_percent"]=100.0*reserved/max(1.0,total)
-        except Exception:
-            pass
-        try:
-            import subprocess, re as _re
-            p=subprocess.run(
-                ["nvidia-smi","--query-gpu=index,temperature.gpu,memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True,text=True,timeout=5
-            )
-            if p.returncode==0:
-                for line in p.stdout.splitlines():
-                    parts=[x.strip() for x in line.split(",")]
-                    if len(parts)>=4 and int(parts[0])==int(idx):
-                        state["temperature"]=float(parts[1])
-                        used=float(parts[2]); total=float(parts[3])
-                        state["memory_percent"]=100.0*used/max(1.0,total)
-                        break
-        except Exception:
-            pass
-        self.scheduler_last_gpu_state=state
-        return state
-
-    def _in_night_window(self):
-        if not hasattr(self,"night_mode") or not self.night_mode.isChecked():
-            return True
-        h=time.localtime().tm_hour
-        start=int(self.night_start.currentData())
-        end=int(self.night_end.currentData())
-        if start==end:
-            return True
-        if start<end:
-            return start<=h<end
-        return h>=start or h<end
-
-    def _scheduler_allows_start(self):
-        if not self._in_night_window():
-            self.scheduler_status.setText(
-                f"è°ƒåº¦å™¨ï¼šç­‰å¾…å¤œé—´çª—å£ {self.night_start.currentText()} - {self.night_end.currentText()}"
-            )
-            return False
-
-        state=self._query_gpu_state()
-        if state.get("available"):
-            mem_limit=self.gpu_memory_limit.value()
-            temp_limit=self.gpu_temp_limit.value()
-            if state.get("memory_percent",0)>=mem_limit:
-                self.scheduler_status.setText(
-                    f"è°ƒåº¦å™¨ï¼šGPU æ˜¾å­˜ {state['memory_percent']:.0f}% â‰¥ é™åˆ¶ {mem_limit}%"
-                )
-                return False
-            if state.get("temperature",0)>0 and state["temperature"]>=temp_limit:
-                self.scheduler_status.setText(
-                    f"è°ƒåº¦å™¨ï¼šGPU {state['temperature']:.0f}Â°C â‰¥ é™åˆ¶ {temp_limit}Â°Cï¼Œç­‰å¾…é™æ¸©"
-                )
-                return False
-            self.scheduler_status.setText(
-                f"è°ƒåº¦å™¨ï¼šGPU æ­£å¸¸ Â· æ˜¾å­˜ {state['memory_percent']:.0f}% Â· "
-                f"{state['temperature']:.0f}Â°C"
-            )
-        else:
-            self.scheduler_status.setText("è°ƒåº¦å™¨ï¼šCPU æ¨¡å¼")
-        return True
-
-    def _scheduler_tick(self):
-        if getattr(self,"pipeline_running",False) and not getattr(self,"pipeline_paused",False):
-            stem_worker=getattr(self,"pipeline_batch_worker",None)
-            stage_worker=getattr(self,"pipeline_stage_worker",None)
-            if not (stem_worker and stem_worker.isRunning()) and not (stage_worker and stage_worker.isRunning()):
-                if self._scheduler_allows_start():
-                    self._start_next_pipeline_job()
-
-    def sort_pipeline_by_priority(self):
-        rank={"é«˜":0,"æ™®é€š":1,"ä½":2}
-        self.pipeline_jobs.sort(
-            key=lambda j:(rank.get(j.get("priority","æ™®é€š"),1),j.get("created_at",0))
-        )
-        self._save_pipeline_jobs()
-        self.refresh_pipeline_table()
-
-    def set_selected_job_priority(self,priority):
-        row=self.pipeline_table.currentRow()
-        if row<0 or row>=len(self.pipeline_jobs):
-            return
-        self.pipeline_jobs[row]["priority"]=priority
-        self.sort_pipeline_by_priority()
-
-    def _retry_backoff_ready(self,job):
-        return time.time() >= float(job.get("next_retry_at",0) or 0)
-
-    def _mark_job_retry(self,job):
-        count=int(job.get("retry_count",0))+1
-        job["retry_count"]=count
-        delay=min(300,self.scheduler_backoff_seconds*(2**max(0,count-1)))
-        job["next_retry_at"]=time.time()+delay
-        job["status"]="å¾…å¤„ç†"
-        return delay
-
-    def _pipeline_file(self):
-        return BASE_DIR/"library"/"auto_pipeline_jobs.json"
-
-    def _save_pipeline_jobs(self):
-        p=self._pipeline_file()
-        atomic_write_json(p, self.pipeline_jobs)
-
-    def _load_pipeline_jobs(self):
-        p=self._pipeline_file()
-        if not p.exists():
-            return
-        try:
-            self.pipeline_jobs=json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            self.pipeline_jobs=[]
-
-    def _enabled_pipeline_stages(self):
-        return [
-            s for s,cb in [
-                ("stems",self.pipe_stems),
-                ("analysis",self.pipe_analysis),
-                ("chords",self.pipe_chords),
-                ("score",self.pipe_score),
-                ("arrangement",self.pipe_arrange),
-                ("render",self.pipe_render),
-                ("library",None),
-            ] if cb is None or cb.isChecked()
-        ]
-
-    def _new_pipeline_job(self,row):
-        return {
-            "track_id":int(row["id"]),
-            "title":row["title"],
-            "priority":self.default_priority.currentText() if hasattr(self,"default_priority") else "æ™®é€š",
-            "retry_count":0,
-            "next_retry_at":0,
-            "path":row["working_path"],
-            "stem_dir":"",
-            "stages":{s:"å¾…å¤„ç†" for s in self.pipeline_stage_order},
-            "status":"å¾…å¤„ç†",
-            "error":"",
-            "created_at":time.time(),
-            "updated_at":time.time(),
-            "artifacts":{}
-        }
-
-    def build_pipeline_jobs(self):
-        con=self._db()
-        rows=con.execute("SELECT id,title,working_path FROM tracks ORDER BY artist,album,title").fetchall()
-        con.close()
-        self.pipeline_jobs=[self._new_pipeline_job(r) for r in rows if r["working_path"] and Path(r["working_path"]).exists()]
-        self.sort_pipeline_by_priority()
-        self._save_pipeline_jobs()
-        self.refresh_pipeline_table()
-
-    def refresh_pipeline_table(self):
-        self.pipeline_table.setRowCount(len(self.pipeline_jobs))
-        for r,job in enumerate(self.pipeline_jobs):
-            st=job.get("stages",{})
-            vals=[
-                job.get("priority","æ™®é€š"),
-                job.get("title",""),
-                st.get("stems","-"),
-                st.get("analysis","-"),
-                st.get("chords","-"),
-                st.get("score","-"),
-                st.get("arrangement","-"),
-                st.get("render","-"),
-                st.get("library","-"),
-                job.get("status","")
-            ]
-            for c,v in enumerate(vals):
-                self.pipeline_table.setItem(r,c,QTableWidgetItem(str(v)))
-
-    def start_auto_pipeline(self):
-        if self.pipeline_executor.currentText().startswith("æœåŠ¡å™¨"):
-            if not self.remote_rows:
-                self.refresh_library()
-            if not self.remote_rows:
-                QMessageBox.information(self, "æœåŠ¡å™¨æµæ°´çº¿", "æœåŠ¡å™¨æ›²åº“ä¸­æ²¡æœ‰å¯å¤„ç†æ­Œæ›²ã€‚")
-                return
-            self.enqueue_stems(show_message=False)
-            self.pipeline_status.setText(
-                f"æœåŠ¡å™¨æµæ°´çº¿ï¼šå·²æäº¤ {len(self.batch_queue)} é¦–æœåŠ¡å™¨ G ç›˜æ­Œæ›²"
-            )
-            self.start_batch_processing()
-            return
-
-        if not self.pipeline_jobs:
-            self.build_pipeline_jobs()
-        if not self.pipeline_jobs:
-            QMessageBox.information(self,"è‡ªåŠ¨æµæ°´çº¿","éŸ³ä¹åº“ä¸­æ²¡æœ‰å¯å¤„ç†æ­Œæ›²ã€‚")
-            return
-
-        self.pipeline_running=True
-        self.pipeline_paused=False
-        self.pipe_pause.setText("æš‚åœæµæ°´çº¿")
-        self.pipeline_status.setText(f"æµæ°´çº¿ï¼š{len(self.pipeline_jobs)} é¦–å¾…å¤„ç†")
-        self._start_next_pipeline_job()
-
-    def toggle_pipeline_pause(self):
-        if not self.pipeline_running:
-            return
-        self.pipeline_paused=not self.pipeline_paused
-        if self.pipeline_paused:
-            self.pipe_pause.setText("ç»§ç»­æµæ°´çº¿")
-            self.pipeline_status.setText("æµæ°´çº¿ï¼šå°†åœ¨å½“å‰é˜¶æ®µå®‰å…¨å®Œæˆåæš‚åœ")
-        else:
-            self.pipe_pause.setText("æš‚åœæµæ°´çº¿")
-            self.pipeline_status.setText("æµæ°´çº¿ï¼šç»§ç»­æ‰§è¡Œ")
-            QTimer.singleShot(100,self._start_next_pipeline_job)
-
-    def resume_failed_pipeline_jobs(self):
-        count=0
-        for job in self.pipeline_jobs:
-            if job.get("status")=="å¤±è´¥":
-                job["status"]="å¾…å¤„ç†"
-                job["error"]=""
-                for stage,state in job.get("stages",{}).items():
-                    if state.startswith("å¤±è´¥"):
-                        job["stages"][stage]="å¾…å¤„ç†"
-                count+=1
-        self._save_pipeline_jobs()
-        self.refresh_pipeline_table()
-        if count:
-            self.pipeline_running=True
-            self.pipeline_paused=False
-            self._start_next_pipeline_job()
-        else:
-            QMessageBox.information(self,"ç»§ç»­å¤±è´¥ä»»åŠ¡","å½“å‰æ²¡æœ‰å¤±è´¥ä»»åŠ¡ã€‚")
-
-    def _pipeline_next_job_index(self):
-        enabled=self._enabled_pipeline_stages()
-        for i,job in enumerate(self.pipeline_jobs):
-            if job.get("status") in ("å¾…å¤„ç†","å¤„ç†ä¸­"):
-                if not self._retry_backoff_ready(job):
-                    continue
-                for s in enabled:
-                    if job.get("stages",{}).get(s,"å¾…å¤„ç†")!="å®Œæˆ":
-                        return i
-        return -1
-
-    def _pipeline_next_stage(self,job):
-        for s in self._enabled_pipeline_stages():
-            if job.get("stages",{}).get(s,"å¾…å¤„ç†")!="å®Œæˆ":
-                return s
-        return ""
-
-    def _pipeline_update_progress(self):
-        enabled=self._enabled_pipeline_stages()
-        total=max(1,len(self.pipeline_jobs)*len(enabled))
-        done=0
-        for job in self.pipeline_jobs:
-            for s in enabled:
-                if job.get("stages",{}).get(s)=="å®Œæˆ":
-                    done+=1
-        self.pipeline_progress.setValue(int(done/total*100))
-
-    def _start_next_pipeline_job(self):
-        if not self.pipeline_running or self.pipeline_paused:
-            return
-        if self.pipeline_batch_worker and self.pipeline_batch_worker.isRunning():
-            return
-        if self.pipeline_stage_worker and self.pipeline_stage_worker.isRunning():
-            return
-        if not self._scheduler_allows_start():
-            return
-        idx=self._pipeline_next_job_index()
-        if idx<0:
-            enabled=self._enabled_pipeline_stages()
-            pending=[
-                item for item in self.pipeline_jobs
-                if item.get("status") in ("å¾…å¤„ç†","å¤„ç†ä¸­")
-                and any(item.get("stages",{}).get(s,"å¾…å¤„ç†")!="å®Œæˆ" for s in enabled)
-            ]
-            if pending:
-                future=[float(x.get("next_retry_at",0) or 0) for x in pending]
-                wait=max(1,int(min(future)-time.time())) if any(future) else 1
-                self.pipeline_status.setText(f"æµæ°´çº¿ï¼šå¤±è´¥ä»»åŠ¡é€€é¿ä¸­ï¼Œçº¦ {wait} ç§’åç»§ç»­")
-                QTimer.singleShot(1000,self._start_next_pipeline_job)
-                return
-            self.pipeline_running=False
-            self.pipeline_status.setText("æµæ°´çº¿ï¼šå…¨éƒ¨å®Œæˆ")
-            self.pipeline_progress.setValue(100)
-            self._save_pipeline_jobs()
-            self.refresh_library()
-            return
-
-        self.pipeline_job_index=idx
-        job=self.pipeline_jobs[idx]
-        stage=self._pipeline_next_stage(job)
-        if not stage:
-            job["status"]="å®Œæˆ"
-            QTimer.singleShot(50,self._start_next_pipeline_job)
-            return
-
-        job["status"]="å¤„ç†ä¸­"
-        job["stages"][stage]="å¤„ç†ä¸­"
-        job["updated_at"]=time.time()
-        self.pipeline_stage=stage
-        self.refresh_pipeline_table()
-        self._save_pipeline_jobs()
-
-        stage_name={
-            "stems":"å…­è½¨åˆ†ç¦»","analysis":"BPM/è°ƒæ€§","chords":"å’Œå¼¦/æ®µè½",
-            "score":"ä¹è°±","arrangement":"æ™ºèƒ½ç¼–é…","render":"æ¸²æŸ“","library":"å…¥åº“"
-        }.get(stage,stage)
-        self.pipeline_status.setText(
-            f"æµæ°´çº¿ï¼š{idx+1}/{len(self.pipeline_jobs)} Â· {job['title']} Â· {stage_name}"
-        )
-
-        if stage=="stems":
-            self._pipeline_run_stems(job)
-        else:
-            QTimer.singleShot(10,lambda: self._pipeline_run_sync_stage(stage,job))
-
-    def _pipeline_fail(self,job,stage,error):
-        job["stages"][stage]="å¤±è´¥"
-        job["error"]=str(error)[:300]
-        if int(job.get("retry_count",0)) < 2:
-            delay=self._mark_job_retry(job)
-            job["error"]=f"{job['error']} Â· {delay}s åè‡ªåŠ¨é‡è¯•"
-            job["stages"][stage]="å¾…å¤„ç†"
-        else:
-            job["status"]="å¤±è´¥"
-        job["updated_at"]=time.time()
-        self._save_pipeline_jobs()
-        self.refresh_pipeline_table()
-        self._pipeline_update_progress()
-        self.pipeline_status.setText(f"æµæ°´çº¿å¤±è´¥ï¼š{job['title']} Â· {stage} Â· {job['error']}")
-        if not self.pipeline_paused:
-            QTimer.singleShot(200,self._start_next_pipeline_job)
-
-    def _pipeline_complete_stage(self,job,stage):
-        job["stages"][stage]="å®Œæˆ"
-        job["updated_at"]=time.time()
-        job["retry_count"]=0
-        job["next_retry_at"]=0
-        if not self._pipeline_next_stage(job):
-            job["status"]="å®Œæˆ"
-        self._save_pipeline_jobs()
-        self.refresh_pipeline_table()
-        self._pipeline_update_progress()
-        if self.pipeline_paused:
-            self.pipeline_status.setText("æµæ°´çº¿ï¼šå·²æš‚åœ")
-        else:
-            QTimer.singleShot(100,self._start_next_pipeline_job)
-
-    def _pipeline_run_stems(self,job):
-        gpu_index=self.gpu_selector.currentData() if hasattr(self,"gpu_selector") else -1
-        job["gpu_index"]=int(gpu_index) if gpu_index is not None else -1
-        self.pipeline_batch_worker=SeparationWorker(job["path"])
-        active_worker=self.pipeline_batch_worker
-        self.pipeline_batch_worker.separation_progress.connect(
-            lambda v,t:self.pipeline_status.setText(f"æµæ°´çº¿ï¼š{job['title']} Â· å…­è½¨ {v}%")
-        )
-        self.pipeline_batch_worker.done.connect(
-            lambda stem_dir:self._pipeline_stems_done(job,stem_dir)
-        )
-        self.pipeline_batch_worker.failed.connect(
-            lambda err:self._pipeline_fail(job,"stems",err)
-        )
-        self.pipeline_batch_worker.finished.connect(
-            lambda w=active_worker:self._release_pipeline_batch_worker(w)
-        )
-        self.pipeline_batch_worker.start()
-
-    def _release_pipeline_batch_worker(self,worker):
-        if self.pipeline_batch_worker is worker:
-            self.pipeline_batch_worker=None
-            if self.pipeline_running and not self.pipeline_paused:
-                QTimer.singleShot(0,self._start_next_pipeline_job)
-
-    def _pipeline_stems_done(self,job,stem_dir):
-        job["stem_dir"]=stem_dir
-        job["artifacts"]["stems"]=stem_dir
-        con=self._db()
-        con.execute("UPDATE tracks SET stems_status='å®Œæˆ' WHERE id=?",(job["track_id"],))
-        con.commit(); con.close()
-        self._pipeline_complete_stage(job,"stems")
-
-    def _pipeline_run_sync_stage(self,stage,job):
-        try:
-            if stage=="render":
-                try:
-                    job["render_soundfont"]=self.main.arrangement.soundfont_edit.text().strip()
-                except Exception:
-                    job["render_soundfont"]=""
-                job["render_output"]=self.pipeline_output.currentText()
-            operations={
-                "analysis":lambda:self._pipeline_stage_analysis(job),
-                "chords":lambda:self._pipeline_stage_chords(job),
-                "score":lambda:self._pipeline_stage_score(job),
-                "arrangement":lambda:self._pipeline_stage_arrangement(job),
-                "render":lambda:self._pipeline_stage_render(job),
-                "library":lambda:self._pipeline_stage_library(job),
-            }
-            operation=operations.get(stage)
-            if operation is None:
-                raise RuntimeError(f"æœªçŸ¥æµæ°´çº¿é˜¶æ®µï¼š{stage}")
-            self.pipeline_stage_worker=PipelineStageWorker(operation)
-            active_worker=self.pipeline_stage_worker
-            self.pipeline_stage_worker.succeeded.connect(
-                lambda:self._pipeline_complete_stage(job,stage)
-            )
-            self.pipeline_stage_worker.failed.connect(
-                lambda error:self._pipeline_fail(job,stage,error)
-            )
-            self.pipeline_stage_worker.finished.connect(
-                lambda w=active_worker:self._release_pipeline_stage_worker(w)
-            )
-            self.pipeline_stage_worker.start()
-        except Exception as e:
-            self._pipeline_fail(job,stage,e)
-
-    def _release_pipeline_stage_worker(self,worker):
-        if self.pipeline_stage_worker is worker:
-            self.pipeline_stage_worker=None
-            if self.pipeline_running and not self.pipeline_paused:
-                QTimer.singleShot(0,self._start_next_pipeline_job)
-
-    def _pipeline_stage_analysis(self,job):
-        import librosa
-        y,sr=librosa.load(job["path"],sr=22050,mono=True,duration=240)
-        tempo,_=librosa.beat.beat_track(y=y,sr=sr)
-        bpm=float(np.asarray(tempo).reshape(-1)[0])
-        chroma=librosa.feature.chroma_cqt(y=y,sr=sr)
-        names=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-        key=names[int(np.argmax(np.mean(chroma,axis=1)))]
-        job["artifacts"]["analysis"]={"bpm":round(bpm,1),"key":key}
-        con=self._db()
-        con.execute(
-            "UPDATE tracks SET bpm=?,musical_key=?,analysis_status='å®Œæˆ' WHERE id=?",
-            (round(bpm,1),key,job["track_id"])
-        )
-        con.commit(); con.close()
-
-    def _pipeline_stage_chords(self,job):
-        import librosa
-        y,sr=librosa.load(job["path"],sr=22050,mono=True)
-        tempo,beat_frames=librosa.beat.beat_track(y=y,sr=sr)
-        beat_times=librosa.frames_to_time(beat_frames,sr=sr)
-        chroma=librosa.feature.chroma_cqt(y=y,sr=sr)
-        beat_chroma=librosa.util.sync(chroma,beat_frames,aggregate=np.median)
-
-        names=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-        templates=[]
-        for root in range(12):
-            for suffix,ints in [("",[0,4,7]),("m",[0,3,7]),("7",[0,4,7,10]),("maj7",[0,4,7,11]),("m7",[0,3,7,10])]:
-                t=np.zeros(12,float)
-                for k in ints:t[(root+k)%12]=1.0
-                templates.append((names[root]+suffix,t/(np.linalg.norm(t)+1e-9)))
-
-        chords=[]
-        for i in range(beat_chroma.shape[1]):
-            v=beat_chroma[:,i].astype(float)
-            v=v/(np.linalg.norm(v)+1e-9)
-            best=max(((float(np.dot(v,t)),name) for name,t in templates),key=lambda x:x[0])
-            chords.append(best[1])
-
-        rows=[]
-        for start in range(0,min(len(chords),len(beat_times)),4):
-            seq=chords[start:start+4]
-            compact=[]
-            for c in seq:
-                if not compact or compact[-1]!=c:compact.append(c)
-            rows.append({
-                "bar":len(rows)+1,
-                "seconds":float(beat_times[start]),
-                "chords":compact,
-                "section":f"æ®µè½ {len(rows)//8+1}"
-            })
-
-        out=BASE_DIR/"pipeline"/"chords"
-        out.mkdir(parents=True,exist_ok=True)
-        p=out/f"{job['track_id']}_chords.json"
-        p.write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding="utf-8")
-        job["artifacts"]["chords"]=str(p)
-        job["artifacts"]["chord_timeline"]=rows
-
-        con=self._db()
-        con.execute("UPDATE tracks SET chords_status='å®Œæˆ' WHERE id=?",(job["track_id"],))
-        con.commit(); con.close()
-
-    def _pipeline_stage_score(self,job):
-        rows=job["artifacts"].get("chord_timeline")
-        if not rows:
-            cp=job["artifacts"].get("chords","")
-            if cp and Path(cp).exists():
-                rows=json.loads(Path(cp).read_text(encoding="utf-8"))
-        if not rows:
-            raise RuntimeError("æ²¡æœ‰å’Œå¼¦æ—¶é—´çº¿ï¼Œæ— æ³•å‡ºè°±")
-
-        outdir=BASE_DIR/"pipeline"/"scores"
-        outdir.mkdir(parents=True,exist_ok=True)
-        p=outdir/f"{job['track_id']}_lead_sheet.html"
-        trs=[]
-        for row in rows:
-            trs.append(
-                f"<tr><td>{row['bar']}</td><td>{self.main._format_time(row['seconds'])}</td>"
-                f"<td>{html.escape(row['section'])}</td><td>{html.escape(' / '.join(row['chords']))}</td></tr>"
-            )
-        page=f"""<!doctype html><meta charset='utf-8'><style>
-        body{{font-family:'Microsoft YaHei UI';background:#09111f;color:#edf3ff;padding:30px}}
-        table{{width:100%;border-collapse:collapse}}td,th{{padding:9px;border-bottom:1px solid #253451}}
-        </style><h1>{html.escape(job['title'])}</h1>
-        <table><tr><th>å°èŠ‚</th><th>æ—¶é—´</th><th>æ®µè½</th><th>å’Œå¼¦</th></tr>{''.join(trs)}</table>"""
-        p.write_text(page,encoding="utf-8")
-        job["artifacts"]["score"]=str(p)
-        con=self._db()
-        con.execute("UPDATE tracks SET score_status='å®Œæˆ' WHERE id=?",(job["track_id"],))
-        con.commit(); con.close()
-
-    def _pipeline_stage_arrangement(self,job):
-        rows=job["artifacts"].get("chord_timeline")
-        if not rows:
-            raise RuntimeError("ç¼ºå°‘å’Œå¼¦æ—¶é—´çº¿")
-
-        from mido import MidiFile,MidiTrack,Message,MetaMessage,bpm2tempo
-        analysis=job["artifacts"].get("analysis",{})
-        bpm=float(analysis.get("bpm",120) or 120)
-
-        mid=MidiFile(ticks_per_beat=480)
-        meta=MidiTrack();mid.tracks.append(meta)
-        meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
-        meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
-
-        guitar=MidiTrack();mid.tracks.append(guitar)
-        bass=MidiTrack();mid.tracks.append(bass)
-        piano=MidiTrack();mid.tracks.append(piano)
-        drums=MidiTrack();mid.tracks.append(drums)
-
-        note_map={"C":60,"C#":61,"D":62,"D#":63,"E":64,"F":65,"F#":66,"G":67,"G#":68,"A":69,"A#":70,"B":71}
-        total=max(1,len(rows))
-        for i,row in enumerate(rows):
-            chord=(row.get("chords") or ["C"])[0]
-            m=re.match(r"^([A-G](?:#)?)(m?)",chord)
-            root=note_map.get(m.group(1) if m else "C",60)
-            minor=bool(m and m.group(2)=="m")
-            chord_notes=[root,root+(3 if minor else 4),root+7]
-
-            # Musical Intelligence-style role estimate based on 8-bar blocks.
-            block=i//8
-            pos=i/max(1,total-1)
-            if pos<0.12:
-                role="intro"
-            elif pos<0.45:
-                role="verse"
-            elif pos<0.68:
-                role="chorus"
-            elif pos<0.85:
-                role="bridge"
-            else:
-                role="outro"
-
-            strategy={
-                "intro": {"g":0.52,"b":0.45,"d":0.35,"p":0.68,"fill":False},
-                "verse": {"g":0.62,"b":0.58,"d":0.55,"p":0.58,"fill":False},
-                "chorus":{"g":0.90,"b":0.88,"d":0.95,"p":0.80,"fill":True},
-                "bridge":{"g":0.40,"b":0.50,"d":0.44,"p":0.75,"fill":False},
-                "outro": {"g":0.48,"b":0.45,"d":0.35,"p":0.62,"fill":False},
-            }[role]
-
-            # Guitar
-            gvel=int(42+45*strategy["g"])
-            gsteps=8 if role=="chorus" else 4
-            gdur=240 if gsteps==8 else 480
-            for step in range(gsteps):
-                if role in ("intro","bridge") and step%2==1:
-                    n=chord_notes[step%len(chord_notes)]
-                    guitar.append(Message('note_on',note=n,velocity=gvel,time=0,channel=0))
-                    guitar.append(Message('note_off',note=n,velocity=0,time=gdur,channel=0))
-                else:
-                    for n in chord_notes:
-                        guitar.append(Message('note_on',note=n,velocity=gvel,time=0,channel=0))
-                    guitar.append(Message('note_off',note=chord_notes[0],velocity=0,time=int(gdur*.82),channel=0))
-                    for n in chord_notes[1:]:
-                        guitar.append(Message('note_off',note=n,velocity=0,time=0,channel=0))
-                    guitar.append(Message('note_on',note=root,velocity=1,time=max(1,int(gdur*.18)),channel=0))
-                    guitar.append(Message('note_off',note=root,velocity=0,time=0,channel=0))
-
-            # Bass
-            bvel=int(55+35*strategy["b"])
-            bass_pattern=[root-24,root-17,root-24,root-12] if role=="chorus" else [root-24,root-17,root-24,root-17]
-            for bn in bass_pattern:
-                bn=max(28,min(72,bn))
-                bass.append(Message('note_on',note=bn,velocity=bvel,time=0,channel=1))
-                bass.append(Message('note_off',note=bn,velocity=0,time=480,channel=1))
-
-            # Piano: more sustained in bridge/intro to avoid guitar masking.
-            pvel=int(42+30*strategy["p"])
-            if role in ("intro","bridge","outro"):
-                for n in chord_notes:
-                    piano.append(Message('note_on',note=n+12,velocity=pvel,time=0,channel=2))
-                piano.append(Message('note_off',note=chord_notes[0]+12,velocity=0,time=1920,channel=2))
-                for n in chord_notes[1:]:
-                    piano.append(Message('note_off',note=n+12,velocity=0,time=0,channel=2))
-            else:
-                for beat in range(4):
-                    n=chord_notes[beat%len(chord_notes)]+12
-                    piano.append(Message('note_on',note=n,velocity=pvel,time=0,channel=2))
-                    piano.append(Message('note_off',note=n,velocity=0,time=480,channel=2))
-
-            # Drums
-            dvel=int(45+50*strategy["d"])
-            for e in range(8):
-                events=[(42,max(35,dvel-25))]
-                if e in (0,4):events.append((36,dvel))
-                if e in (2,6):events.append((38,dvel))
-                if role=="chorus" and e in (3,7):events.append((36,max(45,dvel-5))
-                )
-                for n,v in events:
-                    drums.append(Message('note_on',note=n,velocity=min(120,v),time=0,channel=9))
-                drums.append(Message('note_off',note=42,velocity=0,time=240,channel=9))
-                for n,_ in events[1:]:
-                    drums.append(Message('note_off',note=n,velocity=0,time=0,channel=9))
-
-            if strategy["fill"] and (i+1)%8==0:
-                for note in [45,47,50,38]:
-                    drums.append(Message('note_on',note=note,velocity=min(120,dvel+10),time=0,channel=9))
-                    drums.append(Message('note_off',note=note,velocity=0,time=120,channel=9))
-
-        outdir=BASE_DIR/"pipeline"/"arrangements"
-        outdir.mkdir(parents=True,exist_ok=True)
-        p=outdir/f"{job['track_id']}_arrangement.mid"
-        mid.save(str(p))
-        job["artifacts"]["arrangement_midi"]=str(p)
-        job["artifacts"]["arrangement_engine"]="Musical Intelligence Pipeline v2.1"
-        con=self._db()
-        con.execute("UPDATE tracks SET arrangement_status='å®Œæˆ' WHERE id=?",(job["track_id"],))
-        con.commit();con.close()
-
-    def _pipeline_stage_render(self,job):
-        midi=job["artifacts"].get("arrangement_midi","")
-        if not midi or not Path(midi).exists():
-            raise RuntimeError("æ²¡æœ‰ç¼–é… MIDI")
-
-        sf_path=str(job.get("render_soundfont","") or "")
-
-        if not sf_path or not Path(sf_path).exists():
-            # MIDI ç¼–é…å·²ç»æ˜¯å¯äº¤ä»˜æˆæœã€‚SoundFont æ˜¯å¯é€‰çš„æœ¬åœ°éŸ³è‰²åº“ï¼Œ
-            # æœªé…ç½®æ—¶è·³è¿‡éŸ³é¢‘æ¸²æŸ“ï¼Œä¸å†è®©æ•´æ¡ AI æµæ°´çº¿å¤±è´¥ã€‚
-            job["artifacts"]["render_notice"] = "æœªé…ç½® SoundFontï¼Œå·²ä¿ç•™ MIDI å¹¶è·³è¿‡éŸ³é¢‘æ¸²æŸ“"
-            con=self._db()
-            con.execute(
-                "UPDATE tracks SET render_status='å·²è·³è¿‡ï¼ˆæœªé…ç½® SoundFontï¼‰' WHERE id=?",
-                (job["track_id"],),
-            )
-            con.commit();con.close()
-            return
-
-        fluidsynth=self.main._find_fluidsynth()
-        if not fluidsynth:
-            raise RuntimeError("æœªæ‰¾åˆ° FluidSynth")
-
-        outdir=BASE_DIR/"pipeline"/"rendered"
-        outdir.mkdir(parents=True,exist_ok=True)
-        wav=outdir/f"{job['track_id']}_final.wav"
-        p=subprocess.run(
-            [fluidsynth,"-ni",sf_path,midi,"-F",str(wav),"-r","44100"],
-            capture_output=True,text=True,timeout=600
-        )
-        if p.returncode!=0 or not wav.exists():
-            raise RuntimeError((p.stderr or p.stdout or "æ¸²æŸ“å¤±è´¥")[-1500:])
-        job["artifacts"]["final_wav"]=str(wav)
-
-        if job.get("render_output")=="WAV + MP3":
-            ffmpeg=self.main._find_ffmpeg()
-            if not ffmpeg:
-                raise RuntimeError("éœ€è¦ MP3ï¼Œä½†æœªæ‰¾åˆ° FFmpeg")
-            mp3=outdir/f"{job['track_id']}_final.mp3"
-            p2=subprocess.run(
-                [ffmpeg,"-y","-i",str(wav),"-codec:a","libmp3lame","-b:a","320k",str(mp3)],
-                capture_output=True,text=True,timeout=300
-            )
-            if p2.returncode!=0 or not mp3.exists():
-                raise RuntimeError("MP3 ç¼–ç å¤±è´¥")
-            job["artifacts"]["final_mp3"]=str(mp3)
-
-        con=self._db()
-        con.execute(
-            "UPDATE tracks SET render_status='å®Œæˆ',final_audio_path=? WHERE id=?",
-            (str(wav),job["track_id"])
-        )
-        con.commit();con.close()
-
-    def _pipeline_stage_library(self,job):
-        # Final consistency checkpoint.
-        con=self._db()
-        row=con.execute("SELECT id FROM tracks WHERE id=?",(job["track_id"],)).fetchone()
-        if not row:
-            raise RuntimeError("éŸ³ä¹åº“ä¸­æ‰¾ä¸åˆ°æ­Œæ›²è®°å½•")
-        con.commit();con.close()
-        job["artifacts"]["library_updated"]=True
-
-
-    def load_selected_to_workspace(self):
-        tid=self._selected_track_id()
-        if not tid:
-            return
-        row=self.remote_rows.get(tid)
-        if not row:
-            QMessageBox.warning(self, "æœåŠ¡å™¨æ›²åº“", "è¯·å…ˆåˆ·æ–°æœåŠ¡å™¨æ›²åº“ã€‚")
-            return
-        self.main.load_server_library_track(tid, row)
-
-
-class WorksCenterPage(QWidget):
-    """Browse, reopen and archive saved Juweier projects."""
-
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-        layout = QVBoxLayout(self)
-        title = QLabel("ä½œå“ä¸­å¿ƒ")
-        title.setObjectName("PageTitle")
-        layout.addWidget(title)
-        hint = QLabel("é›†ä¸­ç®¡ç†å·²ä¿å­˜å·¥ç¨‹ã€Stemã€è°±é¢ã€MIDI å’Œå¯¼å‡ºæ··éŸ³ã€‚")
-        hint.setObjectName("SectionHint")
-        layout.addWidget(hint)
-        actions = QHBoxLayout()
-        refresh = QPushButton("åˆ·æ–°ä½œå“")
-        open_project = QPushButton("æ‰“å¼€å·¥ç¨‹")
-        package = QPushButton("æ‰“åŒ…æ‰€é€‰ä½œå“")
-        reveal = QPushButton("æ‰“å¼€ä½œå“ç›®å½•")
-        remove = QPushButton("ç§»åˆ°å›æ”¶ç«™")
-        apply_button_accent(open_project, "primary")
-        refresh.clicked.connect(self.refresh)
-        open_project.clicked.connect(self.open_selected)
-        package.clicked.connect(self.package_selected)
-        reveal.clicked.connect(self.reveal_folder)
-        remove.clicked.connect(self.remove_selected)
-        for button in (refresh, open_project, package, reveal, remove): actions.addWidget(button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["ä½œå“", "æºæ­Œæ›²", "åˆ†è½¨", "ç‰ˆæœ¬", "ä¿®æ”¹æ—¶é—´", "å·¥ç¨‹æ–‡ä»¶"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.doubleClicked.connect(self.open_selected)
-        layout.addWidget(self.table, 1)
-        self.status = QLabel("")
-        self.status.setObjectName("SectionHint")
-        layout.addWidget(self.status)
-        self.refresh()
-
-    def _projects(self):
-        rows = []
-        for path in sorted(PROJECTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            rows.append((path, data))
-        return rows
-
-    def refresh(self):
-        rows = self._projects()
-        self.table.setRowCount(len(rows))
-        for row, (path, data) in enumerate(rows):
-            source = str(data.get("source_song") or "")
-            stem_dir = str(data.get("stem_dir") or "")
-            values = [path.stem.replace(".novria", ""), Path(source).name if source else "-",
-                      "å·²ç”Ÿæˆ" if stem_dir and Path(stem_dir).is_dir() else "æœªç”Ÿæˆ",
-                      str(data.get("version") or "-"),
-                      time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)), str(path)]
-            for col, value in enumerate(values): self.table.setItem(row, col, QTableWidgetItem(value))
-        self.status.setText(f"å…± {len(rows)} ä¸ªå·¥ç¨‹ï¼Œç›®å½•ï¼š{PROJECTS_DIR}")
-
-    def _selected_path(self):
-        row = self.table.currentRow()
-        if row < 0: return None
-        item = self.table.item(row, 5)
-        return Path(item.text()) if item else None
-
-    def open_selected(self):
-        path = self._selected_path()
-        if not path: return
-        self.main.load_project_file(path)
-
-    def package_selected(self):
-        project = self._selected_path()
-        if not project: return
-        target, _ = QFileDialog.getSaveFileName(self, "æ‰“åŒ…ä½œå“", str(EXPORTS_DIR / f"{project.stem}.zip"), "ZIP (*.zip)")
-        if not target: return
-        data = json.loads(project.read_text(encoding="utf-8"))
-        candidates = [project, Path(str(data.get("source_song") or ""))]
-        stem_dir = Path(str(data.get("stem_dir") or ""))
-        if stem_dir.is_dir(): candidates.extend(p for p in stem_dir.rglob("*") if p.is_file())
-        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-            seen = set()
-            for path in candidates:
-                if path.is_file() and str(path.resolve()) not in seen:
-                    seen.add(str(path.resolve()))
-                    archive.write(path, f"{path.parent.name}/{path.name}")
-        QMessageBox.information(self, "ä½œå“æ‰“åŒ…", f"å·²ç”Ÿæˆï¼š\n{target}")
-
-    def reveal_folder(self):
-        try: os.startfile(str(PROJECTS_DIR))
-        except Exception: webbrowser.open(PROJECTS_DIR.as_uri())
-
-    def remove_selected(self):
-        path = self._selected_path()
-        if not path: return
-        if QMessageBox.question(self, "ç§»é™¤å·¥ç¨‹", f"ç¡®å®šç§»é™¤å·¥ç¨‹ï¼Ÿ\n{path.name}") != QMessageBox.Yes: return
-        trash = PROJECTS_DIR / ".trash"
-        trash.mkdir(exist_ok=True)
-        destination = trash / f"{int(time.time())}_{path.name}"
-        shutil.move(str(path), str(destination))
-        self.refresh()
-
-
-class CommunityPage(QWidget):
-    """Desktop account and beta community client backed by mobile_api.py."""
-
-    CONFIG_FILE = BASE_DIR / "config" / "community.json"
-
-    def __init__(self, main):
-        super().__init__()
-        self.main = main
-        self.token = ""
-        self.username = ""
-        self.nickname = ""
-
-        root = QVBoxLayout(self)
-        title = QLabel("è´¦å· / å†…æµ‹ç¾¤èŠ")
-        title.setObjectName("PageTitle")
-        root.addWidget(title)
-        hint = QLabel("Windowsã€Android ä¸ iOS ä½¿ç”¨åŒä¸€è´¦å·å’Œç¾¤èŠï¼›æœåŠ¡å™¨å¯å¡«å†™ç”µè„‘å±€åŸŸç½‘åœ°å€æˆ– Cloudflare HTTPS åŸŸåã€‚")
-        hint.setObjectName("SectionHint")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
-
-        account_box = QGroupBox("æ©˜å‘³å„¿è´¦å·")
-        form = QGridLayout(account_box)
-        self.server_edit = QLineEdit("http://192.168.1.100:8000")
-        self.server_edit.setPlaceholderText("ä¾‹å¦‚ http://ç”µè„‘IP:8000 æˆ– https://api.example.com")
-        self.user_edit = QLineEdit()
-        self.user_edit.setPlaceholderText("è´¦å·ï¼ˆè‡³å°‘ 3 ä½ï¼‰")
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setPlaceholderText("å¯†ç ï¼ˆè‡³å°‘ 6 ä½ï¼‰")
-        self.nickname_edit = QLineEdit()
-        self.nickname_edit.setPlaceholderText("æ˜µç§°ï¼ˆæ³¨å†Œæ—¶å¯é€‰ï¼‰")
-        login_btn = QPushButton("ç™»å½•")
-        register_btn = QPushButton("æ³¨å†Œ")
-        apply_button_accent(login_btn, "primary")
-        login_btn.clicked.connect(lambda: self.authenticate(False))
-        register_btn.clicked.connect(lambda: self.authenticate(True))
-        self.logout_btn = QPushButton("é€€å‡ºç™»å½•")
-        self.logout_btn.clicked.connect(self.logout)
-        self.account_status = QLabel("æœªç™»å½•")
-        self.account_status.setObjectName("SectionHint")
-        form.addWidget(QLabel("AI æœåŠ¡å™¨"), 0, 0)
-        form.addWidget(self.server_edit, 0, 1, 1, 4)
-        form.addWidget(QLabel("è´¦å·"), 1, 0)
-        form.addWidget(self.user_edit, 1, 1)
-        form.addWidget(QLabel("å¯†ç "), 1, 2)
-        form.addWidget(self.password_edit, 1, 3)
-        form.addWidget(QLabel("æ˜µç§°"), 2, 0)
-        form.addWidget(self.nickname_edit, 2, 1)
-        form.addWidget(login_btn, 2, 2)
-        form.addWidget(register_btn, 2, 3)
-        form.addWidget(self.logout_btn, 2, 4)
-        form.addWidget(self.account_status, 3, 0, 1, 5)
-        root.addWidget(account_box)
-
-        chat_box = QGroupBox("v3.0 å†…æµ‹ç¾¤èŠ")
-        chat_layout = QVBoxLayout(chat_box)
-        self.messages = QTextBrowser()
-        self.messages.setPlaceholderText("ç™»å½•åå¯ä¸ä¸‰ç«¯å†…æµ‹ç”¨æˆ·äº¤æµã€‚")
-        chat_layout.addWidget(self.messages, 1)
-        send_row = QHBoxLayout()
-        self.message_edit = QLineEdit()
-        self.message_edit.setPlaceholderText("è¾“å…¥æ¶ˆæ¯ï¼Œæœ€å¤š 500 å­—")
-        self.message_edit.returnPressed.connect(self.send_message)
-        refresh_btn = QPushButton("åˆ·æ–°")
-        send_btn = QPushButton("å‘é€")
-        apply_button_accent(send_btn, "primary")
-        refresh_btn.clicked.connect(self.refresh_messages)
-        send_btn.clicked.connect(self.send_message)
-        send_row.addWidget(self.message_edit, 1)
-        send_row.addWidget(refresh_btn)
-        send_row.addWidget(send_btn)
-        chat_layout.addLayout(send_row)
-        root.addWidget(chat_box, 1)
-        self._load_config()
-
-    def _base_url(self):
-        return self.server_edit.text().strip().rstrip("/")
-
-    def _request(self, method, path, payload=None):
-        base = self._base_url()
-        if not base.startswith(("http://", "https://")):
-            raise RuntimeError("æœåŠ¡å™¨åœ°å€å¿…é¡»ä»¥ http:// æˆ– https:// å¼€å¤´")
-        headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        data = None
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json; charset=utf-8"
-        request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
-            except Exception:
-                detail = str(exc)
-            raise RuntimeError(detail) from exc
-        except Exception as exc:
-            raise RuntimeError(f"æ— æ³•è¿æ¥æœåŠ¡å™¨ï¼š{exc}") from exc
-
-    def _load_config(self):
-        try:
-            data = json.loads(self.CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        self.server_edit.setText(str(data.get("server", self.server_edit.text())))
-        self.token = str(data.get("token", ""))
-        self.username = str(data.get("username", ""))
-        self.nickname = str(data.get("nickname", ""))
-        self.user_edit.setText(self.username)
-        self._update_status()
-        if self.token:
-            QTimer.singleShot(700, self.refresh_messages)
-
-    def _save_config(self):
-        self.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.CONFIG_FILE, {
-            "server": self._base_url(), "token": self.token,
-            "username": self.username, "nickname": self.nickname,
-        })
-
-    def _update_status(self):
-        text = f"å·²ç™»å½•ï¼š{self.nickname or self.username}ï¼ˆ{self.username}ï¼‰" if self.token else "æœªç™»å½•"
-        self.account_status.setText(text)
-        self.logout_btn.setEnabled(bool(self.token))
-
-    def authenticate(self, register):
-        payload = {
-            "username": self.user_edit.text().strip(),
-            "password": self.password_edit.text(),
-            "nickname": self.nickname_edit.text().strip(),
-        }
-        try:
-            data = self._request("POST", "/api/v1/auth/register" if register else "/api/v1/auth/login", payload)
-            self.token = str(data.get("token", ""))
-            self.username = str(data.get("username", payload["username"]))
-            self.nickname = str(data.get("nickname", self.username))
-            self.password_edit.clear()
-            self._save_config()
-            self._update_status()
-            self.refresh_messages()
-        except Exception as exc:
-            QMessageBox.warning(self, "è´¦å·æ“ä½œå¤±è´¥", str(exc))
-
-    def logout(self):
-        self.token = ""
-        self._save_config()
-        self._update_status()
-        self.messages.clear()
-
-    def refresh_messages(self):
-        if not self.token:
-            return
-        try:
-            data = self._request("GET", "/api/v1/community/messages?limit=100")
-            rows = []
-            for item in data.get("messages", []):
-                stamp = time.strftime("%m-%d %H:%M", time.localtime(float(item.get("created_at", 0))))
-                name = html.escape(str(item.get("nickname") or item.get("username") or "ç”¨æˆ·"))
-                content = html.escape(str(item.get("content", ""))).replace("\n", "<br>")
-                rows.append(f"<p><b style='color:#FF8A2A'>{name}</b> <span style='color:#A995A6'>{stamp}</span><br>{content}</p>")
-            self.messages.setHtml("".join(rows) or "<p>ç¾¤é‡Œè¿˜æ²¡æœ‰æ¶ˆæ¯ï¼Œæ¥å‘ç¬¬ä¸€æ¡å§ã€‚</p>")
-            bar = self.messages.verticalScrollBar()
-            bar.setValue(bar.maximum())
-        except Exception as exc:
-            self.account_status.setText(f"ç¾¤èŠåˆ·æ–°å¤±è´¥ï¼š{exc}")
-
-    def send_message(self):
-        content = self.message_edit.text().strip()
-        if not self.token:
-            QMessageBox.information(self, "æç¤º", "è¯·å…ˆç™»å½•è´¦å·ã€‚")
-            return
-        if not content:
-            return
-        try:
-            self._request("POST", "/api/v1/community/messages", {"content": content[:500]})
-            self.message_edit.clear()
-            self.refresh_messages()
-        except Exception as exc:
-            QMessageBox.warning(self, "å‘é€å¤±è´¥", str(exc))
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle(f"{APP_NAME}  Â·  v{VERSION}")
-        self.setWindowIcon(QIcon(asset_path("novria_app_icon.ico")))
-        self.resize(1440, 900)
-        self.setMinimumSize(1180, 760)
-        self.song_file = None
-        self.selected_library_track_id = None
-        self.selected_library_source = "none"
-        self.stem_dir = None
-        self.base_stem_dir = None
-        self.markers = []
-        self.analysis_result = {}
-        self.chord_timeline = []
-        self.section_timeline = []
-        self.arrangement_result = {}
-        self.manual_section_overrides = {}
-        self.arrangement_variants = {"A": {}, "B": {}}
-        self.variant_audio = {"A": "", "B": ""}
-        self.active_variant = ""
-        self.arrangement_history = []
-        self.undo_stack = []
-        self.redo_stack = []
-        self.variant_preview_player = None
-        self.ab_stream = None
-        self.ab_files = {}
-        self.ab_current_variant = "A"
-        self.ab_gain = {"A":1.0,"B":1.0}
-        self.ab_frame = 0
-        self.soundfont_path = ""
-        self.melody_reference = []
-        self.lyric_reference = []
-        self.worker = None
-        self.engine = MultiStemEngine()
-        self.metronome_engine = MetronomeEngine()
-        self.midi_worker = None
-        self._auto_next_fired = False
-        self.is_playing_ui = False
-        self._timeline_dragging = False
-
-        central = QWidget()
-        root = QHBoxLayout(central)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(14)
-
-        sidebar = QWidget()
-        sidebar.setFixedWidth(228)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(0,0,0,0)
-        side.setSpacing(10)
-
-        brand = QGroupBox()
-        brand_l = QVBoxLayout(brand)
-        brand_l.setContentsMargins(14,14,14,14)
-        brand_top = QHBoxLayout()
-        brand_icon = QLabel()
-        pix = QPixmap(asset_path("juweier_brand_mark_v322.png"))
-        brand_icon.setPixmap(pix.scaled(58,58,Qt.KeepAspectRatio,Qt.SmoothTransformation))
-        brand_text = QVBoxLayout()
-        bt = QLabel(APP_NAME)
-        bt.setObjectName("BrandTitle")
-        bs = QLabel("AI éŸ³ä¹å·¥ä½œç«™")
-        bs.setObjectName("BrandSub")
-        brand_text.addWidget(bt)
-        brand_text.addWidget(bs)
-        brand_top.addWidget(brand_icon)
-        brand_top.addLayout(brand_text)
-        brand_l.addLayout(brand_top)
-        ver = QLabel(f"Performance Â· v{VERSION}")
-        ver.setObjectName("BrandSub")
-        brand_l.addWidget(ver)
-        side.addWidget(brand)
-
-        self.nav = QListWidget()
-        self.nav.setObjectName("NavList")
-        self.nav.setIconSize(QSize(30,30))
-        nav_items = [
-            ("ç»Ÿä¸€éŸ³ä¹å¯¼å…¥","import"),
-            ("éŸ³ä¹åº“","projects"),
-            ("AI å…­è½¨+ç”µå‰ä»–","split"),
-            ("AI æ”¹ç¼– / ä¹è°±","arrange"),
-            ("æ¼”å‡ºè°±é¢","arrange"),
-            ("ä¹æ‰‹æ¼”å¥ä¸­å¿ƒ","live"),
-            ("ç°åœºæ¼”å‡º","live"),
-            ("Setlist æ­Œå•","setlist"),
-            ("AI æ­Œè¯","voice"),
-            ("AI æ­Œå£°","voice"),
-            ("ä½œå“ä¸­å¿ƒ","projects"),
-            ("è´¦å· / å†…æµ‹ç¾¤èŠ","projects"),
-            ("è®¾ç½®","settings"),
-        ]
-        for text, ico in nav_items:
-            QListWidgetItem(QIcon(icon_path(ico)), text, self.nav)
-        self.nav.setCurrentRow(2)
-        side.addWidget(self.nav, 1)
-
-        song_context=QGroupBox("å…¨å±€ G ç›˜æ­Œæ›²")
-        song_context_layout=QVBoxLayout(song_context)
-        self.current_song_label=QLabel("å°šæœªé€‰æ‹©æ­Œæ›²")
-        self.current_song_label.setWordWrap(True)
-        self.current_song_label.setObjectName("BrandSub")
-        choose_library_song=QPushButton("ä»æ­Œæ›²åº“é€‰æ‹©")
-        apply_button_accent(choose_library_song,"primary")
-        choose_library_song.clicked.connect(self.open_g_drive_library)
-        song_context_layout.addWidget(self.current_song_label)
-        song_context_layout.addWidget(choose_library_song)
-        side.addWidget(song_context)
-
-        footer = QLabel("è®©éŸ³ä¹åˆ›ä½œä¸æ¼”å‡ºæ›´è‡ªç”±")
-        footer.setAlignment(Qt.AlignCenter)
-        footer.setObjectName("BrandSub")
-        side.addWidget(footer)
-
-        self.stack = QStackedWidget()
-        self.universal_import = UniversalImportPage(self)
-        self.music_library = MusicLibraryPage(self)
-        self.studio = StudioPage(self)
-        self.arrangement = ArrangementScorePage(self)
-        self.score_performance = ScorePerformancePage(self)
-        self.instrument_experience = InstrumentExperiencePage(self)
-        self.live = LivePage(self)
-        self.live_pro = LiveProPage(self)
-        self.setlist = SetlistPage(self)
-        self.lyrics_studio = LyricsStudioPage(self)
-        self.voice_lab = VoiceLabPage(self)
-        self.works_center = WorksCenterPage(self)
-        self.stack.addWidget(self.universal_import)
-        self.stack.addWidget(self.music_library)
-        self.stack.addWidget(self.studio)
-        self.stack.addWidget(self.arrangement)
-        self.stack.addWidget(self.score_performance)
-        self.stack.addWidget(self.instrument_experience)
-        self.stack.addWidget(self.live_pro)
-        self.stack.addWidget(self.setlist)
-        self.stack.addWidget(self.lyrics_studio)
-        self.stack.addWidget(self.voice_lab)
-        self.stack.addWidget(self.works_center)
-        self.community = CommunityPage(self)
-        self.stack.addWidget(self.community)
-        self.settings_page = SettingsPage(self)
-        self.stack.addWidget(self.settings_page)
-        self.nav.currentRowChanged.connect(self._on_nav_changed)
-        self._on_nav_changed(self.nav.currentRow())
-
-        root.addWidget(sidebar)
-        root.addWidget(self.stack, 1)
-        self.setCentralWidget(central)
-        self.statusBar().showMessage(f"å°±ç»ª   Â·   {APP_NAME} v{VERSION}")
-        QTimer.singleShot(300, self.restore_live_session)
-        QTimer.singleShot(500, self.refresh_smart_arranger_summary)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_timeline)
-        self.timer.start(200)
-
-        self.session_timer = QTimer(self)
-        self.session_timer.timeout.connect(self.save_live_session)
-        self.session_timer.start(5000)
-
-        try:
-            self.setStyleSheet(Path(asset_path("theme.qss")).read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-
-    def _on_nav_changed(self,index):
-        self.stack.setCurrentIndex(index)
-        if index in {2,3,4,5,6,7,8,9,10} and not self.song_file:
-            self.statusBar().showMessage("è¯·å…ˆç‚¹å‡»å·¦ä¾§â€˜ä»æ­Œæ›²åº“é€‰æ‹©â€™ï¼Œé€‰æ‹© G ç›˜æ­Œæ›²")
-
-    def open_g_drive_library(self):
-        self.nav.setCurrentRow(1)
-        self.music_library.tree.setFocus()
-        self.statusBar().showMessage("è¯·æŒ‰æ­Œæ‰‹å±•å¼€æ­Œæ›²ï¼ŒåŒå‡»æ­Œæ›²åå³å¯ä¾›å·¦ä¾§æ‰€æœ‰åŠŸèƒ½å…±åŒå¤„ç†")
-
-    def load_library_track(self,track_id):
-        con=self.music_library._db()
-        row=con.execute("SELECT * FROM tracks WHERE id=?",(int(track_id),)).fetchone()
-        con.close()
-        if not row:
-            QMessageBox.warning(self,"æ­Œæ›²åº“","æ‰¾ä¸åˆ°è¿™é¦–æ­Œæ›²ï¼Œè¯·é‡æ–°æ‰«æ G ç›˜æ­Œæ›²åº“ã€‚")
-            return
-        path=Path(row["working_path"] or row["source_path"] or "")
-        if not path.exists():
-            QMessageBox.warning(self,"æ­Œæ›²åº“",f"æ­Œæ›²æ–‡ä»¶ä¸å­˜åœ¨ï¼š\n{path}")
-            return
-        self.load_imported_working_file(path,library_track_id=int(track_id))
-        artist=catalog_artist_name(dict(row))
-        self.current_song_label.setText(f"{artist}\n{row['title']}")
-        self.statusBar().showMessage(f"å½“å‰ G ç›˜æ­Œæ›²ï¼š{artist} - {row['title']}")
-
-    def load_server_library_track(self, track_id, row=None):
-        row = dict(row or self.music_library.remote_rows.get(int(track_id)) or {})
-        if not row:
-            QMessageBox.warning(self, "æœåŠ¡å™¨æ›²åº“", "æ‰¾ä¸åˆ°è¿™é¦–æœåŠ¡å™¨æ­Œæ›²ï¼Œè¯·åˆ·æ–°æ›²åº“ã€‚")
-            return
-        audio_url = str(row.get("audio_url") or "")
-        if not audio_url:
-            QMessageBox.warning(self, "æœåŠ¡å™¨æ›²åº“", "æœåŠ¡å™¨æœªè¿”å›æ­Œæ›²éŸ³é¢‘åœ°å€ã€‚")
-            return
-        format_name = str(row.get("format") or "mp3").lower().lstrip(".")
-        if format_name not in {"mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "aif", "alac"}:
-            format_name = "mp3"
-        artist = str(row.get("artist") or "æœªçŸ¥æ­Œæ‰‹")
-        title = str(row.get("title") or f"æœåŠ¡å™¨æ­Œæ›²_{track_id}")
-        cache_dir = BASE_DIR / "library" / "server_cache"
-        cache_path = cache_dir / f"{int(track_id)}_{safe_file_stem(artist)}_{safe_file_stem(title)}.{format_name}"
-        try:
-            self.statusBar().showMessage(f"æ­£åœ¨ä»æœåŠ¡å™¨åŠ è½½ï¼š{artist} - {title}")
-            QApplication.processEvents()
-            if not cache_path.is_file() or cache_path.stat().st_size == 0:
-                self.music_library._server_client(timeout=120).download(audio_url, cache_path)
-            lyrics_url = str(row.get("lyrics_url") or "")
-            lyrics_path = cache_path.with_suffix(".lrc")
-            if lyrics_url and (not lyrics_path.is_file() or lyrics_path.stat().st_size == 0):
-                self.music_library._server_client(timeout=60).download(lyrics_url, lyrics_path)
-            self.load_imported_working_file(cache_path, library_track_id=int(track_id))
-            self.selected_library_source = "server"
-            self.current_song_label.setText(f"æœåŠ¡å™¨ Â· {artist}\n{title}")
-            self.statusBar().showMessage(f"å½“å‰æœåŠ¡å™¨ G ç›˜æ­Œæ›²ï¼š{artist} - {title}")
-        except Exception as exc:
-            QMessageBox.critical(self, "æœåŠ¡å™¨æ­Œæ›²åŠ è½½å¤±è´¥", str(exc))
-
-    def load_imported_working_file(self, path, library_track_id=None):
-        p=Path(path)
-        if not p.exists():
-            return
-        self.song_file=str(p)
-        self.selected_library_track_id=library_track_id
-        if library_track_id is None:
-            self.selected_library_source="local_test"
-        self.stem_dir=None
-        self.engine.close()
-        self.studio.file_label.setText(p.name)
-        if hasattr(self,"current_song_label") and library_track_id is None:
-            self.current_song_label.setText(p.name)
-        self._load_song_lyrics(p)
-        if hasattr(self,"arrangement"):
-            self.arrangement.song_label.setText(p.name)
-            self.arrangement.analysis_status.setText("å·²ä»ç»Ÿä¸€å¯¼å…¥ä¸­å¿ƒè½½å…¥ï¼Œç­‰å¾…åˆ†æ")
-        self.load_live_preset_file()
-        self.nav.setCurrentRow(2)
-
-    def import_song(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "å¯¼å…¥æ­Œæ›²", "", "éŸ³é¢‘ (*.mp3 *.wav *.flac *.m4a *.aac)"
-        )
-        if not p:
-            return
-        self.song_file = p
-        self.selected_library_track_id = None
-        self.selected_library_source = "local_test"
-        if hasattr(self,"current_song_label"):
-            self.current_song_label.setText(Path(p).name)
-        self.stem_dir = None
-        self.stop_variant_preview()
-        self.stop_ab_instant_preview()
-        self.metronome_engine.stop()
-        if self.midi_worker:
-            self.midi_worker.stop()
-            self.midi_worker.wait(700)
-        self.engine.close()
-        self.studio.file_label.setText(Path(p).name)
-        self._load_song_lyrics(Path(p))
-        if hasattr(self, "arrangement"):
-            self.arrangement.song_label.setText(Path(p).name)
-            self.arrangement.analysis_status.setText("å·²å¯¼å…¥æ­Œæ›²ï¼Œç­‰å¾…å’Œå¼¦/ä¹è°±åˆ†æ")
-        self.load_live_preset_file()
-        self.studio.log.setText("æ­Œæ›²å·²å¯¼å…¥ã€‚ç‚¹å‡»â€œAI å…­è½¨åˆ†ç¦» + ç”µå‰ä»–äºŒæ¬¡åˆ†ç¦»â€ã€‚")
-        self.studio.model_progress.setValue(0)
-        self.studio.split_progress.setValue(0)
-        self.studio.model_status.setText("ç­‰å¾…æ£€æµ‹ AI æ¨¡å‹")
-        self.studio.split_status.setText("ç­‰å¾…å¼€å§‹")
-
-    def start_separation(self):
-        if not self.song_file:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå¯¼å…¥æ­Œæ›²ã€‚")
-            return
-        if self.worker and self.worker.isRunning():
-            return
-        self.stop()
-        self.studio.btn_split.setEnabled(False)
-        self.studio.model_progress.setRange(0, 100)
-        self.studio.split_progress.setRange(0, 100)
-        self.studio.model_progress.setValue(0)
-        self.studio.split_progress.setValue(0)
-        self.studio.log.setText("æ­£åœ¨å‡†å¤‡ AI å…­è½¨æ¨¡å‹ä¸ç”µå‰ä»–äºŒæ¬¡åˆ†ç¦»...")
-        self.worker = SeparationWorker(self.song_file)
-        self.worker.log.connect(self.on_split_log)
-        self.worker.model_progress.connect(self.on_model_progress)
-        self.worker.separation_progress.connect(self.on_separation_progress)
-        self.worker.done.connect(self.on_split_done)
-        self.worker.failed.connect(self.on_split_failed)
-        self.worker.start()
-
-    def on_model_progress(self, value, text):
-        self.studio.model_progress.setValue(max(0, min(100, int(value))))
-        self.studio.model_status.setText(text)
-
-    def on_separation_progress(self, value, text):
-        self.studio.split_progress.setValue(max(0, min(100, int(value))))
-        self.studio.split_status.setText(text)
-
-    def on_split_log(self, text):
-        self.studio.log.setText(text[-500:])
-
-    def on_split_done(self, stem_dir):
-        self.studio.model_progress.setValue(100)
-        self.studio.split_progress.setValue(100)
-        self.studio.split_status.setText("åŸºç¡€å…­è½¨å®Œæˆ Â· ç”µå‰ä»–è½¨æŒ‰è¯†åˆ«ç»“æœè½½å…¥")
-        self.studio.btn_split.setEnabled(True)
-        self.stem_dir = Path(stem_dir)
-        self.base_stem_dir = Path(stem_dir)
-        try:
-            self.engine.load(self.stem_dir)
-            self.load_waveform_if_ready()
-            self.sync_mix_controls()
-            electric = self.stem_dir / "electric_guitar.wav"
-            self.studio.log.setText(
-                f"åˆ†è½¨å®Œæˆï¼š{self.stem_dir}\n"
-                + ("å·²è½½å…¥ç‹¬ç«‹ç”µå‰ä»–è½¨ã€‚" if electric.exists() else "ç”µå‰ä»–è½¨ç­‰å¾…äºŒæ¬¡è¯†åˆ«ï¼Œæœªä¼ªé€ ç©ºéŸ³é¢‘ã€‚")
-            )
-            QMessageBox.information(self, "å®Œæˆ", "AI åˆ†è½¨å®Œæˆï¼Œå¯ä»¥è¿›è¡Œå¤šè½¨ Mute/Solo å’Œç°åœºæ’­æ”¾ã€‚")
-        except Exception as e:
-            QMessageBox.critical(self, "åŠ è½½å¤±è´¥", str(e))
-
-    def on_split_failed(self, text):
-        self.studio.model_progress.setValue(0)
-        self.studio.split_progress.setValue(0)
-        self.studio.model_status.setText("ç­‰å¾…æ£€æµ‹ AI æ¨¡å‹")
-        self.studio.split_status.setText("ç­‰å¾…å¼€å§‹")
-        self.studio.btn_split.setEnabled(True)
-        self.studio.log.setText("åˆ†è½¨å¤±è´¥ã€‚")
-        QMessageBox.critical(
-            self, "AI åˆ†è½¨å¤±è´¥",
-            text + "\n\nå¦‚æœæ˜¯æ¨¡å‹ä¸‹è½½å¤±è´¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œåé‡è¯•ï¼›å·²ç»ä¸‹è½½æˆåŠŸçš„æ¨¡å‹ä¼šè‡ªåŠ¨ç¼“å­˜ï¼Œä¸ä¼šé‡å¤ä¸‹è½½ã€‚"
-        )
-
-    def sync_mix_controls(self):
-        for key, row in self.studio.rows.items():
-            self.engine.mute[key] = row.mute.isChecked()
-            self.engine.solo[key] = row.solo.isChecked()
-            self.engine.volume[key] = row.volume.value() / 100.0
-
-    def play_pause(self):
-        if not self.engine.files:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå®Œæˆ AI å…­è½¨åˆ†ç¦»ã€‚")
-            return
-        try:
-            if self.is_playing_ui and not self.engine.paused:
-                self.engine.pause()
-                self.is_playing_ui = False
-                self.studio.play_btn.setText("æ’­æ”¾")
-            else:
-                self._auto_next_fired = False
-                self.engine.resume()
-                self.is_playing_ui = True
-                self.studio.play_btn.setText("æš‚åœ")
-        except Exception as e:
-            QMessageBox.critical(self, "æ’­æ”¾å¤±è´¥", str(e))
-
-    def stop(self):
-        self.engine.stop()
-        self.is_playing_ui = False
-        if hasattr(self, "studio"):
-            self.studio.play_btn.setText("æ’­æ”¾")
-            self.studio.timeline.setValue(0)
-
-    def update_timeline(self):
-        dur = self.engine.duration_seconds()
-        pos = self.engine.position_seconds()
-        if dur > 0 and not self._timeline_dragging:
-            self.studio.timeline.blockSignals(True)
-            self.studio.timeline.setValue(int(min(1, pos/dur)*1000))
-            self.studio.timeline.blockSignals(False)
-        def fmt(s):
-            s = max(0, int(s))
-            return f"{s//60:02d}:{s%60:02d}"
-        self.studio.time_label.setText(f"{fmt(pos)} / {fmt(dur)}")
-        if self.is_playing_ui and not self.engine.playing and not self.engine.paused:
-            if (hasattr(self, "setlist") and self.setlist.auto_next.isChecked()
-                    and not self._auto_next_fired and dur > 0 and pos >= max(0, dur - 0.35)):
-                self._auto_next_fired = True
-                QTimer.singleShot(250, lambda: self.advance_setlist(1, autoplay=True))
-            else:
-                self._auto_next_fired = False
-            self.is_playing_ui = False
-            self.studio.play_btn.setText("æ’­æ”¾")
-
-    def begin_timeline_seek(self):
-        self._timeline_dragging = True
-
-    def preview_timeline_seek(self, value):
-        self._timeline_dragging = True
-        dur = self.engine.duration_seconds()
-        if dur <= 0:
-            return
-        target = dur * max(0, min(1000, int(value))) / 1000.0
-        def fmt(seconds):
-            seconds = max(0, int(seconds))
-            return f"{seconds//60:02d}:{seconds%60:02d}"
-        self.studio.time_label.setText(f"{fmt(target)} / {fmt(dur)}")
-
-    def seek_from_slider(self):
-        if not self.engine.files:
-            self._timeline_dragging = False
-            return
-        ratio = self.studio.timeline.value()/1000.0
-        self.engine.seek_ratio(ratio)
-        self.studio.waveform.set_position(ratio)
-        self._timeline_dragging = False
-
-    def apply_live_preset(self, muted_key):
-        for key, row in self.studio.rows.items():
-            row.solo.setChecked(False)
-            row.mute.setChecked(key == muted_key if muted_key else False)
-        self.sync_mix_controls()
-        names = {
-            "guitar":"æœ¨å‰ä»–æ¼”å¥ï¼ˆæœ¨å‰ä»–è½¨å…³é—­ï¼‰",
-            "electric_guitar":"ç”µå‰ä»–æ¼”å¥ï¼ˆç”µå‰ä»–è½¨å…³é—­ï¼‰",
-            "piano":"é’¢ç´å¼¹å”±ï¼ˆé’¢ç´è½¨å…³é—­ï¼‰",
-            "drums":"é¼“æ‰‹æ¼”å‡ºï¼ˆé¼“è½¨å…³é—­ï¼‰",
-            "bass":"è´æ–¯æ¼”å‡ºï¼ˆè´æ–¯è½¨å…³é—­ï¼‰",
-            "vocals":"çº¯ä¼´å¥/KTVï¼ˆäººå£°è½¨å…³é—­ï¼‰",
-            None:"å…¨éƒ¨æ¢å¤"
-        }
-        self.live.status.setText("å½“å‰é¢„è®¾ï¼š" + names[muted_key])
-
-    def apply_live_transpose(self):
-        if not hasattr(self,"live_pro"):
-            return
-        if not self.base_stem_dir and self.stem_dir:
-            self.base_stem_dir=Path(self.stem_dir)
-        if hasattr(self,"arrangement"):
-            self.arrangement.transpose.setValue(int(self.live_pro.transpose.value()))
-        self.generate_transposed_stems()
-
-
-    def start_midi_worker(self):
-        if self.midi_worker and self.midi_worker.isRunning():
-            return
-        self.midi_worker = MidiWorker()
-        self.midi_worker.action.connect(self.handle_midi_action)
-        self.midi_worker.status.connect(
-            lambda s: self.live_pro.midi_status.setText(s) if hasattr(self, "live_pro") else None
-        )
-        self.midi_worker.start()
-
-    def handle_midi_action(self, action):
-        if action == "play_pause":
-            self.play_pause()
-        elif action == "stop":
-            self.stop()
-        elif action == "next":
-            self.advance_setlist(1, autoplay=True)
-        elif action == "previous":
-            self.advance_setlist(-1, autoplay=False)
-
-    def advance_setlist(self, delta=1, autoplay=False):
-        if not hasattr(self, "setlist") or not self.setlist.items:
-            return
-        r = self.setlist.current_index()
-        if r < 0:
-            target = 0
-        else:
-            target = r + delta
-        if target < 0 or target >= len(self.setlist.items):
-            return
-        self.stop()
-        self.setlist.select_index(target)
-        item = self.setlist.items[target]
-        self.song_file = item["path"]
-        self._load_song_lyrics(Path(self.song_file))
-        self.studio.file_label.setText(Path(self.song_file).name)
-
-        # ä¼˜å…ˆå¤ç”¨å·²ç»å­˜åœ¨çš„å…­è½¨ç›®å½•ã€‚
-        candidate = STEMS_DIR / "uvr_htdemucs_6s" / Path(self.song_file).stem
-        if not candidate.exists():
-            candidate = STEMS_DIR / "htdemucs_6s" / Path(self.song_file).stem
-        if candidate.exists():
-            try:
-                self.stem_dir = candidate
-                self.engine.load(candidate)
-                self.load_waveform_if_ready()
-                self.sync_mix_controls()
-                if autoplay:
-                    QTimer.singleShot(350, self.play_pause)
-                return
-            except Exception:
-                pass
-
-        self.nav.setCurrentRow(2)
-        QMessageBox.information(
-            self, "Setlist",
-            f"å·²åˆ‡æ¢åˆ°ï¼š{Path(self.song_file).name}\nè¯¥æ­Œæ›²å°šæ— å¯ç”¨å…­è½¨ç¼“å­˜ï¼Œè¯·å…ˆæ‰§è¡Œ AI å…­è½¨åˆ†ç¦»ã€‚"
-        )
-
-    def save_live_session(self):
-        try:
-            self.save_live_preset_file()
-            data = {
-                "version": VERSION,
-                "song_file": self.song_file,
-                "stem_dir": str(self.stem_dir) if self.stem_dir else None,
-                "setlist": self.setlist.items if hasattr(self, "setlist") else [],
-                "setlist_index": self.setlist.current_index() if hasattr(self, "setlist") else -1,
-                "position_seconds": self.engine.position_seconds(),
-                "transpose": self.live_pro.transpose.value() if hasattr(self, "live_pro") else 0,
-                "speed": self.live_pro.speed.value() if hasattr(self, "live_pro") else 1.0,
-            }
-            path = BASE_DIR / "user_data" / "last_live_session.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    def restore_live_session(self):
-        path = BASE_DIR / "user_data" / "last_live_session.json"
-        if not path.exists():
-            return
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            song = str(data.get("song_file") or "")
-            if song and Path(song).exists():
-                self.song_file = song
-                self.selected_library_track_id = None
-                self.studio.file_label.setText(Path(song).name)
-                if hasattr(self, "current_song_label"):
-                    self.current_song_label.setText(Path(song).name)
-                self._load_song_lyrics(Path(song))
-            if hasattr(self, "setlist"):
-                self.setlist.items = data.get("setlist", [])
-                self.setlist.refresh()
-                idx = int(data.get("setlist_index", -1))
-                if idx >= 0:
-                    self.setlist.select_index(idx)
-            if hasattr(self, "live_pro"):
-                self.live_pro.transpose.setValue(int(data.get("transpose", 0)))
-                self.live_pro.speed.setValue(float(data.get("speed", 1.0)))
-        except Exception:
-            pass
-
-
-    def _format_time(self, seconds):
-        seconds = max(0, float(seconds or 0))
-        m = int(seconds // 60)
-        s = int(seconds % 60)
-        return f"{m:02d}:{s:02d}"
-
-    def _transpose_note_name(self, name, semitones):
-        names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-        base = str(name or "C").replace("â™­","b")
-        aliases = {"Db":"C#","Eb":"D#","Gb":"F#","Ab":"G#","Bb":"A#"}
-        base = aliases.get(base, base)
-        if base not in names:
-            return base
-        return names[(names.index(base)+int(semitones))%12]
-
-    def _transpose_chord(self, chord, semitones):
-        if not chord or chord == "N":
-            return chord
-        m = re.match(r"^([A-G](?:#|b)?)(.*)$", chord)
-        if not m:
-            return chord
-        return self._transpose_note_name(m.group(1), semitones) + m.group(2)
-
-    def update_target_key_label(self):
-        if not hasattr(self, "arrangement"):
-            return
-        key = self.analysis_result.get("key", "") if self.analysis_result else ""
-        if not key:
-            self.arrangement.target_key.setText("ç›®æ ‡è°ƒï¼šâ€”")
-            return
-        semis = self.arrangement.transpose.value()
-        self.arrangement.target_key.setText("ç›®æ ‡è°ƒï¼š" + self._transpose_note_name(key, semis))
-
-    def analyze_full_score(self):
-        if not self.song_file:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå¯¼å…¥æ­Œæ›²ã€‚")
-            return
-        try:
-            import librosa
-            self.arrangement.progress.setValue(5)
-            self.arrangement.analysis_status.setText("æ­£åœ¨è¯»å–éŸ³é¢‘å¹¶æ£€æµ‹èŠ‚æ‹...")
-            QApplication.processEvents()
-            y, sr = librosa.load(self.song_file, sr=22050, mono=True)
-            self._load_song_lyrics(Path(self.song_file), float(librosa.get_duration(y=y,sr=sr)))
-            tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-            tempo_val = float(np.asarray(tempo).reshape(-1)[0])
-            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-            if len(beat_times) < 4:
-                raise RuntimeError("æœªæ£€æµ‹åˆ°è¶³å¤ŸèŠ‚æ‹ï¼Œæ— æ³•ç”Ÿæˆä¹è°±ã€‚")
-            self.arrangement.progress.setValue(25)
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-            beat_chroma = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
-
-            names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-            chord_types = {
-                "":    ([0,4,7],       [1.0,0.84,0.74]),
-                "m":   ([0,3,7],       [1.0,0.84,0.74]),
-                "7":   ([0,4,7,10],    [1.0,0.82,0.72,0.60]),
-                "maj7":([0,4,7,11],    [1.0,0.82,0.72,0.58]),
-                "m7":  ([0,3,7,10],    [1.0,0.82,0.72,0.60]),
-                "sus4":([0,5,7],       [1.0,0.80,0.72]),
-                "dim": ([0,3,6],       [1.0,0.80,0.70]),
-            }
-            templates=[]
-            for root in range(12):
-                for suffix,(intervals,weights) in chord_types.items():
-                    temp=np.zeros(12,dtype=float)
-                    for interval,weight in zip(intervals,weights):
-                        temp[(root+interval)%12]=weight
-                    templates.append((names[root]+suffix,temp))
-            chords=[]
-            for i in range(beat_chroma.shape[1]):
-                v=beat_chroma[:,i].astype(float)
-                norm=np.linalg.norm(v)
-                if norm < 1e-8:
-                    chords.append("N")
-                    continue
-                v=v/norm
-                best=("N",-1e9)
-                for cname,temp in templates:
-                    t=temp/(np.linalg.norm(temp)+1e-9)
-                    score=float(np.dot(v,t))
-                    if score>best[1]:
-                        best=(cname,score)
-                chords.append(best[0])
-
-            for i in range(1,len(chords)-1):
-                if chords[i-1] == chords[i+1] != chords[i]:
-                    chords[i]=chords[i-1]
-
-            self.arrangement.progress.setValue(55)
-            mean_chroma=np.mean(chroma,axis=1)
-            key=names[int(np.argmax(mean_chroma))]
-            self.analysis_result={"bpm":round(tempo_val,1),"key":key,"time_signature":"4/4"}
-            self.studio.bpm_label.setText(f"BPMï¼š{tempo_val:.1f}")
-            self.studio.key_label.setText(f"è°ƒæ€§å‚è€ƒï¼š{key}")
-
-            rows=[]
-            total_beats=min(len(chords), len(beat_times))
-            bar_no=1
-            for start in range(0,total_beats,4):
-                seq=chords[start:start+4]
-                compact=[]
-                for c in seq:
-                    if not compact or compact[-1]!=c:
-                        compact.append(c)
-                t=float(beat_times[start]) if start < len(beat_times) else 0.0
-                rows.append({"bar":bar_no,"seconds":t,"chords":compact})
-                bar_no += 1
-
-            sections=[]
-            if self.markers:
-                for m in self.markers:
-                    sections.append({"name":m.get("name","æ®µè½"),"seconds":float(m.get("seconds",0))})
-                sections.sort(key=lambda x:x["seconds"])
-            else:
-                for i in range(0,len(rows),8):
-                    sections.append({"name":f"æ®µè½ {i//8+1}","seconds":rows[i]["seconds"]})
-            self.section_timeline=sections
-            for row in rows:
-                sec=""
-                for s in sections:
-                    if row["seconds"] >= s["seconds"]:
-                        sec=s["name"]
-                    else:
-                        break
-                row["section"]=sec or "æ®µè½ 1"
-            self.chord_timeline=rows
-
-            self.arrangement.progress.setValue(78)
-            self.arrangement.analysis_status.setText("æ­£åœ¨ç”Ÿæˆä¸»æ—‹å¾‹äº”çº¿è°±ã€å…­çº¿è°±ä¸æ­Œè¯åŒæ­¥æ•°æ®...")
-            QApplication.processEvents()
-            self.melody_reference=self._extract_melody_reference(y,sr)
-
-            self.arrangement.chord_table.setRowCount(len(rows))
-            for r,row in enumerate(rows):
-                values=[str(row["bar"]),self._format_time(row["seconds"]),"  ".join(row["chords"]),row["section"]]
-                for c,val in enumerate(values):
-                    self.arrangement.chord_table.setItem(r,c,QTableWidgetItem(val))
-            self.arrangement.progress.setValue(100)
-            self.arrangement.analysis_status.setText(
-                f"åˆ†æå®Œæˆï¼š{tempo_val:.1f} BPM Â· {key} è°ƒå‚è€ƒ Â· {len(rows)} å°èŠ‚ Â· å·²ç”Ÿæˆå’Œå¼¦æ—¶é—´çº¿"
-            )
-            self.update_target_key_label()
-            if hasattr(self,"instrument_experience"):
-                self.instrument_experience.refresh_sections()
-            self.refresh_manual_sections()
-            self.refresh_compare_sections()
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self,"ä¹è°±åˆ†æå¤±è´¥",str(e))
-
-    def generate_transposed_stems(self):
-        source_dir=Path(self.base_stem_dir or self.stem_dir) if (self.base_stem_dir or self.stem_dir) else None
-        if not source_dir or not source_dir.exists():
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆå®Œæˆå…­è½¨åˆ†ç¦»ã€‚")
-            return
-        semis=int(self.arrangement.transpose.value())
-        if semis == 0:
-            self.stem_dir=source_dir
-            self.engine.load(source_dir)
-            self.engine.set_speed(self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0)
-            self.load_waveform_if_ready()
-            self.sync_mix_controls()
-            QMessageBox.information(self,"æ¢å¤åŸè°ƒ",f"å·²æ¢å¤åŸè°ƒåˆ†è½¨ï¼š\n{source_dir}")
-            return
-        try:
-            import librosa
-            self.stop()
-            song=Path(self.song_file).stem if self.song_file else "song"
-            out_dir=BASE_DIR/"arrangements"/f"{song}_transpose_{semis:+d}"
-            out_dir.mkdir(parents=True,exist_ok=True)
-            stems=[k for k,_,_ in STEM_ORDER]
-            for idx,key in enumerate(stems):
-                self.arrangement.progress.setValue(int(idx/len(stems)*90))
-                QApplication.processEvents()
-                src=source_dir/f"{key}.wav"
-                if not src.is_file():
-                    continue
-                data,sr=sf.read(str(src),dtype="float32",always_2d=True)
-                shifted=[]
-                for ch in range(data.shape[1]):
-                    shifted.append(librosa.effects.pitch_shift(data[:,ch],sr=sr,n_steps=semis))
-                out=np.stack(shifted,axis=1).astype(np.float32)
-                sf.write(str(out_dir/f"{key}.wav"),out,sr,subtype="PCM_24")
-            self.arrangement.progress.setValue(100)
-            self.stem_dir=out_dir
-            self.engine.load(out_dir)
-            self.engine.set_speed(self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0)
-            self.load_waveform_if_ready()
-            self.sync_mix_controls()
-            QMessageBox.information(self,"å‡é™è°ƒå®Œæˆ",f"å·²ç”Ÿæˆ {semis:+d} åŠéŸ³æ¼”å‡ºç‰ˆå¹¶è½½å…¥ï¼š\n{out_dir}")
-        except Exception as e:
-            QMessageBox.critical(self,"å‡é™è°ƒå¤±è´¥",str(e))
-
-    def _score_rows_transposed(self):
-        semis=self.arrangement.transpose.value() if hasattr(self,"arrangement") else 0
-        out=[]
-        for row in self.chord_timeline:
-            out.append({**row,"chords":[self._transpose_chord(c,semis) for c in row.get("chords",[])]})
-        return out
-
-    def _load_song_lyrics(self,path,duration=0):
-        try:
-            self.lyric_reference=load_synced_lyrics(path,duration)
-        except Exception:
-            self.lyric_reference=[]
-        if hasattr(self,"score_performance"):
-            self.score_performance.refresh_score()
-
-    def _extract_melody_reference(self,y,sr):
-        import librosa
-        f0,voiced_flag,_=librosa.pyin(
-            y,fmin=librosa.note_to_hz("C2"),fmax=librosa.note_to_hz("C7"),
-            sr=sr,frame_length=2048,hop_length=512,
-        )
-        times=librosa.times_like(f0,sr=sr,hop_length=512)
-        refs=[]
-        current_midi=None
-        start_index=0
-        for index,(hz,voiced) in enumerate(zip(f0,voiced_flag)):
-            midi=int(round(float(librosa.hz_to_midi(hz)))) if voiced and hz is not None and np.isfinite(hz) else None
-            if midi!=current_midi:
-                if current_midi is not None and index>start_index:
-                    start=float(times[start_index])
-                    end=float(times[index-1]+512/sr)
-                    if end-start>=0.08:
-                        refs.append({"start":start,"end":end,"midi":current_midi,"note":librosa.midi_to_note(current_midi,octave=True,cents=False)})
-                current_midi=midi
-                start_index=index
-        if current_midi is not None and len(times)>start_index:
-            start=float(times[start_index]); end=float(times[-1]+512/sr)
-            if end-start>=0.08:
-                refs.append({"start":start,"end":end,"midi":current_midi,"note":librosa.midi_to_note(current_midi,octave=True,cents=False)})
-        return refs[:4000]
-
-    def _make_score_html(self, title, instrument="lead"):
-        rows=self._score_rows_transposed()
-        bpm=self.analysis_result.get("bpm","â€”")
-        key=self.analysis_result.get("key","â€”")
-        semis=self.arrangement.transpose.value() if hasattr(self,"arrangement") else 0
-        target=self._transpose_note_name(key,semis) if key != "â€”" else key
-        guides={
-            "lead":"Lead Sheetï¼šæŒ‰å°èŠ‚æ˜¾ç¤ºå’Œå¼¦ä¸æ®µè½ã€‚",
-            "guitar":"å‰ä»–ï¼šå»ºè®®æ ¹æ®å’Œå¼¦ä½¿ç”¨å¼€æ”¾å’Œå¼¦/å°é—­å’Œå¼¦ï¼›4/4 å¯å…ˆä»¥å…«åˆ†éŸ³ç¬¦æ‰«å¼¦ä½œä¸ºæ’ç»ƒèµ·ç‚¹ã€‚",
-            "bass":"è´æ–¯ï¼šåŸºç¡€ç‰ˆæœ¬ä»¥æ¯ä¸ªå’Œå¼¦æ ¹éŸ³ä¸ºä¸»ï¼Œå¼ºæ‹è½æ ¹éŸ³ï¼Œæ®µè½è¿æ¥å¤„å¯åŠ å…¥äº”åº¦ä¸ç»è¿‡éŸ³ã€‚",
-            "drums":"é¼“ï¼šåŸºç¡€ 4/4 grooveï¼šHi-Hat å…«åˆ†éŸ³ç¬¦ï¼ŒSnare 2/4 æ‹ï¼ŒKick 1/3 æ‹ï¼›å‰¯æ­Œå¯å¢å¼º Crash ä¸ Fillã€‚",
-            "piano":"é”®ç›˜ï¼šå³æ‰‹ä¸‰å’Œå¼¦/è½¬ä½ï¼Œå·¦æ‰‹æ ¹éŸ³æˆ–æ ¹éŸ³+äº”åº¦ï¼›æ ¹æ®æ®µè½å¯†åº¦è°ƒæ•´ç»‡ä½“ã€‚",
-        }
-        trs=[]
-        for r in rows:
-            chords=" / ".join(html.escape(c) for c in r["chords"])
-            trs.append(f"<tr><td>{r['bar']}</td><td>{self._format_time(r['seconds'])}</td><td>{html.escape(r['section'])}</td><td class='chord'>{chords}</td></tr>")
-        return f'''<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
-<style>body{{font-family:'Microsoft YaHei UI',Arial;background:#0a1020;color:#eef3ff;padding:30px}}h1{{color:#b993ff}}.meta{{color:#9fb0cf;margin-bottom:20px}}.guide{{background:#111c33;border:1px solid #2c3b5e;padding:14px;border-radius:10px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #253451;padding:10px;text-align:left}}th{{color:#8fa2c6}}.chord{{font-size:18px;font-weight:bold;color:#65e1ce}}small{{color:#8795b0}}</style></head><body>
-<h1>{html.escape(title)}</h1><div class="meta">BPM {bpm} Â· åŸè°ƒå‚è€ƒ {html.escape(str(key))} Â· æ¼”å‡ºè°ƒ {html.escape(str(target))} Â· å‡é™ {semis:+d} åŠéŸ³ Â· 4/4</div>
-<div class="guide">{html.escape(guides.get(instrument,guides['lead']))}</div>
-<table><tr><th>å°èŠ‚</th><th>æ—¶é—´</th><th>æ®µè½</th><th>å’Œå¼¦</th></tr>{''.join(trs)}</table>
-<p><small>æ©˜å‘³å„¿éŸ³ä¹ Â· AI åˆ†æç”Ÿæˆçš„æ’ç»ƒ/æ¼”å¥å‚è€ƒè°±ï¼Œå»ºè®®ä¹æ‰‹æ¼”å‡ºå‰äººå·¥æ ¡å¯¹ã€‚</small></p></body></html>'''
-
-    def export_lead_sheet(self):
-        self.export_instrument_score("lead")
-
-    def export_instrument_score(self, instrument):
-        if not self.chord_timeline:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆè¿è¡Œâ€œåˆ†æå’Œå¼¦ / BPM / è°ƒæ€§â€ã€‚")
-            return
-        names={"lead":"Lead Sheet","guitar":"å‰ä»–æ¼”å¥å‚è€ƒè°±","bass":"è´æ–¯æ¼”å¥å‚è€ƒè°±","drums":"é¼“æ‰‹æ¼”å¥å‚è€ƒè°±","piano":"é”®ç›˜æ¼”å¥å‚è€ƒè°±"}
-        song=Path(self.song_file).stem if self.song_file else "song"
-        default=EXPORTS_DIR/f"{song}_{instrument}_score.html"
-        p,_=QFileDialog.getSaveFileName(self,"å¯¼å‡ºæ¼”å¥è°±",str(default),"HTML ä¹è°± (*.html)")
-        if not p:
-            return
-        Path(p).write_text(self._make_score_html(f"{song} Â· {names.get(instrument,instrument)}",instrument),encoding="utf-8")
-        try:
-            webbrowser.open(Path(p).resolve().as_uri())
-        except Exception:
-            pass
-        QMessageBox.information(self,"å‡ºè°±å®Œæˆ",f"å·²ç”Ÿæˆï¼š\n{p}")
-
-
-    def _difficulty_value(self, text):
-        return {"ç®€åŒ–":0.55, "æ ‡å‡†":0.75, "ä¸°å¯Œ":0.9, "ä¸“ä¸š":1.0}.get(str(text),0.75)
-
-    def _current_player_profiles(self):
-        ie = getattr(self, "instrument_experience", None)
-        if ie is None:
-            return {}
-        return {
-            "guitar":{
-                "difficulty":ie.guitar_difficulty.currentText(),
-                "tuning":ie.guitar_tuning.currentText(),
-                "capo":ie.guitar_capo.value(),
-                "style":ie.guitar_style.currentText(),
-                "density":ie.guitar_density.value(),
-            },
-            "bass":{
-                "difficulty":ie.bass_difficulty.currentText(),
-                "strings":ie.bass_strings.currentText(),
-                "pattern":ie.bass_pattern.currentText(),
-                "density":ie.bass_density.value(),
-                "range":ie.bass_octave.currentText(),
-            },
-            "drums":{
-                "difficulty":ie.drums_difficulty.currentText(),
-                "groove":ie.drums_groove.currentText(),
-                "hihat":ie.drums_hihat.currentText(),
-                "fill":ie.drums_fill.currentText(),
-                "strength":ie.drums_strength.value(),
-            },
-            "piano":{
-                "difficulty":ie.piano_difficulty.currentText(),
-                "left":ie.piano_left.currentText(),
-                "right":ie.piano_right.currentText(),
-                "sustain":ie.piano_sustain.currentText(),
-                "density":ie.piano_density.value(),
-            }
-        }
-
-    def refresh_smart_arranger_summary(self):
-        if not hasattr(self, "arrangement"):
-            return
-        p=self._current_player_profiles()
-        if not p:
-            self.arrangement.smart_summary.setText("æœªæ‰¾åˆ°ä¹æ‰‹å‚æ•°")
-            return
-        txt=(
-            f"å‰ä»–ï¼š{p['guitar']['difficulty']} / {p['guitar']['style']} / å¯†åº¦ {p['guitar']['density']} / Capo {p['guitar']['capo']}\\n"
-            f"Bassï¼š{p['bass']['difficulty']} / {p['bass']['pattern']} / å¯†åº¦ {p['bass']['density']} / {p['bass']['range']}\\n"
-            f"é¼“ï¼š{p['drums']['difficulty']} / {p['drums']['groove']} / {p['drums']['hihat']} / {p['drums']['fill']}\\n"
-            f"é”®ç›˜ï¼š{p['piano']['difficulty']} / å·¦æ‰‹ {p['piano']['left']} / å³æ‰‹ {p['piano']['right']} / å¯†åº¦ {p['piano']['density']}"
-        )
-        self.arrangement.smart_summary.setText(txt)
-
-    def _smart_chord_notes(self, chord, semis):
-        notes={"C":60,"C#":61,"D":62,"D#":63,"E":64,"F":65,"F#":66,"G":67,"G#":68,"A":69,"A#":70,"B":71}
-        m=re.match(r"^([A-G](?:#|b)?)(.*)$", chord or "")
-        if not m:
-            return [60,64,67]
-        root=self._transpose_note_name(m.group(1),semis)
-        base=notes.get(root,60)
-        suffix=m.group(2)
-        if suffix.startswith("m") and not suffix.startswith("maj"):
-            third=3
-        else:
-            third=4
-        ns=[base,base+third,base+7]
-        if suffix=="7":
-            ns.append(base+10)
-        elif suffix=="maj7":
-            ns.append(base+11)
-        elif suffix=="m7":
-            ns=[base,base+3,base+7,base+10]
-        elif suffix=="sus4":
-            ns=[base,base+5,base+7]
-        elif suffix=="dim":
-            ns=[base,base+3,base+6]
-        return ns
-
-    def _guitar_bar_events(self, track, ns, profile, mode):
-        from mido import Message
-        difficulty=self._difficulty_value(profile.get("difficulty"))
-        density=max(1,min(10,int(profile.get("density",5))))
-        style=profile.get("style","è‡ªåŠ¨æ¨è")
-        capo=int(profile.get("capo",0))
-        notes=[n+capo for n in ns]
-        velocity=int(48+35*difficulty)
-
-        if "Power Chord" in style:
-            notes=[notes[0],notes[0]+7,notes[0]+12]
-        elif "åˆ†è§£" in style or "Fingerstyle" in style:
-            steps=8 if density>=6 else 4
-            dur=240 if steps==8 else 480
-            pattern=[0,1,2,1,0,2,1,2] if len(notes)>=3 else [0]*steps
-            for i in range(steps):
-                n=notes[pattern[i % len(pattern)] % len(notes)]
-                track.append(Message('note_on',note=min(108,n),velocity=velocity,time=0,channel=0))
-                track.append(Message('note_off',note=min(108,n),velocity=0,time=dur,channel=0))
-            return
-        else:
-            beats=4 if density<=6 else 8
-            dur=480 if beats==4 else 240
-            for _ in range(beats):
-                for n in notes:
-                    track.append(Message('note_on',note=min(108,n),velocity=velocity,time=0,channel=0))
-                track.append(Message('note_off',note=min(108,notes[0]),velocity=0,time=int(dur*0.78),channel=0))
-                for n in notes[1:]:
-                    track.append(Message('note_off',note=min(108,n),velocity=0,time=0,channel=0))
-                track.append(Message('note_on',note=min(108,notes[0]),velocity=1,time=max(1,int(dur*0.22)),channel=0))
-                track.append(Message('note_off',note=min(108,notes[0]),velocity=0,time=0,channel=0))
-
-    def _bass_bar_events(self, track, ns, profile):
-        from mido import Message
-        root=ns[0]-24
-        if "é«˜æŠŠä½" in profile.get("range",""):
-            root+=12
-        elif "ä½éŸ³æ›´ç¨³" in profile.get("range",""):
-            root-=5
-        density=max(1,min(10,int(profile.get("density",5))))
-        pattern=profile.get("pattern","æ ¹éŸ³ä¼˜å…ˆ")
-        diff=self._difficulty_value(profile.get("difficulty"))
-        velocity=int(64+24*diff)
-
-        notes=[]
-        if "Walking" in pattern:
-            notes=[root,root+4,root+7,root+9]
-        elif "å…«åº¦" in pattern:
-            notes=[root,root+12,root+7,root+12]
-        elif "äº”åº¦" in pattern:
-            notes=[root,root+7,root,root+7]
-        elif "æ—‹å¾‹åŒ–" in pattern:
-            notes=[root,root+4,root+7,root+11]
-        else:
-            notes=[root,root,root,root]
-
-        if density<=3:
-            seq=[notes[0],notes[2]]
-            dur=960
-        elif density>=8:
-            seq=[notes[0],notes[1],notes[2],notes[3],notes[0]+12,notes[2],notes[1],notes[3]]
-            dur=240
-        else:
-            seq=notes
-            dur=480
-
-        for n in seq:
-            n=max(28,min(72,n))
-            track.append(Message('note_on',note=n,velocity=velocity,time=0,channel=1))
-            track.append(Message('note_off',note=n,velocity=0,time=dur,channel=1))
-
-    def _piano_bar_events(self, track, ns, profile):
-        from mido import Message
-        left=profile.get("left","æ ¹éŸ³")
-        right=profile.get("right","ä¸‰å’Œå¼¦")
-        density=max(1,min(10,int(profile.get("density",5))))
-        diff=self._difficulty_value(profile.get("difficulty"))
-        velocity=int(48+24*diff)
-
-        chord=[n+12 for n in ns]
-        if "è½¬ä½" in right and len(chord)>=3:
-            chord=[chord[1],chord[2],chord[0]+12] + chord[3:]
-        if "Pad" in right:
-            for n in chord:
-                track.append(Message('note_on',note=min(108,n),velocity=max(35,velocity-12),time=0,channel=2))
-            track.append(Message('note_off',note=min(108,chord[0]),velocity=0,time=1920,channel=2))
-            for n in chord[1:]:
-                track.append(Message('note_off',note=min(108,n),velocity=0,time=0,channel=2))
-            return
-
-        steps=8 if density>=7 else 4
-        dur=240 if steps==8 else 480
-        for i in range(steps):
-            if "åˆ†è§£" in right or "Rhodes" in right:
-                n=chord[i % len(chord)]
-                track.append(Message('note_on',note=min(108,n),velocity=velocity,time=0,channel=2))
-                track.append(Message('note_off',note=min(108,n),velocity=0,time=dur,channel=2))
-            else:
-                for n in chord:
-                    track.append(Message('note_on',note=min(108,n),velocity=velocity,time=0,channel=2))
-                track.append(Message('note_off',note=min(108,chord[0]),velocity=0,time=int(dur*0.85),channel=2))
-                for n in chord[1:]:
-                    track.append(Message('note_off',note=min(108,n),velocity=0,time=0,channel=2))
-                track.append(Message('note_on',note=min(108,chord[0]),velocity=1,time=max(1,int(dur*0.15)),channel=2))
-                track.append(Message('note_off',note=min(108,chord[0]),velocity=0,time=0,channel=2))
-
-    def _drum_bar_events(self, track, profile, is_section_boundary=False):
-        from mido import Message
-        groove=profile.get("groove","Pop 8Beat")
-        hihat=profile.get("hihat","å…«åˆ†éŸ³ç¬¦")
-        fill=profile.get("fill","å°‘é‡ Fill")
-        strength=max(1,min(10,int(profile.get("strength",5))))
-        difficulty=self._difficulty_value(profile.get("difficulty"))
-        vel_base=int(50+35*difficulty+(strength-5)*2)
-
-        sixteenth = "åå…­" in hihat
-        steps=16 if sixteenth else 8
-        dur=120 if sixteenth else 240
-        hh_note=51 if "Ride" in hihat else 42
-
-        for step in range(steps):
-            beat_pos = step/(4 if sixteenth else 2)
-            events=[(hh_note,max(35,vel_base-25))]
-            if abs(beat_pos-0.0)<0.01 or abs(beat_pos-2.0)<0.01:
-                events.append((36,min(120,vel_base+12)))
-            if abs(beat_pos-1.0)<0.01 or abs(beat_pos-3.0)<0.01:
-                events.append((38,min(120,vel_base+8)))
-            if "Rock" in groove and beat_pos in (0.0,1.5,2.0):
-                events.append((36,min(120,vel_base+8)))
-            if "Funk" in groove and step % 4 == 3:
-                events.append((36,min(115,vel_base)))
-            for note,vel in events:
-                track.append(Message('note_on',note=note,velocity=vel,time=0,channel=9))
-            track.append(Message('note_off',note=hh_note,velocity=0,time=dur,channel=9))
-            for note,_ in events[1:]:
-                track.append(Message('note_off',note=note,velocity=0,time=0,channel=9))
-
-        wants_fill = is_section_boundary and ("æ®µè½å‰" in fill or "å‰¯æ­Œ" in fill or "ä¸°å¯Œ" in fill)
-        if wants_fill:
-            # Append a short tom/snare fill by borrowing one final quarter-note feel.
-            for note in [45,47,50,38]:
-                track.append(Message('note_on',note=note,velocity=min(120,vel_base+10),time=0,channel=9))
-                track.append(Message('note_off',note=note,velocity=0,time=120,channel=9))
-
-
-    def _section_role(self, name, index, total):
-        text=str(name or "").lower()
-        if "intro" in text or "å‰å¥" in text:
-            return "intro"
-        if "verse" in text or "ä¸»æ­Œ" in text:
-            return "verse"
-        if "chorus" in text or "å‰¯æ­Œ" in text:
-            return "chorus"
-        if "bridge" in text or "æ¡¥" in text:
-            return "bridge"
-        if "solo" in text or "é—´å¥" in text:
-            return "solo"
-        if "outro" in text or "å°¾å¥" in text:
-            return "outro"
-        if total <= 1:
-            return "verse"
-        ratio=index/max(1,total-1)
-        if ratio < 0.12:
-            return "intro"
-        if ratio < 0.42:
-            return "verse"
-        if ratio < 0.66:
-            return "chorus"
-        if ratio < 0.84:
-            return "bridge"
-        return "outro"
-
-    def _section_strategy(self, role, curve="è‡ªåŠ¨åˆ¤æ–­"):
-        base = {
-            "intro":  {"energy":0.48,"guitar":0.55,"bass":0.45,"drums":0.35,"piano":0.65,"fill":0.15,"space":0.35},
-            "verse":  {"energy":0.58,"guitar":0.62,"bass":0.58,"drums":0.55,"piano":0.58,"fill":0.20,"space":0.25},
-            "chorus": {"energy":0.92,"guitar":0.88,"bass":0.88,"drums":0.95,"piano":0.82,"fill":0.72,"space":0.05},
-            "bridge": {"energy":0.52,"guitar":0.40,"bass":0.50,"drums":0.46,"piano":0.72,"fill":0.35,"space":0.45},
-            "solo":   {"energy":0.82,"guitar":0.72,"bass":0.78,"drums":0.84,"piano":0.55,"fill":0.65,"space":0.10},
-            "outro":  {"energy":0.45,"guitar":0.50,"bass":0.48,"drums":0.38,"piano":0.58,"fill":0.28,"space":0.40},
-        }[role].copy()
-
-        if curve=="æ¸è¿›å¢å¼º":
-            if role in ("intro","verse"):
-                base["energy"]*=0.88
-            elif role in ("chorus","solo"):
-                base["energy"]=min(1.0,base["energy"]*1.06)
-        elif curve=="å¹³ç¨³ç°åœº":
-            for k in ("energy","guitar","bass","drums","piano"):
-                base[k]=0.68 + (base[k]-0.68)*0.35
-        elif curve=="å¼ºå¼±å¯¹æ¯”":
-            if role in ("verse","bridge","intro"):
-                base["energy"]*=0.78
-            if role in ("chorus","solo"):
-                base["energy"]=min(1.0,base["energy"]*1.08)
-        elif curve=="æŠ’æƒ…å…‹åˆ¶":
-            base["drums"]*=0.72
-            base["guitar"]*=0.82
-            base["bass"]*=0.86
-            base["piano"]=min(1.0,base["piano"]*1.05)
-            base["fill"]*=0.45
-            base["space"]=min(0.8,base["space"]+0.18)
-        return base
-
-    def _build_section_map(self):
-        rows=self.chord_timeline or []
-        if not rows:
-            return []
-        unique=[]
-        seen=set()
-        for row in rows:
-            s=row.get("section","æ®µè½")
-            if s not in seen:
-                seen.add(s); unique.append(s)
-        curve=self.arrangement.energy_curve.currentText() if hasattr(self,"arrangement") else "è‡ªåŠ¨åˆ¤æ–­"
-        out=[]
-        for i,name in enumerate(unique):
-            role=self._section_role(name,i,len(unique))
-            out.append({
-                "name":name,
-                "role":role,
-                "strategy":self._section_strategy(role,curve)
-            })
-        return out
-
-    def refresh_musical_intelligence_preview(self):
-        if not self.chord_timeline:
-            self.arrangement.intelligence_summary.setText("è¯·å…ˆå®Œæˆæ­Œæ›²å’Œå¼¦/æ®µè½åˆ†æã€‚")
-            return
-        smap=self._build_section_map()
-        labels={"intro":"å‰å¥","verse":"ä¸»æ­Œ","chorus":"å‰¯æ­Œ","bridge":"æ¡¥æ®µ","solo":"é—´å¥/ç‹¬å¥","outro":"å°¾å¥"}
-        lines=[]
-        for s in smap:
-            st=s["strategy"]
-            lines.append(
-                f"{s['name']} â†’ {labels.get(s['role'],s['role'])} | "
-                f"èƒ½é‡ {int(st['energy']*100)}% | "
-                f"å‰ä»– {int(st['guitar']*100)}% | Bass {int(st['bass']*100)}% | "
-                f"é¼“ {int(st['drums']*100)}% | é”®ç›˜ {int(st['piano']*100)}% | "
-                f"Fill {int(st['fill']*100)}%"
-            )
-        self.arrangement.intelligence_summary.setText("\n".join(lines))
-
-    def _section_strategy_for_name(self, section_name, section_map):
-        for item in section_map:
-            if item["name"] == section_name:
-                return item["strategy"], item["role"]
-        return self._section_strategy("verse"), "verse"
-
-    def _apply_section_profile(self, profile, strategy, instrument):
-        p=dict(profile or {})
-        factor=float(strategy.get(instrument,0.7))
-        density_key="density"
-        if density_key in p:
-            p[density_key]=max(1,min(10,int(round(float(p[density_key])*factor))))
-        if instrument=="drums":
-            p["strength"]=max(1,min(10,int(round(float(p.get("strength",5))*max(0.55,strategy.get("drums",0.7))))))
-            if strategy.get("fill",0)<0.25:
-                p["fill"]="å°‘é‡ Fill"
-            elif strategy.get("fill",0)>0.65:
-                p["fill"]="æ®µè½å‰ Fill"
-        return p
-
-    def _musical_intelligence_bar(self, tracks, row, ns, profiles, strategy, role, boundary, mode):
-        guitar,bass,piano,drums = tracks
-        gp=self._apply_section_profile(profiles.get("guitar",{}),strategy,"guitar")
-        bp=self._apply_section_profile(profiles.get("bass",{}),strategy,"bass")
-        pp=self._apply_section_profile(profiles.get("piano",{}),strategy,"piano")
-        dp=self._apply_section_profile(profiles.get("drums",{}),strategy,"drums")
-
-        # Human-friendly orchestration decisions.
-        if role=="intro":
-            if "æ‰«å¼¦" in gp.get("style",""):
-                gp["style"]="åˆ†è§£å’Œå¼¦"
-            dp["strength"]=max(2,dp.get("strength",5)-2)
-        elif role=="chorus":
-            if gp.get("style","è‡ªåŠ¨æ¨è")=="è‡ªåŠ¨æ¨è":
-                gp["style"]="æ‰«å¼¦"
-            bp["density"]=max(bp.get("density",5),6)
-            dp["strength"]=min(10,dp.get("strength",5)+2)
-            if dp.get("fill")=="å°‘é‡ Fill":
-                dp["fill"]="æ®µè½å‰ Fill"
-        elif role=="bridge":
-            # Leave space: piano may hold longer notes; guitar reduced.
-            gp["density"]=max(1,int(gp.get("density",5)*0.55))
-            pp["right"]="Padé“ºåº•"
-            dp["strength"]=max(1,int(dp.get("strength",5)*0.7))
-        elif role=="outro":
-            gp["density"]=max(1,int(gp.get("density",5)*0.65))
-            bp["density"]=max(1,int(bp.get("density",5)*0.65))
-            dp["strength"]=max(1,int(dp.get("strength",5)*0.6))
-            pp["right"]="Padé“ºåº•"
-
-        # Frequency/rhythm separation heuristic:
-        # if piano is dense, guitar becomes rhythmically simpler; if guitar dense, piano sustains.
-        if int(pp.get("density",5)) >= 7 and int(gp.get("density",5)) >= 7:
-            if role in ("chorus","solo"):
-                pp["right"]="Padé“ºåº•"
-            else:
-                gp["density"]=5
-
-        self._guitar_bar_events(guitar,ns,gp,mode)
-        self._bass_bar_events(bass,ns,bp)
-        self._piano_bar_events(piano,ns,pp)
-        self._drum_bar_events(drums,dp,boundary)
-
-
-
-
-    def _integrated_rms_db(self, path):
-        data,sr=sf.read(path,dtype="float32",always_2d=True)
-        if len(data)==0:
-            return -120.0
-        mono=np.mean(data,axis=1)
-        # Ignore near-silence for more useful program-level matching.
-        mask=np.abs(mono)>1e-5
-        if np.any(mask):
-            mono=mono[mask]
-        rms=float(np.sqrt(np.mean(np.square(mono))+1e-12))
-        return 20.0*math.log10(max(rms,1e-12))
-
-    def prepare_ab_loudness_match(self):
-        pa=self.variant_audio.get("A","")
-        pb=self.variant_audio.get("B","")
-        if not pa or not pb or not Path(pa).exists() or not Path(pb).exists():
-            return False
-        try:
-            da=self._integrated_rms_db(pa)
-            db=self._integrated_rms_db(pb)
-            target=min(da,db)
-            self.ab_gain["A"]=10**((target-da)/20.0)
-            self.ab_gain["B"]=10**((target-db)/20.0)
-            if hasattr(self,"arrangement"):
-                self.arrangement.diff_label.setText(
-                    f"å“åº¦åŒ¹é…ï¼šA {da:.1f} dB RMS / B {db:.1f} dB RMS â†’ å…±åŒç›®æ ‡ {target:.1f} dB RMS"
-                )
-            return True
-        except Exception:
-            self.ab_gain={"A":1.0,"B":1.0}
-            return False
-
-    def refresh_ab_waveforms(self):
-        if not hasattr(self,"arrangement"):
-            return
-        pa=self.variant_audio.get("A","")
-        pb=self.variant_audio.get("B","")
-        if pa and Path(pa).exists():
-            self.arrangement.ab_wave_a.set_waveform_from_wav(pa)
-        if pb and Path(pb).exists():
-            self.arrangement.ab_wave_b.set_waveform_from_wav(pb)
-
-    def _open_ab_files(self):
-        self._close_ab_files()
-        for v in ("A","B"):
-            p=self.variant_audio.get(v,"")
-            if p and Path(p).exists():
-                self.ab_files[v]=sf.SoundFile(p,"r")
-        if set(self.ab_files.keys()) != {"A","B"}:
-            self._close_ab_files()
-            return False
-        a=self.ab_files["A"]; b=self.ab_files["B"]
-        if a.samplerate!=b.samplerate or a.channels!=b.channels:
-            self._close_ab_files()
-            QMessageBox.critical(self,"A/B ä¸å…¼å®¹","A/B æ¸²æŸ“æ–‡ä»¶çš„é‡‡æ ·ç‡æˆ–å£°é“æ•°ä¸åŒã€‚")
-            return False
-        return True
-
-    def _close_ab_files(self):
-        for f in getattr(self,"ab_files",{}).values():
-            try: f.close()
-            except Exception: pass
-        self.ab_files={}
-
-    def start_ab_instant_preview(self):
-        if not self._open_ab_files():
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆæŠŠ A å’Œ B éƒ½æ¸²æŸ“æˆ WAVã€‚")
-            return False
-
-        if hasattr(self,"arrangement") and self.arrangement.loudness_match.isChecked():
-            self.prepare_ab_loudness_match()
-        else:
-            self.ab_gain={"A":1.0,"B":1.0}
-
-        start,end=self._selected_compare_segment()
-        sr=self.ab_files["A"].samplerate
-        ch=self.ab_files["A"].channels
-        loop=bool(hasattr(self,"arrangement") and self.arrangement.loop_compare.isChecked())
-        start_frame=max(0,int(start*sr))
-        end_frame=int(end*sr) if end else min(self.ab_files["A"].frames,self.ab_files["B"].frames)
-        self.ab_frame=start_frame
-        for f in self.ab_files.values():
-            f.seek(start_frame)
-
-        def cb(outdata,frames,time_info,status):
-            v=self.ab_current_variant
-            f=self.ab_files[v]
-            # Keep both files aligned even when only one is audible.
-            pos=self.ab_frame
-            for key,fh in self.ab_files.items():
-                fh.seek(pos)
-            data=self.ab_files[v].read(frames,dtype="float32",always_2d=True)
-            n=len(data)
-
-            if n<frames or pos+n>=end_frame:
-                valid=max(0,min(n,end_frame-pos))
-                first=data[:valid]
-                if loop:
-                    remain=frames-valid
-                    for fh in self.ab_files.values():
-                        fh.seek(start_frame)
-                    second=self.ab_files[v].read(remain,dtype="float32",always_2d=True)
-                    data=np.vstack([first,second]) if len(first) else second
-                    self.ab_frame=start_frame+len(second)
-                else:
-                    outdata.fill(0)
-                    if valid:
-                        outdata[:valid]=first*self.ab_gain.get(v,1.0)
-                    raise sd.CallbackStop()
-            else:
-                self.ab_frame=pos+frames
-
-            if len(data)<frames:
-                padded=np.zeros((frames,ch),dtype=np.float32)
-                padded[:len(data)]=data
-                data=padded
-            outdata[:]=data[:frames]*self.ab_gain.get(v,1.0)
-
-        self.stop_ab_instant_preview()
-        self.ab_stream=sd.OutputStream(
-            samplerate=sr,channels=ch,dtype="float32",blocksize=512,callback=cb
-        )
-        self.ab_stream.start()
-        return True
-
-    def stop_ab_instant_preview(self):
-        if self.ab_stream:
-            try:
-                self.ab_stream.stop()
-                self.ab_stream.close()
-            except Exception:
-                pass
-            self.ab_stream=None
-        self._close_ab_files()
-
-    def instant_switch_variant(self, variant):
-        if variant not in ("A","B"):
-            return
-        self.ab_current_variant=variant
-        self.active_variant=variant
-        if not self.ab_stream:
-            if not self.start_ab_instant_preview():
-                return
-        if hasattr(self,"arrangement"):
-            self.arrangement.diff_label.setText(
-                f"æ­£åœ¨ç¬æ—¶ A/B å¯¹æ¯”ï¼šå½“å‰ {variant} Â· "
-                f"{'å·²å¯ç”¨å“åº¦åŒ¹é…' if self.arrangement.loudness_match.isChecked() else 'æœªå¯ç”¨å“åº¦åŒ¹é…'}"
-            )
-
-    def analyze_ab_difference(self):
-        pa=self.variant_audio.get("A","")
-        pb=self.variant_audio.get("B","")
-        if not pa or not pb or not Path(pa).exists() or not Path(pb).exists():
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆæ¸²æŸ“ A/B WAVã€‚")
-            return
-        try:
-            a,sra=sf.read(pa,dtype="float32",always_2d=True)
-            b,srb=sf.read(pb,dtype="float32",always_2d=True)
-            if sra!=srb:
-                raise RuntimeError("A/B é‡‡æ ·ç‡ä¸åŒ")
-            n=min(len(a),len(b))
-            if n<=0:
-                raise RuntimeError("A/B éŸ³é¢‘ä¸ºç©º")
-            a=a[:n]; b=b[:n]
-            if a.shape[1]!=b.shape[1]:
-                m=min(a.shape[1],b.shape[1])
-                a=a[:,:m]; b=b[:,:m]
-
-            # Compare after level matching to emphasize arrangement/timbre differences.
-            da=self._integrated_rms_db(pa)
-            db=self._integrated_rms_db(pb)
-            target=min(da,db)
-            ga=10**((target-da)/20.0)
-            gb=10**((target-db)/20.0)
-            aa=a*ga; bb=b*gb
-            diff=aa-bb
-
-            rms_a=float(np.sqrt(np.mean(aa**2)+1e-12))
-            rms_b=float(np.sqrt(np.mean(bb**2)+1e-12))
-            rms_diff=float(np.sqrt(np.mean(diff**2)+1e-12))
-            corr=float(np.corrcoef(aa.reshape(-1),bb.reshape(-1))[0,1]) if n>100 else 0.0
-            corr=max(-1.0,min(1.0,corr if not np.isnan(corr) else 0.0))
-            relative=100.0*rms_diff/max(1e-9,(rms_a+rms_b)/2.0)
-
-            self.arrangement.diff_label.setText(
-                f"A/B å·®å¼‚åˆ†æï¼šå“åº¦åŒ¹é…åå·®å¼‚å¼ºåº¦çº¦ {relative:.1f}% Â· "
-                f"æ³¢å½¢ç›¸å…³åº¦ {corr:.3f} Â· "
-                f"A {da:.1f} dB RMS / B {db:.1f} dB RMSã€‚"
-            )
-        except Exception as e:
-            QMessageBox.critical(self,"A/B å·®å¼‚åˆ†æå¤±è´¥",str(e))
-
-    def restore_selected_history(self):
-        if not hasattr(self,"arrangement"):
-            return
-        row=self.arrangement.history_table.currentRow()
-        if row<0:
-            QMessageBox.information(self,"å†å²æ¢å¤","è¯·å…ˆé€‰æ‹©ä¸€æ¡å†å²è®°å½•ã€‚")
-            return
-        # Table is newest-first.
-        index=len(self.arrangement_history)-1-row
-        if index<0 or index>=len(self.arrangement_history):
-            return
-        self._push_undo_state("æ¢å¤å†å²å‰")
-        state=self.arrangement_history[index]
-        self.manual_section_overrides=json.loads(json.dumps(state.get("manual_overrides",{}),ensure_ascii=False))
-        self.arrangement_variants=json.loads(json.dumps(state.get("variants",{"A":{},"B":{}}),ensure_ascii=False))
-        self.active_variant=state.get("active_variant","")
-        self.load_manual_section_settings()
-        QMessageBox.information(self,"å†å²æ¢å¤",f"å·²æ¢å¤ï¼š{state.get('label','å†å²å¿«ç…§')}")
-
-
-    def _snapshot_state(self, label=""):
-        return {
-            "time":time.time(),
-            "label":label,
-            "manual_overrides":json.loads(json.dumps(self.manual_section_overrides,ensure_ascii=False)),
-            "variants":json.loads(json.dumps(self.arrangement_variants,ensure_ascii=False)),
-            "active_variant":self.active_variant,
-        }
-
-    def _push_undo_state(self, label="ä¿®æ”¹"):
-        self.undo_stack.append(self._snapshot_state(label))
-        if len(self.undo_stack) > 50:
-            self.undo_stack=self.undo_stack[-50:]
-        self.redo_stack.clear()
-
-    def undo_arrangement_change(self):
-        if not self.undo_stack:
-            QMessageBox.information(self,"Undo","æ²¡æœ‰å¯æ’¤é”€çš„æ“ä½œã€‚")
-            return
-        self.redo_stack.append(self._snapshot_state("redo"))
-        state=self.undo_stack.pop()
-        self.manual_section_overrides=state.get("manual_overrides",{})
-        self.arrangement_variants=state.get("variants",{"A":{},"B":{}})
-        self.active_variant=state.get("active_variant","")
-        self.load_manual_section_settings()
-        self.refresh_history_table()
-
-    def redo_arrangement_change(self):
-        if not self.redo_stack:
-            QMessageBox.information(self,"Redo","æ²¡æœ‰å¯é‡åšçš„æ“ä½œã€‚")
-            return
-        self.undo_stack.append(self._snapshot_state("undo"))
-        state=self.redo_stack.pop()
-        self.manual_section_overrides=state.get("manual_overrides",{})
-        self.arrangement_variants=state.get("variants",{"A":{},"B":{}})
-        self.active_variant=state.get("active_variant","")
-        self.load_manual_section_settings()
-        self.refresh_history_table()
-
-    def save_arrangement_snapshot(self):
-        state=self._snapshot_state("æ‰‹åŠ¨å¿«ç…§")
-        self.arrangement_history.append(state)
-        folder=BASE_DIR/"arrangement_history"
-        folder.mkdir(parents=True,exist_ok=True)
-        song=Path(self.song_file).stem if self.song_file else "project"
-        p=folder/f"{song}_{int(state['time'])}.json"
-        p.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding="utf-8")
-        state["file"]=str(p)
-        self.refresh_history_table()
-        QMessageBox.information(self,"å†å²å¿«ç…§",f"å·²ä¿å­˜ï¼š\n{p}")
-
-    def refresh_history_table(self):
-        if not hasattr(self,"arrangement"):
-            return
-        table=self.arrangement.history_table
-        table.setRowCount(len(self.arrangement_history))
-        for r,item in enumerate(reversed(self.arrangement_history)):
-            ts=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(item.get("time",0)))
-            vals=[
-                ts,
-                item.get("active_variant","") or "-",
-                item.get("label",""),
-                item.get("file","")
-            ]
-            for c,v in enumerate(vals):
-                table.setItem(r,c,QTableWidgetItem(str(v)))
-
-    def _variant_midi_path(self, variant):
-        p=str(self.arrangement_variants.get(variant,{}).get("midi",""))
-        if p and Path(p).exists():
-            return p
-        return ""
-
-    def _variant_render_output(self, variant, ext="wav"):
-        song=Path(self.song_file).stem if self.song_file else "song"
-        folder=EXPORTS_DIR/"ab_compare"
-        folder.mkdir(parents=True,exist_ok=True)
-        return str(folder/f"{song}_variant_{variant}.{ext}")
-
-    def render_variant_audio(self, variant):
-        midi=self._variant_midi_path(variant)
-        if not midi:
-            self.generate_variant_midi(variant)
-            midi=self._variant_midi_path(variant)
-        if not midi:
-            return
-
-        sf=self.arrangement.soundfont_edit.text().strip() if hasattr(self,"arrangement") else self.soundfont_path
-        if not sf or not Path(sf).exists():
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆåœ¨â€œæ–°ç¼–é…éŸ³æºæ¸²æŸ“â€åŒºåŸŸé€‰æ‹© SoundFontã€‚")
-            return
-        fluidsynth=self._find_fluidsynth()
-        if not fluidsynth:
-            QMessageBox.critical(self,"ç¼ºå°‘ FluidSynth","æœªæ‰¾åˆ° fluidsynth.exeã€‚")
-            return
-
-        out=self._variant_render_output(variant,"wav")
-        try:
-            self.arrangement.progress.setValue(10)
-            QApplication.processEvents()
-            p=subprocess.run(
-                [fluidsynth,"-ni",sf,midi,"-F",out,"-r","44100"],
-                capture_output=True,text=True,timeout=600
-            )
-            if p.returncode != 0 or not Path(out).exists():
-                raise RuntimeError((p.stderr or p.stdout or "FluidSynth æ¸²æŸ“å¤±è´¥")[-2000:])
-            self.variant_audio[variant]=out
-            self.arrangement_variants.setdefault(variant,{})["render_wav"]=out
-            self.refresh_ab_waveforms()
-            if self.variant_audio.get("A") and self.variant_audio.get("B"):
-                self.prepare_ab_loudness_match()
-            self.arrangement.progress.setValue(100)
-            QMessageBox.information(self,"æ¸²æŸ“å®Œæˆ",f"{variant} ç‰ˆå·²æ¸²æŸ“ï¼š\n{out}")
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self,"æ¸²æŸ“å¤±è´¥",str(e))
-
-    def _selected_compare_segment(self):
-        if not hasattr(self,"arrangement"):
-            return (0.0,None)
-        text=self.arrangement.compare_section.currentText()
-        sections=self.section_timeline or []
-        if not text or not sections:
-            return (0.0,None)
-        idx=self.arrangement.compare_section.currentData()
-        if idx is None:
-            return (0.0,None)
-        idx=int(idx)
-        start=float(sections[idx].get("seconds",0))
-        end=float(sections[idx+1].get("seconds",0)) if idx+1<len(sections) else None
-        return (start,end)
-
-    def preview_variant(self, variant):
-        path=self.variant_audio.get(variant,"")
-        if not path or not Path(path).exists():
-            self.render_variant_audio(variant)
-            path=self.variant_audio.get(variant,"")
-        if not path or not Path(path).exists():
-            return
-        try:
-            if self.variant_preview_player:
-                try:
-                    self.variant_preview_player.stop()
-                    self.variant_preview_player.close()
-                except Exception:
-                    pass
-                self.variant_preview_player=None
-
-            f=sf.SoundFile(path,"r")
-            sr=f.samplerate
-            ch=f.channels
-            start,end=self._selected_compare_segment()
-            if hasattr(self,"arrangement") and self.arrangement.loop_compare.isChecked() and start>0:
-                f.seek(int(start*sr))
-
-            loop_start=int(start*sr)
-            loop_end=int(end*sr) if end else f.frames
-            loop_enabled=bool(hasattr(self,"arrangement") and self.arrangement.loop_compare.isChecked())
-
-            def cb(outdata,frames,time_info,status):
-                data=f.read(frames,dtype="float32",always_2d=True)
-                if len(data)<frames:
-                    if loop_enabled:
-                        f.seek(loop_start)
-                        extra=f.read(frames-len(data),dtype="float32",always_2d=True)
-                        data=np.vstack([data,extra]) if len(data) else extra
-                    else:
-                        outdata[:len(data)] = data
-                        if len(data)<frames: outdata[len(data):]=0
-                        raise sd.CallbackStop()
-
-                if loop_enabled and f.tell() >= loop_end:
-                    remain=max(0,loop_end-(f.tell()-len(data)))
-                    if remain < len(data):
-                        first=data[:remain]
-                        f.seek(loop_start)
-                        second=f.read(len(data)-remain,dtype="float32",always_2d=True)
-                        data=np.vstack([first,second]) if len(first) else second
-                outdata[:] = data[:frames]
-
-            stream=sd.OutputStream(samplerate=sr,channels=ch,dtype="float32",callback=cb)
-            stream.start()
-            self.variant_preview_player=stream
-            self._variant_preview_file=f
-            self.active_variant=variant
-        except Exception as e:
-            QMessageBox.critical(self,"è¯•å¬å¤±è´¥",str(e))
-
-    def stop_variant_preview(self):
-        if self.variant_preview_player:
-            try:
-                self.variant_preview_player.stop()
-                self.variant_preview_player.close()
-            except Exception:
-                pass
-            self.variant_preview_player=None
-        try:
-            if hasattr(self,"_variant_preview_file") and self._variant_preview_file:
-                self._variant_preview_file.close()
-        except Exception:
-            pass
-
-    def adopt_variant(self, variant):
-        if not self.arrangement_variants.get(variant):
-            QMessageBox.warning(self,"æç¤º",f"ç‰ˆæœ¬ {variant} è¿˜æ²¡æœ‰ä¿å­˜ã€‚")
-            return
-        self._push_undo_state(f"é‡‡ç”¨ {variant}")
-        self.active_variant=variant
-        chosen=json.loads(json.dumps(self.arrangement_variants[variant],ensure_ascii=False))
-        self.manual_section_overrides=chosen.get("manual_overrides",self.manual_section_overrides)
-        self.arrangement_result=chosen.copy()
-        song=Path(self.song_file).stem if self.song_file else "project"
-        folder=BASE_DIR/"arrangement_history"
-        folder.mkdir(parents=True,exist_ok=True)
-        state=self._snapshot_state(f"é‡‡ç”¨ç‰ˆæœ¬ {variant}")
-        p=folder/f"{song}_adopt_{variant}_{int(time.time())}.json"
-        p.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding="utf-8")
-        state["file"]=str(p)
-        self.arrangement_history.append(state)
-        self.refresh_history_table()
-        QMessageBox.information(self,"å·²é‡‡ç”¨",f"ç‰ˆæœ¬ {variant} å·²è®¾ä¸ºå½“å‰æ­£å¼ç¼–é…ã€‚")
-
-    def refresh_compare_sections(self):
-        if not hasattr(self,"arrangement"):
-            return
-        combo=self.arrangement.compare_section
-        combo.clear()
-        for i,s in enumerate(self.section_timeline or []):
-            combo.addItem(f"{s.get('name','æ®µè½')} Â· {self._format_time(s.get('seconds',0))}",i)
-
-    def refresh_manual_sections(self):
-        if not hasattr(self,"arrangement"):
-            return
-        combo=self.arrangement.manual_section
-        current=combo.currentText()
-        combo.blockSignals(True)
-        combo.clear()
-        sections=[]
-        for row in self.chord_timeline or []:
-            s=row.get("section","æ®µè½")
-            if s not in sections:
-                sections.append(s)
-        combo.addItems(sections)
-        if current:
-            idx=combo.findText(current)
-            if idx>=0: combo.setCurrentIndex(idx)
-        combo.blockSignals(False)
-        self.load_manual_section_settings()
-
-    def load_manual_section_settings(self):
-        if not hasattr(self,"arrangement"):
-            return
-        sec=self.arrangement.manual_section.currentText()
-        data=self.manual_section_overrides.get(sec,{})
-        pairs=[
-            ("manual_guitar","guitar"),
-            ("manual_bass","bass"),
-            ("manual_drums","drums"),
-            ("manual_piano","piano"),
-            ("manual_fill","fill"),
-            ("manual_space","space"),
-        ]
-        for attr,key in pairs:
-            getattr(self.arrangement,attr).setValue(int(data.get(key,0)))
-
-    def capture_manual_section_settings(self):
-        if not hasattr(self,"arrangement"):
-            return
-        sec=self.arrangement.manual_section.currentText()
-        if not sec:
-            return
-        self.manual_section_overrides[sec]={
-            "guitar":self.arrangement.manual_guitar.value(),
-            "bass":self.arrangement.manual_bass.value(),
-            "drums":self.arrangement.manual_drums.value(),
-            "piano":self.arrangement.manual_piano.value(),
-            "fill":self.arrangement.manual_fill.value(),
-            "space":self.arrangement.manual_space.value(),
-        }
-
-    def save_arrangement_variant(self, name):
-        self._push_undo_state(f"ä¿å­˜ç‰ˆæœ¬ {name}")
-        self.capture_manual_section_settings()
-        data={
-            "name":name,
-            "energy_curve":self.arrangement.energy_curve.currentText(),
-            "manual_overrides":json.loads(json.dumps(self.manual_section_overrides,ensure_ascii=False)),
-            "player_profiles":self._current_player_profiles(),
-            "transpose":self.arrangement.transpose.value(),
-            "arrange_mode":self.arrangement.arrange_mode.currentText(),
-        }
-        self.arrangement_variants[name]=data
-        if self.song_file:
-            folder=BASE_DIR/"arrangement_variants"
-            folder.mkdir(parents=True,exist_ok=True)
-            p=folder/f"{Path(self.song_file).stem}_variant_{name}.json"
-            p.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
-        QMessageBox.information(self,"ç‰ˆæœ¬å·²ä¿å­˜",f"å·²ä¿å­˜ç¼–é…ç‰ˆæœ¬ {name}")
-
-    def _strategy_with_manual_override(self, section_name, strategy, variant=None):
-        st=dict(strategy)
-        source=self.manual_section_overrides
-        if variant and self.arrangement_variants.get(variant):
-            source=self.arrangement_variants[variant].get("manual_overrides",source)
-        ov=source.get(section_name,{})
-        for key in ("guitar","bass","drums","piano","fill"):
-            if key in ov:
-                st[key]=max(0.05,min(1.0,st.get(key,0.7)*(1.0+float(ov[key])/100.0)))
-        if "space" in ov:
-            st["space"]=max(0.0,min(0.95,st.get("space",0.2)+float(ov["space"])/100.0))
-            # more space also subtly reduces active density
-            reduce_factor=max(0.45,1.0-float(ov["space"])/180.0)
-            if float(ov["space"])>0:
-                for key in ("guitar","bass","drums","piano"):
-                    st[key]*=reduce_factor
-        return st
-
-    def generate_variant_midi(self, variant):
-        if not self.arrangement_variants.get(variant):
-            self.save_arrangement_variant(variant)
-        if not self.chord_timeline:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆåˆ†ææ­Œæ›²ã€‚")
-            return
-
-        try:
-            from mido import MidiFile, MidiTrack, MetaMessage, bpm2tempo
-            v=self.arrangement_variants.get(variant,{})
-            profiles=v.get("player_profiles") or self._current_player_profiles()
-            mode=v.get("arrange_mode") or self.arrangement.arrange_mode.currentText()
-            song=Path(self.song_file).stem if self.song_file else "song"
-            out,_=QFileDialog.getSaveFileName(
-                self,f"ç”Ÿæˆ {variant} ç‰ˆ MIDI",
-                str(EXPORTS_DIR/f"{song}_{mode}_variant_{variant}.mid"),
-                "MIDI (*.mid)"
-            )
-            if not out:
-                return
-
-            mid=MidiFile(ticks_per_beat=480)
-            meta=MidiTrack(); mid.tracks.append(meta)
-            bpm=float(self.analysis_result.get("bpm",120) or 120)
-            meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
-            meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
-
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name=f'Juweier Variant {variant} Drums',time=0)); mid.tracks.append(drums)
-
-            section_map=self._build_section_map()
-            semis=int(v.get("transpose",self.arrangement.transpose.value()))
-            prev_section=None
-            total=max(1,len(self.chord_timeline))
-            for idx,row in enumerate(self.chord_timeline):
-                self.arrangement.progress.setValue(int(idx/total*95))
-                QApplication.processEvents()
-                chord=(row.get("chords") or ["C"])[0]
-                ns=self._smart_chord_notes(chord,semis)
-                section=row.get("section","æ®µè½")
-                strategy,role=self._section_strategy_for_name(section,section_map)
-                strategy=self._strategy_with_manual_override(section,strategy,variant)
-                boundary=prev_section is not None and section!=prev_section
-                prev_section=section
-                self._musical_intelligence_bar(
-                    (guitar,bass,piano,drums),
-                    row,ns,profiles,strategy,role,boundary,mode
-                )
-            mid.save(out)
-            self.arrangement.progress.setValue(100)
-            self.arrangement_variants[variant]["midi"]=out
-            QMessageBox.information(self,"ç”Ÿæˆå®Œæˆ",f"{variant} ç‰ˆ MIDI å·²ç”Ÿæˆï¼š\n{out}")
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self,"ç”Ÿæˆå¤±è´¥",str(e))
-
-    def compare_variant_summary(self):
-        a=self.arrangement_variants.get("A",{})
-        b=self.arrangement_variants.get("B",{})
-        return {"A":a,"B":b}
-
-    def generate_musical_intelligence_midi(self):
-        if not self.chord_timeline:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆåˆ†ææ­Œæ›²å’Œå¼¦ã€‚")
-            return
-        if not getattr(self.arrangement,"musical_intelligence",None) or not self.arrangement.musical_intelligence.isChecked():
-            return self.generate_smart_arrangement_midi()
-
-        try:
-            from mido import MidiFile, MidiTrack, MetaMessage, bpm2tempo
-            profiles=self._current_player_profiles()
-            mode=self.arrangement.arrange_mode.currentText()
-            song=Path(self.song_file).stem if self.song_file else "song"
-            out,_=QFileDialog.getSaveFileName(
-                self,"å¯¼å‡ºéŸ³ä¹æ€§æ™ºèƒ½ç¼–é… MIDI",
-                str(EXPORTS_DIR/f"{song}_{mode}_musical.mid"),
-                "MIDI (*.mid)"
-            )
-            if not out:
-                return
-
-            mid=MidiFile(ticks_per_beat=480)
-            meta=MidiTrack(); mid.tracks.append(meta)
-            bpm=float(self.analysis_result.get("bpm",120) or 120)
-            meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
-            meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
-
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='Juweier Musical Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='Juweier Musical Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='Juweier Musical Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='Juweier Musical Drums',time=0)); mid.tracks.append(drums)
-
-            section_map=self._build_section_map()
-            semis=self.arrangement.transpose.value()
-            prev_section=None
-            total=max(1,len(self.chord_timeline))
-
-            for idx,row in enumerate(self.chord_timeline):
-                self.arrangement.progress.setValue(int(idx/total*95))
-                QApplication.processEvents()
-                chord=(row.get("chords") or ["C"])[0]
-                ns=self._smart_chord_notes(chord,semis)
-                section=row.get("section","æ®µè½")
-                strategy,role=self._section_strategy_for_name(section,section_map)
-                self.capture_manual_section_settings()
-                strategy=self._strategy_with_manual_override(section,strategy)
-                boundary=prev_section is not None and section!=prev_section
-                prev_section=section
-                self._musical_intelligence_bar(
-                    (guitar,bass,piano,drums),
-                    row,ns,profiles,strategy,role,boundary,mode
-                )
-
-            mid.save(out)
-            self.arrangement_result={
-                "mode":mode,
-                "midi":out,
-                "transpose":semis,
-                "smart_arranger":True,
-                "musical_intelligence":True,
-                "energy_curve":self.arrangement.energy_curve.currentText(),
-                "section_map":section_map,
-                "player_profiles":profiles,
-            }
-            self.arrangement.progress.setValue(100)
-            self.refresh_musical_intelligence_preview()
-            QMessageBox.information(
-                self,"éŸ³ä¹æ€§æ™ºèƒ½ç¼–é…å®Œæˆ",
-                f"å·²æ ¹æ®æ®µè½å¼ºå¼±ã€ä¹å™¨ç©ºé—´å’Œå½“å‰ä¹æ‰‹è®¾ç½®ç”Ÿæˆæ–° MIDIï¼š\n{out}"
-            )
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self,"éŸ³ä¹æ€§ç¼–é…å¤±è´¥",str(e))
-
-    def generate_smart_arrangement_midi(self):
-        if not self.chord_timeline:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆåˆ†ææ­Œæ›²å’Œå¼¦ã€‚")
-            return
-        try:
-            from mido import MidiFile, MidiTrack, Message, MetaMessage, bpm2tempo
-            profiles=self._current_player_profiles()
-            mode=self.arrangement.arrange_mode.currentText()
-            song=Path(self.song_file).stem if self.song_file else "song"
-            out,_=QFileDialog.getSaveFileName(
-                self,"å¯¼å‡ºæ™ºèƒ½ç¼–é… MIDI",
-                str(EXPORTS_DIR/f"{song}_{mode}_smart.mid"),
-                "MIDI (*.mid)"
-            )
-            if not out:
-                return
-
-            mid=MidiFile(ticks_per_beat=480)
-            meta=MidiTrack(); mid.tracks.append(meta)
-            bpm=float(self.analysis_result.get("bpm",120) or 120)
-            meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
-            meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
-
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='Juweier Smart Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='Juweier Smart Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='Juweier Smart Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='Juweier Smart Drums',time=0)); mid.tracks.append(drums)
-
-            semis=self.arrangement.transpose.value()
-            prev_section=None
-            total=max(1,len(self.chord_timeline))
-            for idx,row in enumerate(self.chord_timeline):
-                self.arrangement.progress.setValue(int(idx/total*95))
-                QApplication.processEvents()
-                chord=(row.get("chords") or ["C"])[0]
-                ns=self._smart_chord_notes(chord,semis)
-                section=row.get("section","")
-                boundary = prev_section is not None and section != prev_section
-                prev_section=section
-
-                self._guitar_bar_events(guitar,ns,profiles.get("guitar",{}),mode)
-                self._bass_bar_events(bass,ns,profiles.get("bass",{}))
-                self._piano_bar_events(piano,ns,profiles.get("piano",{}))
-                self._drum_bar_events(drums,profiles.get("drums",{}),boundary)
-
-            mid.save(out)
-            self.arrangement_result={
-                "mode":mode,
-                "midi":out,
-                "transpose":semis,
-                "smart_arranger":True,
-                "player_profiles":profiles
-            }
-            self.arrangement.progress.setValue(100)
-            QMessageBox.information(
-                self,"æ™ºèƒ½ç¼–é…å®Œæˆ",
-                f"å·²æŒ‰ç…§å½“å‰å‰ä»–/Bass/é¼“/é”®ç›˜è®¾ç½®ç”Ÿæˆæ–° MIDIï¼š\\n{out}"
-            )
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self,"æ™ºèƒ½ç¼–é…å¤±è´¥",str(e))
-
-    def generate_arrangement_midi(self):
-        if not self.chord_timeline:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆåˆ†ææ­Œæ›²å’Œå¼¦ã€‚")
-            return
-        try:
-            from mido import MidiFile, MidiTrack, Message, MetaMessage, bpm2tempo
-            mode=self.arrangement.arrange_mode.currentText()
-            song=Path(self.song_file).stem if self.song_file else "song"
-            out,_=QFileDialog.getSaveFileName(self,"å¯¼å‡ºæ–°ç¼–é… MIDI",str(EXPORTS_DIR/f"{song}_{mode}.mid"),"MIDI (*.mid)")
-            if not out:
-                return
-            mid=MidiFile(ticks_per_beat=480)
-            meta=MidiTrack()
-            mid.tracks.append(meta)
-            bpm=float(self.analysis_result.get("bpm",120) or 120)
-            meta.append(MetaMessage('set_tempo',tempo=bpm2tempo(bpm),time=0))
-            meta.append(MetaMessage('time_signature',numerator=4,denominator=4,time=0))
-            notes={"C":60,"C#":61,"D":62,"D#":63,"E":64,"F":65,"F#":66,"G":67,"G#":68,"A":69,"A#":70,"B":71}
-            semis=self.arrangement.transpose.value()
-
-            def chord_notes(ch):
-                m=re.match(r"^([A-G](?:#|b)?)(m?)",ch or "")
-                if not m:
-                    return [60,64,67]
-                root=self._transpose_note_name(m.group(1),semis)
-                base=notes.get(root,60)
-                third=3 if m.group(2)=="m" else 4
-                return [base,base+third,base+7]
-
-            guitar=MidiTrack(); guitar.append(MetaMessage('track_name',name='Juweier Guitar',time=0)); mid.tracks.append(guitar)
-            bass=MidiTrack(); bass.append(MetaMessage('track_name',name='Juweier Bass',time=0)); mid.tracks.append(bass)
-            piano=MidiTrack(); piano.append(MetaMessage('track_name',name='Juweier Piano',time=0)); mid.tracks.append(piano)
-            drums=MidiTrack(); drums.append(MetaMessage('track_name',name='Juweier Drums',time=0)); mid.tracks.append(drums)
-
-            for row in self.chord_timeline:
-                chord=(row.get("chords") or ["C"])[0]
-                ns=chord_notes(chord)
-                gvel=48 if "é’¢ç´" in mode else 72
-                for beat in range(4):
-                    for n in ns:
-                        guitar.append(Message('note_on',note=n,velocity=gvel,time=0,channel=0))
-                    guitar.append(Message('note_off',note=ns[0],velocity=0,time=360,channel=0))
-                    for n in ns[1:]:
-                        guitar.append(Message('note_off',note=n,velocity=0,time=0,channel=0))
-                    guitar.append(Message('note_on',note=ns[0],velocity=1,time=120,channel=0))
-                    guitar.append(Message('note_off',note=ns[0],velocity=0,time=0,channel=0))
-
-                bbase=ns[0]-24
-                for beat in range(4):
-                    bn=bbase if beat%2==0 else bbase+7
-                    bass.append(Message('note_on',note=max(24,bn),velocity=78,time=0,channel=1))
-                    bass.append(Message('note_off',note=max(24,bn),velocity=0,time=480,channel=1))
-
-                pvel=48 if ("æœ¨å‰ä»–" in mode or "ä¸æ’ç”µ" in mode) else 68
-                for n in ns:
-                    piano.append(Message('note_on',note=n+12,velocity=pvel,time=0,channel=2))
-                piano.append(Message('note_off',note=ns[0]+12,velocity=0,time=1920,channel=2))
-                for n in ns[1:]:
-                    piano.append(Message('note_off',note=n+12,velocity=0,time=0,channel=2))
-
-                for eighth in range(8):
-                    simultaneous=[(42,45)]
-                    if eighth in (0,4):
-                        simultaneous.append((36,88))
-                    if eighth in (2,6):
-                        simultaneous.append((38,82))
-                    for note,vel in simultaneous:
-                        drums.append(Message('note_on',note=note,velocity=vel,time=0,channel=9))
-                    drums.append(Message('note_off',note=42,velocity=0,time=240,channel=9))
-                    for note,_ in simultaneous[1:]:
-                        drums.append(Message('note_off',note=note,velocity=0,time=0,channel=9))
-            mid.save(out)
-            self.arrangement_result={"mode":mode,"midi":out,"transpose":semis}
-            QMessageBox.information(self,"AI æ”¹ç¼– MIDI å®Œæˆ",f"å·²ç”Ÿæˆæ–°çš„ä¼´å¥ç¼–é… MIDIï¼š\n{out}\n\nä¸‹ä¸€é˜¶æ®µå¯ç”¨ç‹¬ç«‹éŸ³æºæ¸²æŸ“æˆå…¨æ–°çš„ WAV/MP3 ä¼´å¥ã€‚")
-        except Exception as e:
-            QMessageBox.critical(self,"ç”Ÿæˆ MIDI å¤±è´¥",str(e))
-
-
-    def choose_soundfont(self):
-        p,_ = QFileDialog.getOpenFileName(
-            self, "é€‰æ‹© SoundFont", "", "SoundFont (*.sf2 *.sf3);;æ‰€æœ‰æ–‡ä»¶ (*.*)"
-        )
-        if not p:
-            return
-        self.soundfont_path = p
-        if hasattr(self, "arrangement"):
-            self.arrangement.soundfont_edit.setText(p)
-
-    def _find_fluidsynth(self):
-        candidates = [
-            BASE_DIR/"runtime"/"fluidsynth"/"bin"/"fluidsynth.exe",
-            BASE_DIR/"runtime"/"fluidsynth"/"fluidsynth.exe",
-            BASE_DIR/"fluidsynth.exe",
-        ]
-        for p in candidates:
-            if p.exists():
-                return str(p)
-        from shutil import which
-        return which("fluidsynth") or ""
-
-    def _find_ffmpeg(self):
-        candidates = [
-            BASE_DIR/"runtime"/"ffmpeg"/"bin"/"ffmpeg.exe",
-            BASE_DIR/"runtime"/"ffmpeg"/"ffmpeg.exe",
-            BASE_DIR/"ffmpeg"/"ffmpeg.exe",
-        ]
-        for p in candidates:
-            if p.exists():
-                return str(p)
-        from shutil import which
-        return which("ffmpeg") or ""
-
-    def _resolve_arrangement_midi(self):
-        p = str(self.arrangement_result.get("midi","") if self.arrangement_result else "")
-        if p and Path(p).exists():
-            return p
-        QMessageBox.warning(self, "æç¤º", "è¯·å…ˆç”Ÿæˆâ€œæ–°ç¼–é… MIDIâ€ã€‚")
-        return ""
-
-    def render_arrangement_wav(self):
-        midi = self._resolve_arrangement_midi()
-        if not midi:
-            return
-        sf = self.arrangement.soundfont_edit.text().strip() if hasattr(self, "arrangement") else self.soundfont_path
-        if not sf or not Path(sf).exists():
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆé€‰æ‹©ä¸€ä¸ªåˆæ³•çš„ SoundFontï¼ˆ.sf2/.sf3ï¼‰ã€‚")
-            return
-        fluidsynth = self._find_fluidsynth()
-        if not fluidsynth:
-            QMessageBox.critical(
-                self, "ç¼ºå°‘ FluidSynth",
-                "æœªæ‰¾åˆ° fluidsynth.exeã€‚\nè¯·æŠŠ Windows FluidSynth æ”¾åˆ° runtime\\fluidsynth\\bin\\fluidsynth.exeï¼Œ"
-                "æˆ–å®‰è£…ååŠ å…¥ PATHã€‚"
-            )
-            return
-        out,_ = QFileDialog.getSaveFileName(
-            self, "æ¸²æŸ“æ–°ç¼–é… WAV",
-            str(EXPORTS_DIR/f"{Path(midi).stem}_render.wav"),
-            "WAV (*.wav)"
-        )
-        if not out:
-            return
-        try:
-            self.arrangement.progress.setValue(15)
-            QApplication.processEvents()
-            cmd = [
-                fluidsynth, "-ni", sf, midi,
-                "-F", out, "-r", "44100"
-            ]
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if p.returncode != 0 or not Path(out).exists():
-                raise RuntimeError((p.stderr or p.stdout or "FluidSynth æ¸²æŸ“å¤±è´¥")[-2000:])
-            self.arrangement.progress.setValue(100)
-            self.arrangement_result["render_wav"] = out
-            QMessageBox.information(self, "æ¸²æŸ“å®Œæˆ", f"å·²ç”Ÿæˆæ–°çš„ä¼´å¥ WAVï¼š\n{out}")
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self, "WAV æ¸²æŸ“å¤±è´¥", str(e))
-
-    def render_arrangement_mp3(self):
-        midi = self._resolve_arrangement_midi()
-        if not midi:
-            return
-        sf = self.arrangement.soundfont_edit.text().strip() if hasattr(self, "arrangement") else self.soundfont_path
-        if not sf or not Path(sf).exists():
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆé€‰æ‹© SoundFontã€‚")
-            return
-        fluidsynth = self._find_fluidsynth()
-        ffmpeg = self._find_ffmpeg()
-        if not fluidsynth:
-            QMessageBox.critical(self, "ç¼ºå°‘ FluidSynth", "æœªæ‰¾åˆ° fluidsynth.exeã€‚")
-            return
-        if not ffmpeg:
-            QMessageBox.critical(self, "ç¼ºå°‘ FFmpeg", "æœªæ‰¾åˆ° ffmpeg.exeï¼Œæ— æ³•ç¼–ç  MP3ã€‚")
-            return
-        out,_ = QFileDialog.getSaveFileName(
-            self, "æ¸²æŸ“æ–°ç¼–é… MP3",
-            str(EXPORTS_DIR/f"{Path(midi).stem}_render.mp3"),
-            "MP3 (*.mp3)"
-        )
-        if not out:
-            return
-        tmp = BASE_DIR/"temp"/f"{Path(midi).stem}_render_tmp.wav"
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.arrangement.progress.setValue(10)
-            QApplication.processEvents()
-            p1 = subprocess.run(
-                [fluidsynth, "-ni", sf, midi, "-F", str(tmp), "-r", "44100"],
-                capture_output=True, text=True, timeout=600
-            )
-            if p1.returncode != 0 or not tmp.exists():
-                raise RuntimeError(p1.stderr or p1.stdout or "FluidSynth æ¸²æŸ“å¤±è´¥")
-            self.arrangement.progress.setValue(75)
-            QApplication.processEvents()
-            p2 = subprocess.run(
-                [ffmpeg, "-y", "-i", str(tmp), "-codec:a", "libmp3lame", "-b:a", "320k", out],
-                capture_output=True, text=True, timeout=300
-            )
-            if p2.returncode != 0 or not Path(out).exists():
-                raise RuntimeError(p2.stderr[-2000:] if p2.stderr else "FFmpeg MP3 ç¼–ç å¤±è´¥")
-            self.arrangement.progress.setValue(100)
-            self.arrangement_result["render_mp3"] = out
-            QMessageBox.information(self, "æ¸²æŸ“å®Œæˆ", f"å·²ç”Ÿæˆæ–°çš„ä¼´å¥ MP3ï¼š\n{out}")
-        except Exception as e:
-            self.arrangement.progress.setValue(0)
-            QMessageBox.critical(self, "MP3 æ¸²æŸ“å¤±è´¥", str(e))
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-
-    def _musicxml_chord_parts(self, chord):
-        import re as _re
-        m=_re.match(r"^([A-G])([#b]?)(.*)$", chord or "C")
-        if not m:
-            return "C",0,"major"
-        step=m.group(1)
-        accidental=m.group(2)
-        suffix=m.group(3)
-        alter=1 if accidental=="#" else (-1 if accidental=="b" else 0)
-        kind_map={
-            "":"major","m":"minor","7":"dominant","maj7":"major-seventh",
-            "m7":"minor-seventh","sus4":"suspended-fourth","dim":"diminished"
-        }
-        return step,alter,kind_map.get(suffix,"major")
-
-    def export_musicxml(self):
-        if not self.chord_timeline:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå®Œæˆå’Œå¼¦/ä¹è°±åˆ†æã€‚")
-            return
-        song=Path(self.song_file).stem if self.song_file else "song"
-        p,_=QFileDialog.getSaveFileName(
-            self, "å¯¼å‡º MusicXML",
-            str(EXPORTS_DIR/f"{song}_Juweier.musicxml"),
-            "MusicXML (*.musicxml *.xml)"
-        )
-        if not p:
-            return
-        rows=self._score_rows_transposed()
-        key_map={"C":0,"G":1,"D":2,"A":3,"E":4,"B":5,"F#":6,"F":-1,"A#":-2,"D#":-3,"G#":-4,"C#":7}
-        target_key=self._transpose_note_name(
-            self.analysis_result.get("key","C"),
-            self.arrangement.transpose.value()
-        )
-        fifths=key_map.get(target_key,0)
-        parts=[]
-        for idx,row in enumerate(rows, start=1):
-            chord=(row.get("chords") or ["C"])[0]
-            step,alter,kind=self._musicxml_chord_parts(chord)
-            attrs=""
-            if idx==1:
-                attrs=f"""<attributes><divisions>1</divisions><key><fifths>{fifths}</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>"""
-            alter_xml=f"<root-alter>{alter}</root-alter>" if alter else ""
-            parts.append(
-                f"""<measure number="{idx}">{attrs}
-<harmony><root><root-step>{step}</root-step>{alter_xml}</root><kind>{kind}</kind></harmony>
-<direction placement="above"><direction-type><words>{html.escape(row.get("section",""))}</words></direction-type></direction>
-<note><rest/><duration>4</duration><type>whole</type></note>
-</measure>"""
-            )
-        xml=f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
-<score-partwise version="4.0">
-<work><work-title>{html.escape(song)}</work-title></work>
-<part-list><score-part id="P1"><part-name>Juweier Lead Sheet</part-name></score-part></part-list>
-<part id="P1">{''.join(parts)}</part>
-</score-partwise>"""
-        Path(p).write_text(xml,encoding="utf-8")
-        QMessageBox.information(self, "MusicXML å®Œæˆ", f"å·²ç”Ÿæˆï¼š\n{p}")
-
-    def export_melody_reference(self):
-        if not self.song_file:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå¯¼å…¥æ­Œæ›²ã€‚")
-            return
-        try:
-            import librosa
-            y,sr=librosa.load(self.song_file,sr=22050,mono=True)
-            refs=self._extract_melody_reference(y,sr)
-            self.melody_reference=refs
-            song=Path(self.song_file).stem
-            p,_=QFileDialog.getSaveFileName(
-                self, "å¯¼å‡ºä¸»æ—‹å¾‹å‚è€ƒ",
-                str(EXPORTS_DIR/f"{song}_melody_reference.csv"),
-                "CSV (*.csv)"
-            )
-            if not p:
-                return
-            lines=["start_seconds,end_seconds,note"]
-            for r in refs:
-                if r["end"]-r["start"] >= 0.08:
-                    lines.append(f'{r["start"]:.3f},{r["end"]:.3f},{r["note"]}')
-            Path(p).write_text("\n".join(lines),encoding="utf-8")
-            QMessageBox.information(
-                self,"ä¸»æ—‹å¾‹å‚è€ƒå®Œæˆ",
-                f"å·²ç”Ÿæˆå•å£°éƒ¨éŸ³é«˜å‚è€ƒï¼š\n{p}\n\nè¿™æ˜¯è‡ªåŠ¨éŸ³é«˜è·Ÿè¸ªç»“æœï¼Œä¸ç­‰åŒäºäººå·¥æ ¡å¯¹çš„ä¸»æ—‹å¾‹æ€»è°±ã€‚"
-            )
-        except Exception as e:
-            QMessageBox.critical(self,"ä¸»æ—‹å¾‹å‚è€ƒè½¬å†™å¤±è´¥",str(e))
-
-
-    def _root_midi(self, chord, octave=4):
-        import re as _re
-        m=_re.match(r"^([A-G])([#b]?)(m?)", chord or "C")
-        if not m:
-            return 60
-        pc={"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}[m.group(1)]
-        if m.group(2)=="#": pc+=1
-        elif m.group(2)=="b": pc-=1
-        return 12*(octave+1)+(pc%12)
-
-    def export_instrument_musicxml(self, instrument):
-        if not self.chord_timeline:
-            QMessageBox.warning(self,"æç¤º","è¯·å…ˆåˆ†ææ­Œæ›²å’Œå¼¦ã€‚")
-            return
-        song=Path(self.song_file).stem if self.song_file else "song"
-        p,_=QFileDialog.getSaveFileName(
-            self, f"å¯¼å‡º {instrument} MusicXML",
-            str(EXPORTS_DIR/f"{song}_{instrument}.musicxml"),
-            "MusicXML (*.musicxml)"
-        )
-        if not p: return
-        rows=self._score_rows_transposed()
-        measures=[]
-        for i,row in enumerate(rows,1):
-            chord=(row.get("chords") or ["C"])[0]
-            midi=self._root_midi(chord,3 if instrument=="bass" else 4)
-            step_names=["C","C","D","D","E","F","F","G","G","A","A","B"]
-            alters=[0,1,0,1,0,0,1,0,1,0,1,0]
-            pc=midi%12
-            octave=midi//12-1
-            step=step_names[pc]; alter=alters[pc]
-            alter_xml=f"<alter>{alter}</alter>" if alter else ""
-            attrs=""
-            if i==1:
-                clef="<sign>F</sign><line>4</line>" if instrument=="bass" else "<sign>G</sign><line>2</line>"
-                attrs=f"<attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time><clef>{clef}</clef></attributes>"
-            if instrument=="drums":
-                notes = """
-                <note><unpitched><display-step>G</display-step><display-octave>5</display-octave></unpitched><duration>2</duration><voice>1</voice><type>eighth</type><notehead>x</notehead></note>
-                <note><unpitched><display-step>C</display-step><display-octave>5</display-octave></unpitched><duration>2</duration><voice>1</voice><type>eighth</type></note>
-                <note><unpitched><display-step>G</display-step><display-octave>5</display-octave></unpitched><duration>2</duration><voice>1</voice><type>eighth</type><notehead>x</notehead></note>
-                <note><unpitched><display-step>F</display-step><display-octave>4</display-octave></unpitched><duration>2</duration><voice>1</voice><type>eighth</type></note>
-                """
-                notes = notes*2
-            elif instrument=="guitar":
-                # Quarter-note chord-root picking reference.
-                notes="".join([
-                    f"<note><pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch><duration>4</duration><type>quarter</type></note>"
-                    for _ in range(4)
-                ])
-            elif instrument=="piano":
-                notes=f"<note><pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch><duration>16</duration><type>whole</type></note>"
-            else:
-                notes="".join([
-                    f"<note><pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch><duration>8</duration><type>half</type></note>"
-                    for _ in range(2)
-                ])
-            measures.append(f"<measure number='{i}'>{attrs}{notes}</measure>")
-        part_name={"guitar":"Guitar","bass":"Bass","drums":"Drums","piano":"Piano"}.get(instrument,instrument)
-        xml=f"""<?xml version="1.0" encoding="UTF-8"?>
-<score-partwise version="4.0">
-<work><work-title>{html.escape(song)}</work-title></work>
-<part-list><score-part id="P1"><part-name>{part_name}</part-name></score-part></part-list>
-<part id="P1">{''.join(measures)}</part></score-partwise>"""
-        Path(p).write_text(xml,encoding="utf-8")
-        QMessageBox.information(self,"åˆ†è°±å®Œæˆ",f"å·²å¯¼å‡ºï¼š\n{p}")
-
-
-    def save_live_preset_file(self):
-        if not self.song_file:
-            return
-        song=Path(self.song_file).stem
-        p=BASE_DIR/"presets"/f"{song}.json"
-        p.parent.mkdir(parents=True,exist_ok=True)
-        data={
-            "song":self.song_file,
-            "tracks":{
-                key:{
-                    "mute":row.mute.isChecked(),
-                    "solo":row.solo.isChecked(),
-                    "volume":row.volume.value()
-                } for key,row in self.studio.rows.items()
-            },
-            "transpose":self.arrangement.transpose.value() if hasattr(self,"arrangement") else 0,
-            "live_transpose":self.live_pro.transpose.value() if hasattr(self,"live_pro") else 0,
-            "live_speed":self.live_pro.speed.value() if hasattr(self,"live_pro") else 1.0
-        }
-        p.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
-
-    def load_live_preset_file(self):
-        if not self.song_file:
-            return
-        p=BASE_DIR/"presets"/f"{Path(self.song_file).stem}.json"
-        if not p.exists():
-            return
-        try:
-            data=json.loads(p.read_text(encoding="utf-8"))
-            for key,val in data.get("tracks",{}).items():
-                if key in self.studio.rows:
-                    row=self.studio.rows[key]
-                    row.mute.setChecked(bool(val.get("mute",False)))
-                    row.solo.setChecked(bool(val.get("solo",False)))
-                    row.volume.setValue(int(val.get("volume",90)))
-            if hasattr(self,"arrangement"):
-                self.arrangement.transpose.setValue(int(data.get("transpose",0)))
-            if hasattr(self,"live_pro"):
-                self.live_pro.transpose.setValue(int(data.get("live_transpose",0)))
-                self.live_pro.speed.setValue(float(data.get("live_speed",1.0)))
-            self.sync_mix_controls()
-        except Exception:
-            pass
-
-    def load_project_file(self, path):
-        try:
-            path = Path(path)
-            data = json.loads(path.read_text(encoding="utf-8"))
-            source = Path(str(data.get("source_song") or ""))
-            if not source.is_file():
-                QMessageBox.warning(self, "æ‰“å¼€å·¥ç¨‹", f"å·¥ç¨‹æºéŸ³é¢‘ä¸å­˜åœ¨ï¼š\n{source}")
-                return
-            self.import_song(str(source))
-            self.markers = list(data.get("markers") or [])
-            self.analysis_result = dict(data.get("analysis") or {})
-            self.chord_timeline = list(data.get("chord_timeline") or [])
-            self.section_timeline = list(data.get("section_timeline") or [])
-            self.arrangement_result = dict(data.get("arrangement") or {})
-            self.melody_reference = list(data.get("melody_reference") or [])
-            self.manual_section_overrides = dict(data.get("manual_section_overrides") or {})
-            self.arrangement_variants = dict(data.get("arrangement_variants") or {"A": {}, "B": {}})
-            self.variant_audio = dict(data.get("variant_audio") or {"A": "", "B": ""})
-            self.arrangement_history = list(data.get("arrangement_history") or [])
-            stem_dir = Path(str(data.get("stem_dir") or ""))
-            if stem_dir.is_dir():
-                self.stem_dir = stem_dir
-                self.base_stem_dir = stem_dir
-                self.engine.load_folder(stem_dir)
-            for key, settings in (data.get("tracks") or {}).items():
-                if key in self.studio.rows:
-                    row = self.studio.rows[key]
-                    row.mute.setChecked(bool(settings.get("mute", False)))
-                    row.solo.setChecked(bool(settings.get("solo", False)))
-                    row.volume.setValue(int(settings.get("volume", 90)))
-            if hasattr(self, "arrangement"):
-                self.arrangement.transpose.setValue(int(data.get("score_transpose", 0)))
-                self.arrangement.soundfont_edit.setText(str(data.get("soundfont") or ""))
-            if hasattr(self, "live_pro"):
-                self.live_pro.transpose.setValue(int(data.get("live_transpose", 0)))
-                self.live_pro.speed.setValue(float(data.get("live_speed", 1.0)))
-            if hasattr(self, "setlist"): self.setlist.items = list(data.get("setlist") or [])
-            self.sync_mix_controls()
-            self.score_performance.refresh_score()
-            self.nav.setCurrentRow(3)
-            self.statusBar().showMessage(f"å·²æ‰“å¼€å·¥ç¨‹ï¼š{path.name}")
-        except Exception as exc:
-            QMessageBox.critical(self, "æ‰“å¼€å·¥ç¨‹å¤±è´¥", str(exc))
-
-    def save_project(self):
-        if not self.song_file:
-            QMessageBox.warning(self, "æç¤º", "å½“å‰æ²¡æœ‰æ­Œæ›²å·¥ç¨‹ã€‚")
-            return
-        data = {
-            "app": APP_NAME,
-            "version": VERSION,
-            "markers": self.markers,
-            "analysis": self.analysis_result,
-            "chord_timeline": self.chord_timeline,
-            "section_timeline": self.section_timeline,
-            "arrangement": self.arrangement_result,
-            "score_transpose": self.arrangement.transpose.value() if hasattr(self, "arrangement") else 0,
-            "soundfont": self.arrangement.soundfont_edit.text().strip() if hasattr(self, "arrangement") else "",
-            "melody_reference": self.melody_reference,
-            "score_follow_enabled": self.score_performance.auto_follow.isChecked() if hasattr(self, "score_performance") else True,
-            "instrument_profile": self.instrument_experience._profile_data() if hasattr(self, "instrument_experience") else {},
-            "all_player_profiles": self._current_player_profiles(),
-            "musical_intelligence_enabled": self.arrangement.musical_intelligence.isChecked() if hasattr(self, "arrangement") else True,
-            "energy_curve": self.arrangement.energy_curve.currentText() if hasattr(self, "arrangement") else "è‡ªåŠ¨åˆ¤æ–­",
-            "manual_section_overrides": self.manual_section_overrides,
-            "arrangement_variants": self.arrangement_variants,
-            "variant_audio": self.variant_audio,
-            "active_variant": self.active_variant,
-            "arrangement_history": self.arrangement_history,
-            "ab_gain": self.ab_gain,
-            "ab_current_variant": self.ab_current_variant,
-            "pipeline_enabled": True,
-            "setlist": self.setlist.items if hasattr(self, "setlist") else [],
-            "live_transpose": self.live_pro.transpose.value() if hasattr(self, "live_pro") else 0,
-            "live_speed": self.live_pro.speed.value() if hasattr(self, "live_pro") else 1.0,
-            "source_song": self.song_file,
-            "stem_dir": str(self.stem_dir) if self.stem_dir else None,
-            "tracks": {
-                key: {
-                    "mute": row.mute.isChecked(),
-                    "solo": row.solo.isChecked(),
-                    "volume": row.volume.value()
-                } for key, row in self.studio.rows.items()
-            }
-        }
-        default = PROJECTS_DIR / (Path(self.song_file).stem + ".novria.json")
-        p, _ = QFileDialog.getSaveFileName(self, "ä¿å­˜å·¥ç¨‹", str(default), "æ©˜å‘³å„¿éŸ³ä¹å·¥ç¨‹ (*.json)")
-        if not p:
-            return
-        Path(p).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        QMessageBox.information(self, "æˆåŠŸ", "å·¥ç¨‹å·²ä¿å­˜ã€‚")
-
-    def export_mix(self):
-        if not self.engine.files or not self.stem_dir:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå®Œæˆå…­è½¨åˆ†ç¦»ã€‚")
-            return
-        out, _ = QFileDialog.getSaveFileName(
-            self, "å¯¼å‡ºæ··éŸ³", str(EXPORTS_DIR / f"{Path(self.song_file).stem}_mix.wav"),
-            "WAV (*.wav)"
-        )
-        if not out:
-            return
-        try:
-            self.stop()
-            stems = {}
-            sr = None
-            max_frames = 0
-            solos = [k for k,v in self.engine.solo.items() if v]
-            active = set(solos) if solos else {k for k in self.engine.files if not self.engine.mute[k]}
-            for key, _, _ in STEM_ORDER:
-                if key not in active:
-                    continue
-                stem_path=self.stem_dir/f"{key}.wav"
-                if not stem_path.is_file():
-                    continue
-                data, this_sr = sf.read(str(stem_path), dtype="float32", always_2d=True)
-                sr = sr or this_sr
-                stems[key] = data * self.engine.volume[key]
-                max_frames = max(max_frames, len(data))
-            if not stems:
-                raise RuntimeError("æ²¡æœ‰å¯å¯¼å‡ºçš„æ´»åŠ¨éŸ³è½¨ã€‚")
-            ch = next(iter(stems.values())).shape[1]
-            mix = np.zeros((max_frames, ch), dtype=np.float32)
-            for data in stems.values():
-                mix[:len(data)] += data
-            peak = float(np.max(np.abs(mix)))
-            if peak > 0.98:
-                mix *= 0.98 / peak
-            sf.write(out, mix, sr, subtype="PCM_24")
-            QMessageBox.information(self, "å¯¼å‡ºå®Œæˆ", f"å·²å¯¼å‡ºï¼š\n{out}")
-        except Exception as e:
-            QMessageBox.critical(self, "å¯¼å‡ºå¤±è´¥", str(e))
-
-
-    def seek_ratio_direct(self, ratio):
-        try:
-            self.engine.seek_ratio(float(ratio))
-            if hasattr(self.studio, "timeline"):
-                self.studio.timeline.setValue(int(float(ratio)*1000))
-            if hasattr(self.studio, "waveform"):
-                self.studio.waveform.set_position(float(ratio))
-        except Exception:
-            pass
-
-    def analyze_music(self):
-        """è½»é‡æœ¬åœ°åˆ†æã€‚ä¼˜å…ˆ librosaï¼›æ²¡æœ‰æ—¶ç»™å‡ºæ˜ç¡®æç¤ºã€‚"""
-        if not self.song_file:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå¯¼å…¥æ­Œæ›²ã€‚")
-            return
-        try:
-            import librosa
-            y, sr = librosa.load(self.song_file, sr=None, mono=True, duration=180)
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            try:
-                tempo_val = float(np.asarray(tempo).reshape(-1)[0])
-            except Exception:
-                tempo_val = float(tempo)
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-            pitch_class = int(np.argmax(np.mean(chroma, axis=1)))
-            names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-            key = names[pitch_class]
-            self.analysis_result = {"bpm": round(tempo_val,1), "key": key}
-            self.studio.bpm_label.setText(f"BPMï¼š{tempo_val:.1f}")
-            self.studio.key_label.setText(f"è°ƒæ€§å‚è€ƒï¼š{key}")
-        except ImportError:
-            QMessageBox.information(self, "éœ€è¦åˆ†æç»„ä»¶",
-                "å½“å‰è¿è¡Œç¯å¢ƒæœªåŒ…å« librosaã€‚\né‡æ–°æ„å»º v0.4.0 EXE åä¼šè‡ªåŠ¨åŒ…å« BPM/è°ƒæ€§åˆ†æç»„ä»¶ã€‚")
-        except Exception as e:
-            QMessageBox.critical(self, "åˆ†æå¤±è´¥", str(e))
-
-    def add_marker(self):
-        if not self.engine.files:
-            QMessageBox.warning(self, "æç¤º", "è¯·å…ˆå®Œæˆåˆ†è½¨å¹¶åŠ è½½éŸ³è½¨ã€‚")
-            return
-        dur = self.engine.duration_seconds()
-        pos = self.engine.position_seconds()
-        ratio = (pos/dur) if dur > 0 else 0
-        dlg = MarkerDialog(self)
-        if dlg.exec() == QDialog.Accepted:
-            self.markers.append({"name": dlg.name(), "ratio": ratio, "seconds": pos})
-            self.markers.sort(key=lambda x: x["ratio"])
-            if hasattr(self.studio, "waveform"):
-                self.studio.waveform.set_markers(self.markers)
-
-    def load_waveform_if_ready(self):
-        try:
-            if self.stem_dir and hasattr(self.studio, "waveform"):
-                p = Path(self.stem_dir) / "vocals.wav"
-                if p.exists():
-                    self.studio.waveform.set_waveform_from_wav(p)
-        except Exception:
-            pass
-
-    def closeEvent(self, event: QCloseEvent):
-        library=getattr(self,"music_library",None)
-        workers=[getattr(self,"worker",None)]
-        if library is not None:
-            workers.extend([
-                getattr(library,"batch_worker",None),
-                getattr(library,"pipeline_batch_worker",None),
-            ])
-            workers.extend(list(getattr(library,"_catalog_workers",[])))
-            stage_worker=getattr(library,"pipeline_stage_worker",None)
-            if stage_worker and stage_worker.isRunning():
-                QMessageBox.information(
-                    self,"æ­£åœ¨å®‰å…¨å®Œæˆä»»åŠ¡",
-                    "å½“å‰åˆ†æ/ç¼–é…é˜¶æ®µä»åœ¨è¿è¡Œã€‚ä¸ºé˜²æ­¢å·¥ç¨‹æ–‡ä»¶æŸåï¼Œè¯·ç­‰å¾…æœ¬é˜¶æ®µå®Œæˆåå†å…³é—­è½¯ä»¶ã€‚"
-                )
-                event.ignore()
-                return
-        for worker in workers:
-            if worker and worker.isRunning():
-                try:
-                    if hasattr(worker,"stop"):
-                        worker.stop()
-                    else:
-                        worker.requestInterruption()
-                    worker.wait(3000)
-                except Exception:
-                    pass
-                if worker.isRunning():
-                    QMessageBox.information(
-                        self,"æ­£åœ¨åœæ­¢ AI ä»»åŠ¡",
-                        "å…­è½¨ä»»åŠ¡ä»åœ¨é‡Šæ”¾æ¨¡å‹èµ„æºï¼Œè¯·ç¨åå†å…³é—­è½¯ä»¶ã€‚"
-                    )
-                    event.ignore()
-                    return
-        self.engine.close()
-        event.accept()
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×^xïÄèµ©hºÚn¶X§zÍBš[\ÜŞ\Âš[\ÜÜ[]LÂš[\ÜÚ][š[\ÜÚ^š[\ÜZ[Y]\\Âš[\Ü\›X‹œ™\]Y\İš[\Ü\›X‹œ\œÙBš[\Ü\ÚX‚š[\ÜÜÂš[\ÜİXœ›ØÙ\ÜÂš[\ÜÙX˜œ›İÜÙ\‚š[\Ü[š[\Ü™Bš[\Ü]Y]YBš[\ÜØ]™Bš[\Üš\š[Bš[\ÜX]š[\Ü™XY[™Âš[\Ü[YKœÛÛ‹İXœ›ØÙ\ÜË˜XÙX˜XÚË]›Ü›K\›X‹œ™\]Y\İ\ÚX‹[ËÜÂ™œ›ÛH]Xˆ[\Ü]‚™œ›ÛH\œ›Ú™Xİİ][È[\Ü
+ˆ]ÛZX×İÜš]WÚœÛÛ‹ˆ›Ü›X[^™YÜ]ˆ™\Z\—İ^ˆØY™WÙš[WÜİ[Kˆ[š\]YWÚ[\ÜØØ[™Y]\ËˆØYÜŞ[˜ÙYÛ\šXÜËˆÜ]ÙİZ]\—Üİ[KŠB™œ›ÛH\]œ—ÜÙ\\˜]Üˆ[\Ü[—İ]œ—ÜÙ\\˜][Û‚™œ›ÛH\›Xœ˜\WØØ][ÙÈ[\Ü
+ˆUQS×ÑVS”ÒSÓ”ËˆØ][Ù×Ø\\İÛ˜[YKˆÛÛ›™XİØØ][ÙËˆ\İØØ][ÙËˆØØ[—ØØ][ÙËˆØØ[—ØØ][Ù×Ü›ÛİËˆİÛ›ØYÜX›X×Ø]Y[ËŠB™œ›ÛH\›Xœ˜\Wİ^Û›Û^H[\ÜQUSĞĞUQÓÔ’QTËTĞÓÕ‘T–WÕP”Â™œ›ÛH\›\šXÜ×ØZH[\ÜÙ[™\˜]WÛ\šXÜË\šXÜ×İ×Û˜Â™œ›ÛH\œÙ\™\—ÛXœ˜\WØÛY[[\Ü
+ˆQUSÔÑT•‘T—ÕT“ˆÙ\™\“Xœ˜\PÛY[ˆÙ\™\“Xœ˜\Q\œ›Ü‹ˆØYÙ\ÚİÜÜÙ\™\—ØÛÛ™šYËŠB‚š[\Ü[\H\Èœš[\ÜÛİ[™]šXÙH\ÈÙš[\ÜÛİ[™š[H\ÈÙ‚‚™œ›ÛHTÚYM‹”]ÛÜ™H[\ÜQš[R[™›Ë]TÚ^™KU™XYÚYÛ˜[U[Y\‹TÚ[‹T™Xİ‹TÙ][™ÜÂ™œ›ÛHTÚYM‹”]İZH[\ÜTZ[\‹T[‹PÛÛÜ‹PÛÜÙQ]™[RXÛÛ‹T^X\Q›Û™œ›ÛHTÚYM‹”]ÚYÙ]È[\Ü
+ˆP\XØ][Û‹SXZ[•Ú[™İËUÚYÙ]U›Ş^[İ]R›Ş^[İ]SX™[ˆT\Ú]Û‹Qš[QX[ÙËTÛY\‹QÜ›İ\›ŞSY\ÜØYÙP›ŞT›ÙÜ™\ÜĞ˜\‹ˆS\İÚYÙ]S\İÚYÙ]][KTİXÚÙYÚYÙ]QÜšY^[İ]QX[ÙĞ]Û›ŞUX›UÚYÙ]UX›UÚYÙ]][KUX•ÚYÙ]T˜Y[Ğ]Û‹Qš[TŞ\İ[S[Ù[U™YUÚYÙ]][KU™YUÚYÙ]TZ[•^Y]P]Û‘Ü›İ\U^œ›İÜÙ\‹TÜ[›ŞQİX›TÜ[›ŞQX[ÙËQ›Ü›S^[İ]S[™QY]PÛÛX›Ğ›ŞPÚXÚĞ›ŞR[œ]X[ÙÂŠB‚TÓSQHH¹ªf9dlùa/úgìù.d‚•‘T”ÒSÓˆHŒËŒËŒ‚”ÕSWÓÔ‘TˆHÂˆ
+›ØØ[È‹¼'ã©‹¹.®¹hì›ØØ[ŠKˆ
+™[\È‹¼'é`H‹ºo$È[\ÈŠKˆ
+˜˜\ÜÈ‹¼'ã®‹º-'y¥«È˜\ÜÈŠKˆ
+™İZ]\ˆ‹¼'ã®‹¹§*9d"y.åˆK‘İZ]\ˆŠKˆ
+™[XİšX×ÙİZ]\ˆ‹¼'ã®‹¹å-yd"y.åˆK‘İZ]\ˆŠKˆ
+œX[›È‹¼'ã®H‹ºd¨¹ä-X[›ÈŠKˆ
+›İ\ˆ‹¼'ã®È‹¹am¹.åˆİ\ˆŠK—B‚TÑWÑTˆH]
+×Ùš[W×ÊKœ™\ÛÛ™J
+Kœ\™[œ\™[”ÕST×ÑTˆHTÑWÑTˆÈœİ[\È‚”“Ò‘PÕ×ÑTˆHTÑWÑTˆÈœ›Ú™XİÈ‚‘VÔ•×ÑTˆHTÑWÑTˆÈ™^ÜÈ‚‘TÒÕÔÔÑT•‘T—ĞÓÓ‘’QÈHTÑWÑTˆÈ˜ÛÛ™šYÈˆÈ™\ÚİÜÜÙ\™\‹šœÛÛˆ‚‚TÔÑU×ÑTˆHTÑWÑTˆÈ˜\ÜÙ]È‚’PÓÓ”×ÑTˆHTÔÑU×ÑTˆÈšXÛÛœÈ‚‚™Yˆ\ÜÙ]Ü]
+
+œ\ÊN‚ˆ™]\›ˆİŠTÔÑU×ÑT‹š›Ú[œ]
+
+œ\ÊJB‚™YˆXÛÛ—Ü]
+˜[YJN‚ˆ™]\›ˆİŠPÓÓ”×ÑTˆÈˆÛ˜[Y_Kœ™ÈŠB‚™Yˆ\WØ]Û—ØXØÙ[
+]Û‹XØÙ[
+N‚ˆ]Û‹œÙ]›Ü\J˜XØÙ[‹XØÙ[
+Bˆ]Û‹œİ[J
+K[œÛ\Ú
+]ÛŠBˆ]Û‹œİ[J
+KœÛ\Ú
+]ÛŠB‚‚˜Û\ÜÈÙ\\˜][Û•ÛÜšÙ\ŠU™XY
+N‚ˆÙÈHÚYÛ˜[
+İŠBˆ[Ù[Ü›ÙÜ™\ÜÈHÚYÛ˜[
+[İŠBˆÙ\\˜][Û—Ü›ÙÜ™\ÜÈHÚYÛ˜[
+[İŠBˆÛ™HHÚYÛ˜[
+İŠBˆ˜Z[YHÚYÛ˜[
+İŠB‚ˆSÑSÕT“HšÎ‹ËÙ™˜˜Z\X›XÙš[\Ë˜ÛÛKÙ[]XÜËÚXœšYİ˜[œÙ›Ü›Y\‹ÍXÎL™‹LÍÌŒ˜ØØ‹‚ˆSÑSÑ’SHHXÎL™‹LÍÌŒ˜ØØ‹‚ˆSÑSÒTÒÔ‘Q’VHŒÍÌŒ˜ØØˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹[œ]Ùš[NˆİŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹š[œ]Ùš[HH[œ]Ùš[B‚ˆYˆÜØY™WÜİ™X[\ÊÙ[ŠN‚ˆÈR[œİ[\ˆÚ[™İÙYVH9.+HŞ\Ëœİİ]ÜŞ\Ëœİ\œˆ9cëú ïy..ˆ›Û™xà ‚ˆÈ9§ä9.¦ù."y¥®yn¤ù.ãy/&¹l'z+åHÜš]J
+{ï#9fè9«i9£ä9/¦ùk¢yaj9æ¡9a¡ykf:/¤ùaî¹­`yag9n¥xà ‚ˆYˆŞ\Ëœİİ]\È›Û™N‚ˆŞ\Ëœİİ]H[Ë”İš[™ÒSÊ
+BˆYˆŞ\Ëœİ\œˆ\È›Û™N‚ˆŞ\Ëœİ\œˆH[Ë”İš[™ÒSÊ
+B‚ˆYˆÜÚLM—ÛÚÊÙ[‹]ˆ]
+HOˆ›ÛÛ‚ˆÚHH\ÚX‹œÚLMŠ
+BˆÚ]]›Ü[Š	Ü˜‰ÊH\È‚ˆÚ[HYN‚ˆˆH‹œ™XY
+L
+ˆL
+BˆYˆ›İ‚ˆœ™XZÂˆÚK\]JŠBˆ™]\›ˆÚKš^YÙ\İ
+
+Kœİ\İÚ]
+Ù[‹“SÑSÒTÒÔ‘Q’V
+B‚ˆYˆÙ[œİ\™WÛ[Ù[
+Ù[ŠN‚ˆ[\ÜÜ˜ÚˆØXÚWÙ\ˆH]
+Ü˜ÚšX‹™Ù]Ù\Š
+JHÈ˜ÚXÚÜÚ[È‚ˆØXÚWÙ\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ\™Ù]HØXÚWÙ\ˆÈÙ[‹“SÑSÑ’SB‚ˆYˆ\™Ù]™^\İÊ
+N‚ˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+K¹¨à9­bù§+9g,RH9ª(yg¢Ë‹‹ˆŠBˆN‚ˆYˆÙ[‹—ÜÚLM—ÛÚÊ\™Ù]
+N‚ˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+LRH9akz/j9ª(yg¢ùmì¹k¢z(á{ï#9¥è:g :aãyi#y."ú/oHŠBˆ™]\›ˆ\™Ù]ˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆN‚ˆ\™Ù][›[šÊ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆ\H\™Ù]Ú]ÜİY™š^
+\™Ù]œİY™š^
+È‹œ\ŠBˆYˆ\™^\İÊ
+N‚ˆN‚ˆ\[›[šÊ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆÙ[‹›ÙË™[Z]
+ºi¥¹«(y/oùå*;ï&¹«hùg*9."ú/oHU”ˆ[]XÜ×ÍœÈ9akz/j9ª(yg¢Ë‹‹ˆŠBˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+º/ç¹£©HRH9ª(yg¢ù§#yb¨yfj‹‹ˆŠB‚ˆ™\HH\›X‹œ™\]Y\İ”™\]Y\İ
+ˆÙ[‹“SÑSÕT“ˆXY\œÏ^È•\Ù\‹PYÙ[ˆ’]ÙZY\‹S]\ÚXËÌËŒËŒŸBˆ
+BˆÚ]\›X‹œ™\]Y\İ\›Ü[Š™\K[Y[İ]MŒ
+H\È™\Ü\›Ü[ŠØˆŠH\È‚ˆİ[H[
+™\ÜšXY\œË™Ù]
+ÛÛ[S[™İŠHÜˆ
+BˆİÛ›ØYYHˆÚ[HYN‚ˆÚ[šÈH™\Üœ™XY
+L
+ˆLLŠBˆYˆ›İÚ[šÎ‚ˆœ™XZÂˆ‹Üš]JÚ[šÊBˆİÛ›ØYY
+ÏH[ŠÚ[šÊBˆYˆİ[ˆ‚ˆİHZ[ŠNK[
+İÛ›ØYY
+ˆLÈİ[
+JBˆXŒHHİÛ›ØYYÈLÈLˆXŒˆHİ[ÈLÈLˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+İˆ¹."ú/oHRH9ª(yg¢ÈÜİIH
+ÛXŒN‹ŒYŸKŞÛXŒ‹ŒYŸHPŠHŠBˆ[ÙN‚ˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+ˆ¹mì¹."ú/oHÙİÛ›ØYYÌLÌL‹ŒYŸHPˆŠB‚ˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+NK¹«hùg*9¨(zj£RH9ª(yg¢ùk£9¥m9 )Ë‹‹ˆŠBˆYˆ›İÙ[‹—ÜÚLM—ÛÚÊ\
+N‚ˆN‚ˆ\[›[šÊ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆ˜Z\ÙH[[YQ\œ›ÜŠRH9ª(yg¢ù¨(zj£9i,z-){ï#9."ú/oy¥¡ù.í¹cëú ïy.#yk£9¥m;ï#:+íúaãy¥¬9."ú/oxà ˆŠB‚ˆÜËœ™\XÙJ\\™Ù]
+BˆÙ[‹›[Ù[Ü›ÙÜ™\ÜË™[Z]
+LRH9akz/j9ª(yg¢ù."ú/oyk£9¢$ŠBˆ™]\›ˆ\™Ù]‚ˆYˆÜÙ\\˜][Û—ØØ[˜XÚÊÙ[‹[™›ÎˆXİ
+N‚ˆN‚ˆ]Y[×Û[™İHX^
+K[
+[™›Ë™Ù]
+˜]Y[×Û[™İ‹JJJBˆÙ™œÙ]HX^
+[
+[™›Ë™Ù]
+œÙYÛY[ÛÙ™œÙ]‹
+JJBˆİ]HH[™›Ë™Ù]
+œİ]H‹œİ\ŠBˆİH[
+Z[ŠNX^
+Ù™œÙ]
+ˆLÈ]Y[×Û[™İ
+JJBˆYˆİ]HOH™[™‚ˆİHZ[ŠNKİ
+ÈJBˆÙ[‹œÙ\\˜][Û—Ü›ÙÜ™\ÜË™[Z]
+İˆRH9akz/j9b!¹é®ù.+HÜİIHŠBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆ[ŠÙ[ŠN‚ˆN‚ˆÙ[‹—ÜØY™WÜİ™X[\Ê
+Bˆİ]Ù\ˆHÕST×ÑT‚ˆİ]Ù\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJB‚ˆ[\ÜÜ˜Úˆ]šXÙHH˜İYHˆYˆÜ˜Ú˜İYKš\×Ø]˜Z[X›J
+H[ÙH˜ÜH‚ˆÙ[‹›ÙË™[Z]
+ˆ•U”ˆ:/ä9ë¥ú+¯¹i!ûï&Ù]šXÙK\\Š
+_HŠB‚ˆİ[WÙ\‹İZ]\—ÙXYÛ›ÜİXÜÈH[—İ]œ—ÜÙ\\˜][ÛŠˆÙ[‹š[œ]Ùš[Kˆİ]Ù\‹ˆ]šXÙOY]šXÙKˆ›ÙÜ™\ÜÏ[[X™H˜[YK^ˆÙ[‹œÙ\\˜][Û—Ü›ÙÜ™\ÜË™[Z]
+[
+˜[YJKİŠ^
+JKˆ
+BˆÙ[‹œÙ\\˜][Û—Ü›ÙÜ™\ÜË™[Z]
+L•U”ˆ9akz/j
+È9âë9êâùå-yd"y.å¹b!¹é®ùk£9¢$ŠBˆÙ[‹›ÙË™[Z]
+ˆ•U”ˆ9akz/j9ª(yg¢ùi!9ä!¹k£9¢$;ï&ùmì¹å'ù¢$9âë9êâù§*9d"y.å¹.#¹å-yd"y.åº/j8à ˆ‚ˆˆˆ9å-yd"y.å¹­.ú-àùn©ˆÙİZ]\—ÙXYÛ›ÜİXÜÖÉÙ[XİšX×ØXİ]š]I×N‹Œ	_xà ˆ‚ˆ
+BˆÙ[‹™Û™K™[Z]
+İŠİ[WÙ\ŠJBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹™˜Z[Y™[Z]
+ˆÙ_W—İ˜XÙX˜XÚË™›Ü›X]Ù^Ê
+_HŠB‚‚˜Û\ÜÈ\[[™TİYÙUÛÜšÙ\ŠU™XY
+N‚ˆˆˆ”[ˆÔKZX]H›Û‹T]İYÙ\ÈÚ]İ]œ™Y^š[™ÈH[\™˜XÙKˆˆˆ‚‚ˆİXØÙYYYHÚYÛ˜[
+
+Bˆ˜Z[YHÚYÛ˜[
+İŠB‚ˆYˆ×Ú[š]×ÊÙ[‹Ü\˜][ÛŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›Ü\˜][ÛˆHÜ\˜][Û‚‚ˆYˆ[ŠÙ[ŠN‚ˆN‚ˆÙ[‹›Ü\˜][ÛŠ
+BˆÙ[‹œİXØÙYYY™[Z]
+
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™˜Z[Y™[Z]
+ˆİ\J^ÊK—×Û˜[YW×ßNˆÙ^ßWİ˜XÙX˜XÚË™›Ü›X]Ù^Ê
+_HŠB‚‚˜Û\ÜÈÙ\™\Ø][ÙÕÛÜšÙ\ŠU™XY
+N‚ˆˆˆ‘™]ÚHÙ\™\ˆØ][ÙÈÚ]İ]]™\ˆ›ØÚÚ[™ÈHÚ[™İÜÈRH™XYˆˆˆ‚‚ˆİXØÙYYYHÚYÛ˜[
+[Øš™Xİ
+Bˆ˜Z[YHÚYÛ˜[
+[İŠB‚ˆYˆ×Ú[š]×ÊÙ[‹™\]Y\İÚYÛY[]Y\KØ]YÛÜK[š]X[H¹aj:`ê‹Ú[˜ÙOL
+N‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹œ™\]Y\İÚYH[
+™\]Y\İÚY
+BˆÙ[‹˜ÛY[HÛY[ˆÙ[‹œ]Y\HHİŠ]Y\JBˆÙ[‹˜Ø]YÛÜHHİŠØ]YÛÜJBˆÙ[‹š[š]X[HİŠ[š]X[
+BˆÙ[‹œÚ[˜ÙHH[
+Ú[˜ÙHÜˆ
+B‚ˆYˆ[ŠÙ[ŠN‚ˆN‚ˆÙ[‹œİXØÙYYY™[Z]
+ˆÙ[‹œ™\]Y\İÚYˆÙ[‹˜ÛY[œÛÛ™ÜÊˆÙ[‹œ]Y\KÙ[‹˜Ø]YÛÜK[š]X[\Ù[‹š[š]X[Ú[˜ÙO\Ù[‹œÚ[˜ÙKˆ
+Kˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™˜Z[Y™[Z]
+Ù[‹œ™\]Y\İÚYİŠ^ÊJB‚‚˜Û\ÜÈÙ\™\\Y˜XİØXÚUÛÜšÙ\ŠU™XY
+N‚ˆˆˆ‘İÛ›ØYX›\ÚYRH\ÜÙ]È[ˆH˜XÚÙÜ›İ[™ÛÈÜ[š[™ÈHÛÛ™È™]™\ˆœ™Y^™\Ëˆˆˆ‚‚ˆÛ™HHÚYÛ˜[
+Øš™Xİ
+Bˆ˜Z[YHÚYÛ˜[
+İŠB‚ˆYˆ×Ú[š]×ÊÙ[‹ÛY[\Y˜XİË\İ[˜][ÛŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹˜ÛY[HÛY[ˆÙ[‹˜\Y˜XİÈHXİ
+\Y˜XİÈÜˆßJBˆÙ[‹™\İ[˜][ÛˆH]
+\İ[˜][ÛŠB‚ˆYˆ[ŠÙ[ŠN‚ˆ˜[Y\ÈHÂˆœİ[Wİ›ØØ[Èˆ›ØØ[ËØ]ˆ‹œİ[WÙ[\Èˆ™[\ËØ]ˆ‹œİ[WØ˜\ÜÈˆ˜˜\ÜËØ]ˆ‹ˆœİ[WÙİZ]\ˆˆ™İZ]\‹Ø]ˆ‹œİ[WÙ[XİšX×ÙİZ]\ˆˆ™[XİšX×ÙİZ]\‹Ø]ˆ‹ˆœİ[WÜX[›ÈˆœX[›ËØ]ˆ‹œİ[WÛİ\ˆˆ›İ\‹Ø]ˆ‹ˆœØÛÜ™WÙ]HˆœØÛÜ™WÙ]KšœÛÛˆ‹›\šXÜ×İ[Y[[™Hˆ›\šXÜ×İ[Y[[™KšœÛÛˆ‹ˆ›]\ÚXŞ[ˆ›XYÜÚY]›]\ÚXŞ[‹™[XİšX×ÙİZ]\—Ü™\Üˆ™İZ]\—ÜÙXÛÛ™ÜİYÙKšœÛÛˆ‹ˆBˆİY™š^\ÈHÂˆ›XYÜÚY]ˆ‹š[‹™İZ]\—İXˆˆ‹š[‹˜XÛİ\İX×ÙİZ]\—İXˆˆ‹š[‹ˆ™[XİšX×ÙİZ]\—İXˆˆ‹š[‹˜˜\Ü×ÜØÛÜ™Hˆ‹š[‹™[WÜØÛÜ™Hˆ‹š[‹ˆœX[›×ÜØÛÜ™Hˆ‹š[‹˜\œ˜[™Ù[Y[ÛZYHˆ‹›ZY‹ˆBˆİÛ›ØYYHßBˆN‚ˆ›ÜˆÙ^K\›[ˆÙ[‹˜\Y˜XİËš][\Ê
+N‚ˆ˜[YHH˜[Y\Ë™Ù]
+Ù^JHÜˆˆÜØY™WÙš[WÜİ[JÙ^J_^ÜİY™š^\Ë™Ù]
+Ù^K	ÉÊ_H‚ˆ\™Ù]HÙ[‹™\İ[˜][ÛˆÈ˜[YBˆYˆ›İ\™Ù]š\×Ùš[J
+HÜˆ\™Ù]œİ]
+
+KœİÜÚ^™HOH‚ˆÙ[‹˜ÛY[™İÛ›ØY
+İŠ\›
+K\™Ù]
+BˆİÛ›ØYYÚÙ^WHHİŠ\™Ù]
+BˆÙ[‹™Û™K™[Z]
+İÛ›ØYY
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™˜Z[Y™[Z]
+İŠ^ÊJB‚‚˜Û\ÜÈ[šÑİÛ›ØYÛÜšÙ\ŠU™XY
+N‚ˆ›ÙÜ™\ÜÈHÚYÛ˜[
+[İŠBˆÛ™HHÚYÛ˜[
+İŠBˆ˜Z[YHÚYÛ˜[
+İŠB‚ˆYˆ×Ú[š]×ÊÙ[‹\›\İ[˜][Û‹™›\Y×Ü]HˆŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹\›HİŠ\›
+Kœİš\
+
+BˆÙ[‹™\İ[˜][ÛˆH]
+\İ[˜][ÛŠBˆÙ[‹™™›\Y×Ü]HİŠ™›\Y×Ü]ÜˆˆŠB‚ˆYˆ[ŠÙ[ŠN‚ˆN‚ˆ]HİÛ›ØYÜX›X×Ø]Y[ÊˆÙ[‹\›Ù[‹™\İ[˜][Û‹Ù[‹™™›\Y×Ü]ˆ[X™H˜[YK^ˆÙ[‹œ›ÙÜ™\ÜË™[Z]
+[
+˜[YJKİŠ^
+JKˆ
+BˆÙ[‹™Û™K™[Z]
+İŠ]
+JBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™˜Z[Y™[Z]
+ˆİ\J^ÊK—×Û˜[YW×ßNˆÙ^ßHŠB‚‚˜Û\ÜÈ™[[İSXœ˜\R›Ø•ÛÜšÙ\ŠU™XY
+N‚ˆˆˆ”]Y]YH[™[Ûš]ÜˆÛ™HÙ\™\‹[İÛ™YXœ˜\H›ØÙ\ÜÚ[™È›Ø‹ˆˆˆ‚‚ˆ›ÙÜ™\ÜÈHÚYÛ˜[
+[İŠBˆÛ™HHÚYÛ˜[
+İ‹Øš™Xİ
+Bˆ˜Z[YHÚYÛ˜[
+İŠB‚ˆYˆ×Ú[š]×ÊÙ[‹ÛY[˜XÚ×ÚY\™[S›Û™JN‚ˆİ\\Š
+K—×Ú[š]×Ê\™[
+BˆÙ[‹˜ÛY[HÛY[ˆÙ[‹˜XÚ×ÚYH[
+˜XÚ×ÚY
+B‚ˆYˆ[ŠÙ[ŠN‚ˆN‚ˆ]Y]YYHÙ[‹˜ÛY[œ]Y]YWÜ›ØÙ\ÜÚ[™ÊÙ[‹˜XÚ×ÚY
+Bˆ›Ø—ÚYHİŠ]Y]YY™Ù]
+š›Ø—ÚYŠHÜˆ]Y]YY™Ù]
+šYŠHÜˆˆŠBˆYˆ›İ›Ø—ÚY‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹§#yb¨yfj9§*º/å9fçˆ›Ø—ÚYŠBˆÚ[H›İÙ[‹š\Ò[\œ\[Û”™\]Y\İY
+
+N‚ˆ™\İ[HÙ[‹˜ÛY[š›ØŠ›Ø—ÚY
+Bˆİ]\ÈHİŠ™\İ[™Ù]
+œİ]\ÈŠHÜˆœ›ØÙ\ÜÚ[™ÈŠK›İÙ\Š
+Bˆ˜[YHH[
+›Ø]
+™\İ[™Ù]
+œ›ÙÜ™\ÜÈŠHÜˆ
+JBˆİYÙHHİŠ™\İ[™Ù]
+œİYÙHŠHÜˆ¹§#yb¨yfj9i!9ä!¹.+HŠBˆÙ[‹œ›ÙÜ™\ÜË™[Z]
+X^
+Z[ŠL˜[YJJKİYÙJBˆYˆİ]\È[ˆÈ˜ÛÛ\]Y‹˜ÛÛ\]H‹™Û™H‹œİXØÙ\ÜÈ‹œİXØÙYYYŸN‚ˆÙ[‹™Û™K™[Z]
+›Ø—ÚYXİ
+™\İ[™Ù]
+˜\Y˜XİÈŠHÜˆßJJBˆ™]\›‚ˆYˆİ]\È[ˆÈ™˜Z[Y‹™\œ›Üˆ‹˜Ø[˜Ù[Y‹˜Ø[˜Ù[YŸN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠİŠ™\İ[™Ù]
+™\œ›ÜˆŠHÜˆ™\İ[™Ù]
+›Y\ÜØYÙHŠHÜˆ¹§#yb¨yfj9.îùb¨yi,z-)HŠJBˆÙ[‹›\ÛY\
+Œ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™˜Z[Y™[Z]
+ˆİ\J^ÊK—×Û˜[YW×ßNˆÙ^ßHŠB‚‚˜Û\ÜÈ][Tİ[Q[™Ú[™N‚ˆYˆ×Ú[š]×ÊÙ[ŠN‚ˆÙ[‹™š[\ÈHßBˆÙ[‹œİ™X[HH›Û™BˆÙ[‹œØ[\WÜ˜]HHLˆÙ[‹˜Ú[›™[ÈH‚ˆÙ[‹œ^Z[™ÈH˜[ÙBˆÙ[‹œ]\ÙYH˜[ÙBˆÙ[‹›]]HHÚÎˆ˜[ÙH›ÜˆËËÈ[ˆÕSWÓÔ‘TŸBˆÙ[‹œÛÛÈHÚÎˆ˜[ÙH›ÜˆËËÈ[ˆÕSWÓÔ‘TŸBˆÙ[‹›Û[YHHÚÎˆH›ÜˆËËÈ[ˆÕSWÓÔ‘TŸBˆÙ[‹™œ˜[Y\×Ü^YYHˆÙ[‹İ[Ùœ˜[Y\ÈHˆÙ[‹œÜYYHKŒˆÙ[‹—Ú[×ÛØÚÈH™XY[™Ë”“ØÚÊ
+B‚ˆYˆØY
+Ù[‹İ[WÙ\ˆ]
+N‚ˆÙ[‹˜ÛÜÙJ
+Bˆ]ÈHßBˆ›ÜˆÙ^KËÈ[ˆÕSWÓÔ‘T‚ˆHİ[WÙ\ˆÈˆÚÙ^_KØ]ˆ‚ˆYˆ›İ™^\İÊ
+N‚ˆYˆÙ^HOH™[XİšX×ÙİZ]\ˆ‚ˆÛÛ[YBˆ˜Z\ÙHš[S›İ›İ[™\œ›ÜŠˆ¹ï.¹l$zgìú/j;ï&Ü›˜[Y_HŠBˆ]ÖÚÙ^WHH‚ˆ[™›ÈHÙ‹š[™›ÊİŠ]ÖÈ›ØØ[È—JJBˆÙ[‹œØ[\WÜ˜]HH[™›ËœØ[\\˜]BˆÙ[‹˜Ú[›™[ÈH[™›Ë˜Ú[›™[ÂˆÙ[‹İ[Ùœ˜[Y\ÈH[™›Ë™œ˜[Y\ÂˆÙ[‹™œ˜[Y\×Ü^YYH‚ˆ›ÜˆÙ^K[ˆ]Ëš][\Ê
+N‚ˆˆHÙ‹”Ûİ[™š[JİŠ
+KœˆŠBˆYˆ‹œØ[\\˜]HOHÙ[‹œØ[\WÜ˜]HÜˆ‹˜Ú[›™[ÈOHÙ[‹˜Ú[›™[Î‚ˆ‹˜ÛÜÙJ
+Bˆ˜Z\ÙH[[YQ\œ›ÜŠˆÚÙ^_KØ]ˆ9æ¡:aáù¨-ùã¡ù¢%¹hì:`dù.#¹am¹.åºgìú/j9.#y. :!íŠBˆÙ[‹™š[\ÖÚÙ^WHH‚‚ˆYˆØØ[˜XÚÊÙ[‹İ]]Kœ˜[Y\Ë[YWÚ[™›Ëİ]\ÊN‚ˆYˆÙ[‹œ]\ÙYÜˆ›İÙ[‹œ^Z[™Î‚ˆİ]]K™š[
+
+Bˆ™]\›‚‚ˆÛÛÜÈHÚÈ›ÜˆËˆ[ˆÙ[‹œÛÛËš][\Ê
+HYˆ—BˆXİ]™HHÙ]
+ÛÛÜÊHYˆÛÛÜÈ[ÙHÚÈ›ÜˆÈ[ˆÙ[‹™š[\ÈYˆ›İÙ[‹›]]VÚ×_B‚ˆÛİ\˜ÙWÙœ˜[Y\ÈHX^
+K[
+X]˜ÙZ[
+œ˜[Y\È
+ˆÙ[‹œÜYY
+JJBˆZ^Hœ™\›ÜÊ
+œ˜[Y\ËÙ[‹˜Ú[›™[ÊK\O[œ™›Ø]ÌŠBˆ˜[YÙœ˜[Y\ÈHœ˜[Y\Â‚ˆÚ]Ù[‹—Ú[×ÛØÚÎ‚ˆ›ÜˆÙ^Kˆ[ˆÙ[‹™š[\Ëš][\Ê
+N‚ˆ]HH‹œ™XY
+Ûİ\˜ÙWÙœ˜[Y\Ë\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆˆH[Š]JBˆİ]]ØÛİ[HZ[Šœ˜[Y\ËX^
+[
+ˆÈÙ[‹œÜYY
+JJBˆ˜[YÙœ˜[Y\ÈHZ[Š˜[YÙœ˜[Y\Ëİ]]ØÛİ[
+BˆYˆÙ^H[ˆXİ]™H[™ˆ[™İ]]ØÛİ[‚ˆYˆˆOHİ]]ØÛİ[‚ˆ™[™\™YH]Bˆ[ÙN‚ˆÛÜÜÚ][ÛœÈHœ˜\˜[™ÙJ‹\O[œ™›Ø]ÌŠBˆ™]×ÜÜÚ][ÛœÈHœ›[œÜXÙJX^
+ˆHJKİ]]ØÛİ[\O[œ™›Ø]ÌŠBˆ™[™\™YHœ˜ÛÛ[[—ÜİXÚÊÂˆœš[\œ
+™]×ÜÜÚ][ÛœËÛÜÜÚ][ÛœË]VÎ‹Ú[›™[JBˆ›ÜˆÚ[›™[[ˆ˜[™ÙJÙ[‹˜Ú[›™[ÊBˆJK˜\İ\Jœ™›Ø]ÌŠBˆZ^Î›İ]]ØÛİ[H
+ÏH™[™\™Y
+ˆ›Ø]
+Ù[‹›Û[YVÚÙ^WJBˆYˆÙ[‹™š[\Î‚ˆÙ[‹™œ˜[Y\×Ü^YYHZ[Š[
+‹[
+
+JH›Üˆˆ[ˆÙ[‹™š[\Ë˜[Y\Ê
+JB‚ˆYˆ˜[YÙœ˜[Y\ÈH‚ˆİ]]K™š[
+
+BˆÙ[‹œ^Z[™ÈH˜[ÙBˆ˜Z\ÙHÙØ[˜XÚÔİÜ
+
+B‚ˆÈ9ë 9cezf,¹bb¹¬è¸à ¹d#¹îëyâb9§+9/&¹£h¹¢$[Z]\ˆÈX\İ\ˆ\øà ‚ˆXZÈH›Ø]
+œ›X^
+œ˜XœÊZ^
+JJHYˆZ^œÚ^™H[ÙHŒˆYˆXZÈˆKŒ‚ˆZ^ÏHXZÂ‚ˆİ]]VÎ—HHZ^ˆYˆ˜[YÙœ˜[Y\Èœ˜[Y\Î‚ˆİ]]Vİ˜[YÙœ˜[Y\Î—HHˆÙ[‹œ^Z[™ÈH˜[ÙBˆ˜Z\ÙHÙØ[˜XÚÔİÜ
+
+B‚ˆYˆ^JÙ[ŠN‚ˆYˆ›İÙ[‹™š[\Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠº/æ9¬¨y§"yb¨:/oyb!º/j8à ˆŠBˆYˆÙ[‹œİ™X[H\È›Û™N‚ˆÙ[‹œİ™X[HHÙ“İ]]İ™X[JˆØ[\\˜]O\Ù[‹œØ[\WÜ˜]KˆÚ[›™[Ï\Ù[‹˜Ú[›™[Ëˆ\OH™›Ø]Ìˆ‹ˆ›ØÚÜÚ^™OLLˆØ[˜XÚÏ\Ù[‹—ØØ[˜XÚÂˆ
+BˆÙ[‹œİ™X[Kœİ\
+
+BˆÙ[‹œ^Z[™ÈHYBˆÙ[‹œ]\ÙYH˜[ÙB‚ˆYˆ]\ÙJÙ[ŠN‚ˆÙ[‹œ]\ÙYHYB‚ˆYˆ™\İ[YJÙ[ŠN‚ˆYˆ›İÙ[‹™š[\Î‚ˆ™]\›‚ˆYˆÙ[‹œİ™X[H\È›Û™N‚ˆÙ[‹œ^J
+Bˆ[ÙN‚ˆÙ[‹œ^Z[™ÈHYBˆÙ[‹œ]\ÙYH˜[ÙB‚ˆYˆİÜ
+Ù[ŠN‚ˆÙ[‹œ^Z[™ÈH˜[ÙBˆÙ[‹œ]\ÙYH˜[ÙBˆYˆÙ[‹œİ™X[N‚ˆN‚ˆÙ[‹œİ™X[KœİÜ
+
+BˆÙ[‹œİ™X[K˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹œİ™X[HH›Û™Bˆ›Üˆˆ[ˆÙ[‹™š[\Ë˜[Y\Ê
+N‚ˆN‚ˆ‹œÙYZÊ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹™œ˜[Y\×Ü^YYH‚ˆYˆÛÜÙJÙ[ŠN‚ˆÙ[‹œİÜ
+
+Bˆ›Üˆˆ[ˆÙ[‹™š[\Ë˜[Y\Ê
+N‚ˆN‚ˆ‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹™š[\ÈHßB‚ˆYˆÙYZ×Ü˜][ÊÙ[‹˜][Îˆ›Ø]
+N‚ˆYˆ›İÙ[‹™š[\ÈÜˆÙ[‹İ[Ùœ˜[Y\ÈH‚ˆ™]\›‚ˆÜÈH[
+X^
+ŒZ[ŠKŒ˜][ÊJH
+ˆÙ[‹İ[Ùœ˜[Y\ÊBˆÚ]Ù[‹—Ú[×ÛØÚÎ‚ˆ›Üˆˆ[ˆÙ[‹™š[\Ë˜[Y\Ê
+N‚ˆ‹œÙYZÊÜÊBˆÙ[‹™œ˜[Y\×Ü^YYHÜÂ‚ˆYˆÙ]ÜÜYY
+Ù[‹˜[YNˆ›Ø]
+N‚ˆÙ[‹œÜYYHX^
+KZ[ŠKK›Ø]
+˜[YJJJB‚ˆYˆÜÚ][Û—ÜÙXÛÛ™ÊÙ[ŠN‚ˆ™]\›ˆÙ[‹™œ˜[Y\×Ü^YYÈÙ[‹œØ[\WÜ˜]HYˆÙ[‹œØ[\WÜ˜]H[ÙH‚ˆYˆ\˜][Û—ÜÙXÛÛ™ÊÙ[ŠN‚ˆ™]\›ˆÙ[‹İ[Ùœ˜[Y\ÈÈÙ[‹œØ[\WÜ˜]HYˆÙ[‹œØ[\WÜ˜]H[ÙH‚˜Û\ÜÈ˜XÚÔ›İÊUÚYÙ]
+N‚ˆÚ[™ÙYHÚYÛ˜[
+
+BˆYˆ×Ú[š]×ÊÙ[‹Ù^KXÛÛ‹˜[YJN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹šÙ^HHÙ^Bˆ^[İ]HR›Ş^[İ]
+Ù[ŠBˆ^[İ]œÙ]ÛÛ[ÓX\™Ú[œÊKJB‚ˆX™[HSX™[
+ˆÚXÛÛŸHÛ˜[Y_HŠBˆ˜XÚ×ØÛÛÜœÈHÈ›ØØ[ÈˆˆĞŒÌQ‘ˆ‹™[\ÈˆˆÑ‘ŒÑ‹˜˜\ÜÈˆˆÌĞĞN‘ˆ‹™İZ]\ˆˆˆÍÍQMÈ‹™[XİšX×ÙİZ]\ˆˆˆÑ‘PH‹œX[›ÈˆˆÌÍQ‘‹›İ\ˆˆˆÑÌÈŸBˆX™[œÙ]İ[TÚY]
+ˆ™›Û]ÙZYÚÌØÛÛÜİ˜XÚ×ØÛÛÜœË™Ù]
+Ù^K	ÈÑPQŒ‘‰Ê_NÈŠBˆX™[œÙ]Z[š[][UÚY
+MÌ
+BˆÙ[‹›]]HHT\Ú]ÛŠ“HŠBˆÙ[‹›]]KœÙ]ÚXÚØX›JYJBˆÙ[‹›]]KœÙ]š^YÚY
+ŠBˆÙ[‹œÛÛÈHT\Ú]ÛŠ”ÈŠBˆÙ[‹œÛÛËœÙ]ÚXÚØX›JYJBˆÙ[‹œÛÛËœÙ]š^YÚY
+ŠBˆÙ[‹›Û[YHHTÛY\Š]’Üš^›Û[
+BˆÙ[‹›Û[YKœÙ]˜[™ÙJLŒ
+BˆÙ[‹›Û[YKœÙ]˜[YJL
+BˆÙ[‹˜[YWÛX™[HSX™[
+L	HŠBˆÙ[‹˜[YWÛX™[œÙ]š^YÚY
+JB‚ˆÙ[‹›]]KÙÙÛY˜ÛÛ›™Xİ
+[X™HÎˆÙ[‹˜Ú[™ÙY™[Z]
+
+JBˆÙ[‹œÛÛËÙÙÛY˜ÛÛ›™Xİ
+[X™HÎˆÙ[‹˜Ú[™ÙY™[Z]
+
+JBˆÙ[‹›Û[YK˜[YPÚ[™ÙY˜ÛÛ›™Xİ
+Ù[‹›Û—İ›Û[YJB‚ˆ^[İ]˜YÚYÙ]
+X™[
+Bˆ^[İ]˜YÚYÙ]
+Ù[‹›]]JBˆ^[İ]˜YÚYÙ]
+Ù[‹œÛÛÊBˆ^[İ]˜YÚYÙ]
+SX™[
+ºgìúaãÈŠJBˆ^[İ]˜YÚYÙ]
+Ù[‹›Û[YKJBˆ^[İ]˜YÚYÙ]
+Ù[‹˜[YWÛX™[
+B‚ˆYˆÛ—İ›Û[YJÙ[‹ŠN‚ˆÙ[‹˜[YWÛX™[œÙ]^
+ˆİŸIHŠBˆÙ[‹˜Ú[™ÙY™[Z]
+
+B‚˜Û\ÜÈİY[ÔYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠB‚ˆ]HHSX™[
+RH9akz/j9b!¹é®È
+È9å-yd"y.å¹.£9«(yb!¹é®ÈÈ9i&º/j9méy/g9cìŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆš[WÜ›İÈHR›Ş^[İ]
+
+BˆÙ[‹™š[WÛX™[HSX™[
+¹l&¹§*¹kï9aiy«c9¦ìˆŠBˆ—Ú[\ÜHT\Ú]ÛŠRXÛÛŠXÛÛ—Ü]
+š[\ÜŠJK¹kï9aiy«c9¦ìˆŠBˆ—Ú[\Ü˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹š[\ÜÜÛÛ™ÊBˆÙ[‹˜—ÜÜ]HT\Ú]ÛŠRXÛÛŠXÛÛ—Ü]
+œÜ]ŠJKRH9akz/j9b!¹é®È
+È9å-yd"y.å¹.£9«(yb!¹é®ÈŠBˆ\WØ]Û—ØXØÙ[
+Ù[‹˜—ÜÜ]œš[X\HŠBˆÙ[‹˜—ÜÜ]˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œİ\ÜÙ\\˜][ÛŠBˆš[WÜ›İË˜YÚYÙ]
+Ù[‹™š[WÛX™[JBˆš[WÜ›İË˜YÚYÙ]
+—Ú[\Ü
+Bˆš[WÜ›İË˜YÚYÙ]
+Ù[‹˜—ÜÜ]
+Bˆ^[İ]˜Y^[İ]
+š[WÜ›İÊB‚ˆ˜[œÜÜHR›Ş^[İ]
+
+BˆÙ[‹œ^WØˆHT\Ú]ÛŠRXÛÛŠXÛÛ—Ü]
+œ^HŠJK¹¤«y¥/ˆŠBˆ\WØ]Û—ØXØÙ[
+Ù[‹œ^WØ‹œš[X\HŠBˆÙ[‹œ^WØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ^WÜ]\ÙJBˆİÜØˆHT\Ú]ÛŠRXÛÛŠXÛÛ—Ü]
+œİÜŠJK¹`g9«hˆŠBˆ\WØ]Û—ØXØÙ[
+İÜØ‹™[™Ù\ˆŠBˆİÜØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œİÜ
+BˆÙ[‹[Y[[™HHTÛY\Š]’Üš^›Û[
+BˆÙ[‹[Y[[™KœÙ]˜[™ÙJL
+BˆÙ[‹[Y[[™KœÛY\”™\ÜÙY˜ÛÛ›™Xİ
+XZ[‹˜™YÚ[—İ[Y[[™WÜÙYZÊBˆÙ[‹[Y[[™KœÛY\“[İ™Y˜ÛÛ›™Xİ
+XZ[‹œ™]šY]×İ[Y[[™WÜÙYZÊBˆÙ[‹[Y[[™KœÛY\”™[X\ÙY˜ÛÛ›™Xİ
+XZ[‹œÙYZ×Ùœ›ÛWÜÛY\ŠBˆÙ[‹[YWÛX™[HSX™[
+ŒŒÈŒŠBˆ˜[œÜÜ˜YÚYÙ]
+Ù[‹œ^WØŠBˆ˜[œÜÜ˜YÚYÙ]
+İÜØŠBˆ˜[œÜÜ˜YÚYÙ]
+Ù[‹[Y[[™KJBˆ˜[œÜÜ˜YÚYÙ]
+Ù[‹[YWÛX™[
+Bˆ^[İ]˜Y^[İ]
+˜[œÜÜ
+B‚ˆÙ[‹Ø]™Y›Ü›HHØ]™Y›Ü›UÚYÙ]
+
+BˆÙ[‹Ø]™Y›Ü›KœÙYZÔ™\]Y\İY˜ÛÛ›™Xİ
+XZ[‹œÙYZ×Ü˜][×Ù\™Xİ
+Bˆ^[İ]˜YÚYÙ]
+Ù[‹Ø]™Y›Ü›JB‚ˆ[˜[\Ú\×Ü›İÈHR›Ş^[İ]
+
+BˆÙ[‹˜œWÛX™[HSX™[
+”{ï&¹§*¹b!¹§¤ŠBˆÙ[‹šÙ^WÛX™[HSX™[
+º, ù )ûï&¹§*¹b!¹§¤ŠBˆ[˜[^™WØˆHT\Ú]ÛŠ¹b!¹§¤”HÈ:, ù )ÈŠBˆ[˜[^™WØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹˜[˜[^™WÛ]\ÚXÊBˆYÛX\šÙ\—ØˆHT\Ú]ÛŠ¹odùbcy/cyïk¹­îùb¨X\šÙ\ˆŠBˆYÛX\šÙ\—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹˜YÛX\šÙ\ŠBˆ[˜[\Ú\×Ü›İË˜YÚYÙ]
+Ù[‹˜œWÛX™[
+Bˆ[˜[\Ú\×Ü›İË˜YÚYÙ]
+Ù[‹šÙ^WÛX™[
+Bˆ[˜[\Ú\×Ü›İË˜YÚYÙ]
+[˜[^™WØŠBˆ[˜[\Ú\×Ü›İË˜YÚYÙ]
+YÛX\šÙ\—ØŠBˆ[˜[\Ú\×Ü›İË˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+[˜[\Ú\×Ü›İÊB‚‚ˆ›ŞHQÜ›İ\›Ş
+¹ç'ùk§¹âë9êâÈİ[H9­íúgìùfjŠBˆ›ŞÛHU›Ş^[İ]
+›Ş
+BˆÙ[‹œ›İÜÈHßBˆ›ÜˆÙ^KXÛÛ‹˜[YH[ˆÕSWÓÔ‘T‚ˆ›İÈH˜XÚÔ›İÊÙ^KXÛÛ‹˜[YJBˆ›İË˜Ú[™ÙY˜ÛÛ›™Xİ
+XZ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊBˆÙ[‹œ›İÜÖÚÙ^WHH›İÂˆ›ŞÛ˜YÚYÙ]
+›İÊBˆ^[İ]˜YÚYÙ]
+›Ş
+B‚ˆ[Ù[Ø›ŞHQÜ›İ\›Ş
+RH9ª(yg¢ÈŠBˆ[Ù[ÛHU›Ş^[İ]
+[Ù[Ø›Ş
+BˆÙ[‹›[Ù[Üİ]\ÈHSX™[
+ºi¥¹«(y/oùå*9¥í¹/&¹."ú/oHU”ˆ[]XÜ×Íœûï&ùk£9¢$9d#¹å'ù¢$9âë9êâùå-yd"y.åº/jŠBˆÙ[‹›[Ù[Ü›ÙÜ™\ÜÈHT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹›[Ù[Ü›ÙÜ™\ÜËœÙ]›Ü›X]
+¹ª(yg¢ù."ú/oH	\	HŠBˆ[Ù[Û˜YÚYÙ]
+Ù[‹›[Ù[Üİ]\ÊBˆ[Ù[Û˜YÚYÙ]
+Ù[‹›[Ù[Ü›ÙÜ™\ÜÊBˆ^[İ]˜YÚYÙ]
+[Ù[Ø›Ş
+B‚ˆÜ]Ø›ŞHQÜ›İ\›Ş
+¹akz/j9gî¹è`9b!¹é®ù.#¹å-yd"y.å¹.£9«(z+á¹b*ú/æùn©ˆŠBˆÜ]ÛHU›Ş^[İ]
+Ü]Ø›Ş
+BˆÙ[‹œÜ]Üİ]\ÈHSX™[
+¹ëbyo¡yo 9iâÈŠBˆÙ[‹œÜ]Ü›ÙÜ™\ÜÈHT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹œÜ]Ü›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹œÜ]Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œÜ]Ü›ÙÜ™\ÜËœÙ]›Ü›X]
+¹b!º/j9i!9ä!ˆ	\	HŠBˆÜ]Û˜YÚYÙ]
+Ù[‹œÜ]Üİ]\ÊBˆÜ]Û˜YÚYÙ]
+Ù[‹œÜ]Ü›ÙÜ™\ÜÊBˆ^[İ]˜YÚYÙ]
+Ü]Ø›Ş
+B‚ˆÙ[‹›ÙÈHSX™[
+¹ëbyo¡y.îùb¨K‹‹ˆŠBˆÙ[‹›ÙËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹›ÙËœÙ]Z[š[][RZYÚ
+Œ
+Bˆ^[İ]˜YÚYÙ]
+Ù[‹›ÙÊB‚ˆ›İÛHHR›Ş^[İ]
+
+BˆØ]™HHT\Ú]ÛŠ¹/çykf9méyê"ÈŠBˆØ]™K˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œØ]™WÜ›Ú™Xİ
+Bˆ^ÜHT\Ú]ÛŠRXÛÛŠXÛÛ—Ü]
+™^ÜŠJK¹kï9aî¹odùbcy­íúgìÈĞUˆŠBˆ\WØ]Û—ØXØÙ[
+^ÜœİXØÙ\ÜÈŠBˆ^Ü˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹™^ÜÛZ^
+Bˆ›İÛK˜YÚYÙ]
+Ø]™JBˆ›İÛK˜YÚYÙ]
+^Ü
+Bˆ›İÛK˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+›İÛJB‚˜Û\ÜÈ]™TYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠB‚ˆ]HHSX™[
+¹ã¬9g.¹¯%9aî¹ª(yo#ÈŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆ[™›ÈHSX™[
+ˆRH9b!º/j9cê¹g*9¯%9aî¹bcyk£9¢$;ï&ù«hùo#ù¯%9aî¹¥í¹æí9£©z+îùcå¹§+9g,İ[xà —ˆ‚ˆº`"y¢êy¯%9aîº.ªù.ïyd#»ï#9kîyn¥9.d9fj9/&¹êâùclúgfzgìûï#9am¹.åº/j:`dùîéùîëy/çy£ yd#9. 9¥íºeí:/m9d#9«iy¤«y¥/¸à ˆ‚ˆ
+Bˆ[™›ËœÙ]ÛÜ™Ü˜\
+YJBˆ^[İ]˜YÚYÙ]
+[™›ÊB‚ˆÜšYHQÜšY^[İ]
+
+Bˆ™\Ù]ÈHÂˆ
+¼'ã®9d"y.å¹o.ye,H‹™İZ]\ˆŠKˆ
+¼'ã®H:d¨¹ä-9o.ye,H‹œX[›ÈŠKˆ
+¼'é`H:o$ù¢bù¯%9aîˆ‹™[\ÈŠKˆ
+¼'ã®:-'y¥«ù¯%9aîˆ‹˜˜\ÜÈŠKˆ
+¼'ã©9î«ù/-9icËÒÕˆ‹›ØØ[ÈŠKˆ
+¼'ã¯9aj:`ê9 h¹i#H‹›Û™JKˆBˆ›ÜˆK
+^Ù^JH[ˆ[[Y\˜]J™\Ù]ÊN‚ˆˆHT\Ú]ÛŠ^
+Bˆ‹œÙ]Z[š[][RZYÚ
+Œ
+Bˆ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙKÏZÙ^NˆXZ[‹˜\WÛ]™WÜ™\Ù]
+ÊJBˆÜšY˜YÚYÙ]
+‹KËÌ‹ILŠBˆ^[İ]˜Y^[İ]
+ÜšY
+B‚ˆˆÛİ[Ø›ŞHQÜ›İ\›Ş
+º-mùicú/¡ybªHŠBˆÛHR›Ş^[İ]
+Ûİ[Ø›Ş
+BˆÙ[‹˜Ûİ[Ú[ˆHPÚXÚĞ›Ş
+9¢ãHÛİ[Z[»ï"9åc:gh¹`$º+¨y¥í»ï"HŠBˆÙ[‹˜Ûİ[Ú[‹œÙ]ÚXÚÙY
+YJBˆÙ[‹˜Ûİ[ÛX™[HSX™[
+”‘PQHŠBˆÙ[‹˜Ûİ[ÛX™[œÙ]İ[TÚY]
+™›Û\Ú^™NŒÙ›Û]ÙZYÚLŠBˆÛİ[ØˆHT\Ú]ÛŠ9¢ãy`$º+¨y¥í¹d#¹o 9iâÈŠBˆÛİ[Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œİ\ØÛİ[Ú[ŠBˆÛ˜YÚYÙ]
+Ù[‹˜Ûİ[Ú[ŠBˆÛ˜YÚYÙ]
+Ù[‹˜Ûİ[ÛX™[
+BˆÛ˜YÚYÙ]
+Ûİ[ØŠBˆ^[İ]˜YÚYÙ]
+Ûİ[Ø›Ş
+B‚ˆÙ[‹œİ]\ÈHSX™[
+¹odùbczh¡:+¯»ï&¹aj:`ê:gìú/j9o 9d+ÈŠBˆÙ[‹œİ]\ËœÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠBˆ^[İ]˜YÚYÙ]
+Ù[‹œİ]\ÊB‚ˆ^HHT\Ú]ÛŠ¸¥­ˆ9o 9iâÈÈ9¦ ¹`g9ã¬9g.¹¤«y¥/ˆŠBˆ^KœÙ]Z[š[][RZYÚ
+Œ
+Bˆ^K˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ^WÜ]\ÙJBˆ^[İ]˜YÚYÙ]
+^JBˆ^[İ]˜Yİ™]Ú
+JB‚‚ˆYˆİ\ØÛİ[Ú[ŠÙ[ŠN‚ˆYˆ›İÙ[‹˜Ûİ[Ú[‹š\ĞÚXÚÙY
+
+N‚ˆÙ[‹›XZ[‹œ^WÜ]\ÙJ
+Bˆ™]\›‚ˆÙ[‹—ØÛİ[HˆÙ[‹˜Ûİ[ÛX™[œÙ]^
+İŠÙ[‹—ØÛİ[
+JBˆÙ[‹—İ[Y\ˆHU[Y\ŠÙ[ŠBˆÙ[‹—İ[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹—İXÚÊBˆÙ[‹—İ[Y\‹œİ\
+Ì
+B‚ˆYˆİXÚÊÙ[ŠN‚ˆÙ[‹—ØÛİ[OHBˆYˆÙ[‹—ØÛİ[H‚ˆÙ[‹—İ[Y\‹œİÜ
+
+BˆÙ[‹˜Ûİ[ÛX™[œÙ]^
+‘ÓÈŠBˆÙ[‹›XZ[‹œ^WÜ]\ÙJ
+BˆU[Y\‹œÚ[™ÛTÚİ
+LŒ[X™NˆÙ[‹˜Ûİ[ÛX™[œÙ]^
+”‘PQHŠJBˆ[ÙN‚ˆÙ[‹˜Ûİ[ÛX™[œÙ]^
+İŠÙ[‹—ØÛİ[
+JB‚‚˜Û\ÜÈXÙZÛ\ŠUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹^
+N‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆHU›Ş^[İ]
+Ù[ŠBˆX™[HSX™[
+^
+BˆX™[œÙ][YÛ›Y[
+][YÛÙ[\ŠBˆX™[œÙ]İ[TÚY]
+™›Û\Ú^™NŒŒœŠBˆ˜YÚYÙ]
+X™[
+B‚‚˜Û\ÜÈÙ][™ÜÔYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+ºgìúh¤HÈÔHÈ9ã¬9g.º+¯¹ïkˆŠBˆ]KœÙ]İ[TÚY]
+™›Û\Ú^™NŒÙ›Û]ÙZYÚŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆÜWØ›ŞHQÜ›İ\›Ş
+RH:/ä9ë¥ú+¯¹i!ÈŠBˆÛHU›Ş^[İ]
+ÜWØ›Ş
+BˆÙ[‹™ÜWÜİ]\ÈHSX™[
+¹l&¹§*¹¨à9­bÈŠBˆ]XİHT\Ú]ÛŠ¹¨à9­bÈ•’QPHÔHÈÕQHŠBˆ]Xİ˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹™]XİÙÜJBˆÛ˜YÚYÙ]
+Ù[‹™ÜWÜİ]\ÊBˆÛ˜YÚYÙ]
+]Xİ
+Bˆ^[İ]˜YÚYÙ]
+ÜWØ›Ş
+B‚ˆ]Y[×Ø›ŞHQÜ›İ\›Ş
+¹ã¬9g.ºgìúh¤z+¯¹i!ÈŠBˆ[HQÜšY^[İ]
+]Y[×Ø›Ş
+BˆÙ[‹›İ]]ØÛÛX›ÈHPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ™Yœ™\ÚØ]Y[×Ù]šXÙ\Ê
+Bˆ™Yœ™\ÚHT\Ú]ÛŠ¹b-ù¥¬:+¯¹i!ÈŠBˆ™Yœ™\Ú˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚØ]Y[×Ù]šXÙ\ÊBˆÙ[‹˜›ØÚ×ØÛÛX›ÈHPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜›ØÚ×ØÛÛX›Ë˜Y][\ÊÈŒMˆ‹LLˆ‹ŒL‹ŒŒ—JBˆÙ[‹˜›ØÚ×ØÛÛX›ËœÙ]İ\œ™[^
+ŒLŠBˆ[˜YÚYÙ]
+SX™[
+¹..ú/¤ùaîº+¯¹i!ÈŠK
+Bˆ[˜YÚYÙ]
+Ù[‹›İ]]ØÛÛX›ËJBˆ[˜YÚYÙ]
+™Yœ™\ÚŠBˆ[˜YÚYÙ]
+SX™[
+ºgìúh¤yï$ùa¬ˆ›ØÚÜÚ^™HŠKK
+Bˆ[˜YÚYÙ]
+Ù[‹˜›ØÚ×ØÛÛX›ËKJBˆ^[İ]˜YÚYÙ]
+]Y[×Ø›Ş
+B‚ˆ]™WØ›ŞHQÜ›İ\›Ş
+¹ã¬9g.¹k¢yajŠBˆHU›Ş^[İ]
+]™WØ›Ş
+BˆÙ[‹›Ù™›[™HHPÚXÚĞ›Ş
+¹¯%9aî¹ª(yo#ù/&9ab9/oùå*9§+9g,İ[{ï#9.#y/§z-e¹ïdyîçŠBˆÙ[‹›Ù™›[™KœÙ]ÚXÚÙY
+YJBˆÙ[‹œ™]™[ÜÛY\HPÚXÚĞ›Ş
+¹¯%9aî¹¥í¹nîº+«¹alúeëyìîùîçùçhyç(ú!ê¹bª9/$yç(ŠBˆÙ[‹œ™]™[ÜÛY\œÙ]ÚXÚÙY
+YJBˆ˜YÚYÙ]
+Ù[‹›Ù™›[™JBˆ˜YÚYÙ]
+Ù[‹œ™]™[ÜÛY\
+Bˆ^[İ]˜YÚYÙ]
+]™WØ›Ş
+B‚ˆÙ\™\—Ø›ŞHQÜ›İ\›Ş
+RH9§#yb¨yfj;ï"9§#yb¨yfjÈ9ææ9¦ì¹n¤ù§iy®¤;ï"HŠBˆÙ\™\—Û^[İ]HQÜšY^[İ]
+Ù\™\—Ø›Ş
+BˆÙ\™\—ØÛÛ™šYÈHØYÙ\ÚİÜÜÙ\™\—ØÛÛ™šYÊTÒÕÔÔÑT•‘T—ĞÓÓ‘’QÊBˆÙ[‹œÙ\™\—ÙY]HS[™QY]
+Ù\™\—ØÛÛ™šYÖÈœÙ\™\ˆ—JBˆÙ[‹œÙ\™\—ÙY]œÙ]XÙZÛ\•^
+šÎ‹ËØ\K™^[\K˜ÛÛHŠBˆÙ[‹œÙ\™\—İÚÙ[—ÙY]HS[™QY]
+Ù\™\—ØÛÛ™šYÖÈÚÙ[ˆ—JBˆÙ[‹œÙ\™\—İÚÙ[—ÙY]œÙ]XÚÓ[ÙJS[™QY]”\ÜİÛÜ™
+BˆÙ[‹œÙ\™\—İÚÙ[—ÙY]œÙ]XÙZÛ\•^
+º+¯úeë¹.é9âc;ï"9§#yb¨yfj9§*º+¯¹ïk¹¥í¹cëùåfyên»ï"HŠBˆØ]™WÜÙ\™\ˆHT\Ú]ÛŠ¹/çykf9nm¹b-ù¥¬9¦ì¹n¤ÈŠBˆ\İÜÙ\™\ˆHT\Ú]ÛŠ¹­bú+åy§#yb¨yfj9¦ì¹n¤ÈŠBˆ\WØ]Û—ØXØÙ[
+Ø]™WÜÙ\™\‹œš[X\HŠBˆØ]™WÜÙ\™\‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œØ]™WÜÙ\™\ŠBˆ\İÜÙ\™\‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹\İÜÙ\™\ŠBˆÙ\™\—Û^[İ]˜YÚYÙ]
+SX™[
+¹§#yb¨yfj9g,9g`ŠK
+BˆÙ\™\—Û^[İ]˜YÚYÙ]
+Ù[‹œÙ\™\—ÙY]KKÊBˆÙ\™\—Û^[İ]˜YÚYÙ]
+SX™[
+º+¯úeë¹.é9âcŠKK
+BˆÙ\™\—Û^[İ]˜YÚYÙ]
+Ù[‹œÙ\™\—İÚÙ[—ÙY]KKKÊBˆÙ\™\—Û^[İ]˜YÚYÙ]
+Ø]™WÜÙ\™\‹‹JBˆÙ\™\—Û^[İ]˜YÚYÙ]
+\İÜÙ\™\‹‹ŠBˆÙ\™\—Û^[İ]˜YÚYÙ]
+SX™[
+¹¦ì¹n¤ùoázhnùå,y§#yb¨yfjTH:+îùcå»ï#9.#y/&¹¢jù£ãùk¨¹¢-ùêëÈÈ9ææ8à ˆŠKËK
+Bˆ^[İ]˜YÚYÙ]
+Ù\™\—Ø›Ş
+B‚ˆYØ[Ø›ŞHQÜ›İ\›Ş
+¹ccú+«¸à yn+¹bªy.#¹alù.£ˆŠBˆYØ[Û^[İ]HR›Ş^[İ]
+YØ[Ø›Ş
+BˆØİ[Y[ÈHÂˆ¹o 9®¤:/kù.í¹hì9¦#ˆˆ¹§+:/kù.í¹/oùå*TÚYM¸à Q˜\İTxà TUÜ˜Ú8à Q[]XÜøà X]Y[Ë\Ù\\˜]Ü‹ÕU”¸à S[Txà TØÚTxà [Xœ›ÜØH9ëbyo 9®¤9îá9.í¸à ¹d!9îá9.í¹æ¡9âb9§`ù.#º+®9cëù§hy«/¹.ézf£ùc!z+®9cëú+àycâ¹k¦9¥®yhì9¦#¹..¹aá¸à ˆ‹ˆºf¤9éày¥/ùëeˆˆº/kù.í¹.áyg*9å*9¢-ù..ùbª9¤ãy/g9¥í¹i!9ä!¹kï9aiyæ¡:gìúh¤xà y.îùb¨ycà¹¥l8à z-)¹cíù.#¹cãzi¢9/èy køà ¹¢bù§.ˆRH9.îùb¨y/&¹."¹/(:!ìúacyïk¹æ¡RH9§#yb¨yfj8à ˆ‹ˆ¹å*9¢-ùccú+«ˆˆ¹§+:/kù.í¹æë¹bcy.áy/¦ùki¹.h9.#¹è%9êm¹/oùå*;ï#9.#y£ä9/¦ù«c9¦ì¹."ú/oy§#yb¨xà ¹cêº ïykï9aiz!ê¹mìyb&ù/g8à ymìº#­ù£¢9§`ù¢%¹/§y¬åycëù/oùå*9æ¡:gìúh¤{ï&ĞRH9îäù§§:hnù.®¹méyi#y¨.8à ˆ‹ˆ¹n+¹bªy.#¹cãzi¢ˆ¹i º`aùb,9b!º/j8à z,,zgh¸à y«c:+ãy¢%º/ç¹£©zeëºh¦;ï#:+íú+¬9oez/kù.í¹âb9§+8à y«c9¦ì¹¨/9o#øà y¤ãy/g9«izj©9d£:e&z+ëù/èy kùd#¹cãzi¢8à ˆ‹ˆ¹alù.£º/kù.íˆˆˆĞTÓSQ_HÕ‘T”ÒSÓŸWRH9akz/j
+ùå-yd"y.å¸à y.¥9î¯ú,,Kùakyî¯ú,,Kù«c:+ãyd#9«ixà PRH9«c:+ãy.#¹ã¬9g.¹¯%9aî¹méy/g9êæxà ˆ‹ˆBˆ›Üˆ˜[YK^[ˆØİ[Y[Ëš][\Ê
+N‚ˆ]ÛˆHT\Ú]ÛŠ˜[YJBˆ]Û‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙK[˜[YK]^ˆÙ[‹œÚİ×ÙØİ[Y[
+‹
+JBˆYØ[Û^[İ]˜YÚYÙ]
+]ÛŠBˆ^[İ]˜YÚYÙ]
+YØ[Ø›Ş
+BˆİYWÛ›İXÙHHSX™[
+¹§+:/kù.í¹æë¹bcy.áy/¦ùki¹.h9.#¹è%9êm¹/oùå*;ï#9.#y£ä9/¦ù«c9¦ì¹."ú/oy§#yb¨xà ˆŠBˆİYWÛ›İXÙKœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+İYWÛ›İXÙJBˆ^[İ]˜Yİ™]Ú
+JB‚ˆYˆØ]™WÜÙ\™\ŠÙ[ŠN‚ˆÙ\™\ˆHÙ[‹œÙ\™\—ÙY]^
+
+Kœİš\
+
+Kœœİš\
+‹ÈŠHÜˆQUSÔÑT•‘T—ÕT“ˆÚÙ[ˆHÙ[‹œÙ\™\—İÚÙ[—ÙY]^
+
+Kœİš\
+
+Bˆ]ÛZX×İÜš]WÚœÛÛŠTÒÕÔÔÑT•‘T—ĞÓÓ‘’QËÈœÙ\™\ˆˆÙ\™\‹ÚÙ[ˆˆÚÙ[ŸJBˆÙ[‹œÙ\™\—ÙY]œÙ]^
+Ù\™\ŠBˆYˆ\Ø]ŠÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\HŠN‚ˆÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\Kœ™Yœ™\ÚÛXœ˜\J
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹RH9§#yb¨yfj‹¹§#yb¨yfj9g,9g`9mì¹/çykf;ï#9mì¹b-ù¥¬9§#yb¨yfjÈ9ææ9¦ì¹n¤øà ˆŠB‚ˆYˆ\İÜÙ\™\ŠÙ[ŠN‚ˆN‚ˆÙ\™\ˆHÙ[‹œÙ\™\—ÙY]^
+
+Kœİš\
+
+Kœœİš\
+‹ÈŠHÜˆQUSÔÑT•‘T—ÕT“ˆÚÙ[ˆHÙ[‹œÙ\™\—İÚÙ[—ÙY]^
+
+Kœİš\
+
+BˆÛY[HÙ\™\“Xœ˜\PÛY[
+Ù\™\‹ÚÙ[‹[Y[İ]LLŠBˆX[HÛY[šX[
+
+BˆØ][ÙÈHÛY[œÛÛ™ÜÊ
+Bˆ›ÛİHØ][ÙË™Ù]
+œÙ\™\—ÛXœ˜\WÜ›Ûİ‹¹§*º/å9fçº-ëùo¡ŠBˆ\šX×Ø\ÜˆH¹mì¹k¢z(áHˆYˆX[™Ù]
+›\šXÜ×Ø\Ü—Ø]˜Z[X›HŠH[ÙH¹§*¹k¢z(á{ï"9.áy/oùå*9d#9d#HËùa¡ymc9«c:+ã{ï"H‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹§#yb¨yfj9¦ì¹n¤ú/ç¹£©y¢$9b§È‹ˆˆ¹§#yb¨yâ­¹  {ï&ÚX[™Ù]
+	Üİ]\ÉË	ÛÛ›[™IÊ_Wˆ‚ˆˆ¹§#yb¨yfj9¦ì¹n¤ûï&Ü›ÛİWˆ‚ˆˆ¹mì¹aiyn¤ù«c9¦ì»ï&ØØ][ÙË™Ù]
+	ØÛİ[	Ë
+_H:i¥—ˆ‚ˆˆ¹«c:+ãz+á¹b*ùª(yg¢ûï&Û\šX×Ø\ÜŸH‹ˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹§#yb¨yfj9¦ì¹n¤ú/ç¹£©yi,z-)H‹İŠ^ÊJB‚ˆYˆÚİ×ÙØİ[Y[
+Ù[‹]K^
+N‚ˆX[ÙÈHQX[ÙÊÙ[ŠBˆX[ÙËœÙ]Ú[™İÕ]J]JBˆX[ÙËœ™\Ú^™JÌŒLŒ
+Bˆ^[İ]HU›Ş^[İ]
+X[ÙÊBˆœ›İÜÙ\ˆHU^œ›İÜÙ\Š
+Bˆœ›İÜÙ\‹œÙ]Z[•^
+^
+Bˆ^[İ]˜YÚYÙ]
+œ›İÜÙ\ŠBˆÛÜÙHHT\Ú]ÛŠ¹alúeëHŠBˆÛÜÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+X[ÙË˜XØÙ\
+Bˆ^[İ]˜YÚYÙ]
+ÛÜÙJBˆX[ÙË™^XÊ
+B‚ˆYˆ™Yœ™\ÚØ]Y[×Ù]šXÙ\ÊÙ[ŠN‚ˆİ\œ™[HÙ[‹›İ]]ØÛÛX›Ë˜İ\œ™[^
+
+HYˆ\Ø]ŠÙ[‹›İ]]ØÛÛX›ÈŠH[ÙHˆ‚ˆYˆ\Ø]ŠÙ[‹›İ]]ØÛÛX›ÈŠN‚ˆÙ[‹›İ]]ØÛÛX›Ë˜ÛX\Š
+BˆN‚ˆ]šXÙ\ÈHÙœ]Y\WÙ]šXÙ\Ê
+Bˆ›ÜˆK[ˆ[[Y\˜]J]šXÙ\ÊN‚ˆYˆÈ›X^Ûİ]]ØÚ[›™[È—Hˆ‚ˆÙ[‹›İ]]ØÛÛX›Ë˜Y][J‰ŞÚ_NˆÙÈ›˜[YH—_IËJBˆYˆİ\œ™[‚ˆYHÙ[‹›İ]]ØÛÛX›Ë™š[™^
+İ\œ™[
+BˆYˆYH‚ˆÙ[‹›İ]]ØÛÛX›ËœÙ]İ\œ™[[™^
+Y
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹›İ]]ØÛÛX›Ë˜Y][Jº+¯¹i!ú+îùcå¹i,z-)HŠB‚ˆYˆ]XİÙÜJÙ[ŠN‚ˆ[™\ÈHÙˆ¹ìîùîçûï&Ü]›Ü›KœŞ\İ[J
+_HÜ]›Ü›Kœ™[X\ÙJ
+_H—BˆN‚ˆHİXœ›ØÙ\ÜËœ[ŠÈ›šYXK\ÛZH‹‹K\]Y\KYÜO[˜[YKY[[ÜKİ[š]™\—İ™\œÚ[Ûˆ‹ˆ‹KY›Ü›X]XÜİ‹›ÚXY\ˆ—KØ\\™WÛİ]]UYK^UYK[Y[İ]N
+BˆYˆœ™]\›˜ÛÙHOH[™œİİ]œİš\
+
+N‚ˆ[™\Ë˜\[™
+“•’QPHÔ{ï&ˆˆ
+Èœİİ]œİš\
+
+JBˆ[ÙN‚ˆ[™\Ë˜\[™
+¹§*¹¨à9­bùb,9cëùå*9æ¡šYXK\ÛZxà ˆŠBˆ^Ù\^Ù\[Û‚ˆ[™\Ë˜\[™
+¹§*¹¨à9­bùb,•’QPH:jlybª9¢%ˆšYXK\ÛZxà ˆŠBˆN‚ˆ[\ÜÜ˜Úˆ[™\Ë˜\[™
+ˆ”UÜ˜Ú;ï&İÜ˜Ú—×İ™\œÚ[Û—×ßHŠBˆ[™\Ë˜\[™
+ˆÕQycëùå*;ï&Éù¦+ÉÈYˆÜ˜Ú˜İYKš\×Ø]˜Z[X›J
+H[ÙH	ùd)‰ßHŠBˆYˆÜ˜Ú˜İYKš\×Ø]˜Z[X›J
+N‚ˆ[™\Ë˜\[™
+ˆÕQz+¯¹i!ûï&İÜ˜Ú˜İYK™Ù]Ù]šXÙWÛ˜[YJ
+_HŠBˆ^Ù\^Ù\[Û‚ˆ[™\Ë˜\[™
+”UÜ˜Ú;ï&¹l&¹§*¹k¢z(áKù¥è9¬åz+îùcåˆŠBˆÙ[‹™ÜWÜİ]\ËœÙ]^
+—ˆ‹š›Ú[Š[™\ÊJB‚‚˜Û\ÜÈØ]™Y›Ü›UÚYÙ]
+UÚYÙ]
+N‚ˆˆˆº/núaãù¬è¹oh¹¦/¹é.»ï#9.#y/§z-eºh§yi%¹îæ9fï¹n¤øà ˆˆˆ‚ˆÙYZÔ™\]Y\İYHÚYÛ˜[
+›Ø]
+B‚ˆYˆ×Ú[š]×ÊÙ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹œØ[\\ÈH×BˆÙ[‹œÜÚ][ÛˆHŒˆÙ[‹›X\šÙ\œÈH×BˆÙ[‹œÙ]Z[š[][RZYÚ
+LŒ
+B‚ˆYˆÙ]İØ]™Y›Ü›WÙœ›ÛWİØ]ŠÙ[‹]
+N‚ˆÙ[‹œØ[\\ÈH×BˆN‚ˆ]KÜˆHÙ‹œ™XY
+İŠ]
+K\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆYˆ[Š]JHOH‚ˆ™]\›‚ˆ[Û›ÈHœ›YX[Š]K^\ÏLJBˆ\™Ù]HLŒˆİ\HX^
+K[Š[Û›ÊKËİ\™Ù]
+Bˆ›ÜˆH[ˆ˜[™ÙJ[Š[Û›ÊKİ\
+N‚ˆÚ[šÈH[Û›ÖÚNšJÜİ\BˆYˆ[ŠÚ[šÊN‚ˆÙ[‹œØ[\\Ë˜\[™
+›Ø]
+œ›X^
+œ˜XœÊÚ[šÊJJJBˆ^Ù\^Ù\[Û‚ˆÙ[‹œØ[\\ÈH×BˆÙ[‹\]J
+B‚ˆYˆÙ]ÜÜÚ][ÛŠÙ[‹˜][ÊN‚ˆÙ[‹œÜÚ][ÛˆHX^
+ŒZ[ŠKŒ˜][ÊJBˆÙ[‹\]J
+B‚ˆYˆÙ]ÛX\šÙ\œÊÙ[‹X\šÙ\œÊN‚ˆÙ[‹›X\šÙ\œÈHX\šÙ\œÈÜˆ×BˆÙ[‹\]J
+B‚ˆYˆ[İ\ÙT™\ÜÑ]™[
+Ù[‹]™[
+N‚ˆYˆÙ[‹ÚY
+
+Hˆ‚ˆ˜][ÈHX^
+ŒZ[ŠKŒ]™[œÜÚ][ÛŠ
+K
+
+KÜÙ[‹ÚY
+
+JJBˆÙ[‹œÙYZÔ™\]Y\İY™[Z]
+˜][ÊB‚ˆYˆZ[]™[
+Ù[‹]™[
+N‚ˆHTZ[\ŠÙ[ŠBˆËHÙ[‹ÚY
+
+KÙ[‹šZYÚ
+
+Bˆ™š[™Xİ
+Ù[‹œ™Xİ
+
+KPÛÛÜŠËÌÊJBˆZYHÌ‚ˆYˆÙ[‹œØ[\\Î‚ˆ[ˆHT[ŠPÛÛÜŠLŒN
+JBˆœÙ][Š[ŠBˆˆH[ŠÙ[‹œØ[\\ÊBˆ›Üˆ[ˆ˜[™ÙJÊN‚ˆYHZ[Š‹LK[
+
+›‹ÛX^
+KÊJJBˆ[\HÙ[‹œØ[\\ÖÚYH
+ˆ
+
+ŒŠBˆ™˜]Ó[™J[
+ZYX[\
+K[
+ZY
+Ø[\
+JBˆÈX\šÙ\œÂˆ›ÜˆH[ˆÙ[‹›X\šÙ\œÎ‚ˆN‚ˆ˜][ÈH›Ø]
+K™Ù]
+œ˜][È‹
+JBˆH[
+˜][ÊÊBˆœÙ][ŠT[ŠPÛÛÜŠNL
+JJBˆ™˜]Ó[™J
+Bˆ™˜]Õ^
+
+ÌËMİŠK™Ù]
+›˜[YH‹ˆŠJJBˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÈ^ZXYˆœÙ][ŠT[ŠPÛÛÜŠMKMKMJKŠJBˆH[
+Ù[‹œÜÚ][ÛŠÊBˆ™˜]Ó[™J
+B‚‚˜Û\ÜÈX\šÙ\‘X[ÙÊQX[ÙÊN‚ˆYˆ×Ú[š]×ÊÙ[‹\™[S›Û™KY˜][Û˜[YOH¹bkù«cŠN‚ˆİ\\Š
+K—×Ú[š]×Ê\™[
+BˆÙ[‹œÙ]Ú[™İÕ]J¹­îùb¨9«­z$/HX\šÙ\ˆŠBˆ^HHQ›Ü›S^[İ]
+Ù[ŠBˆÙ[‹›˜[YWÙY]HS[™QY]
+Y˜][Û˜[YJBˆ^K˜Y›İÊ¹d#yéì‹Ù[‹›˜[YWÙY]
+Bˆ]ÛœÈHQX[ÙĞ]Û›Ş
+QX[ÙĞ]Û›Ş“ÚÈQX[ÙĞ]Û›ŞØ[˜Ù[
+Bˆ]ÛœË˜XØÙ\Y˜ÛÛ›™Xİ
+Ù[‹˜XØÙ\
+Bˆ]ÛœËœ™Z™XİY˜ÛÛ›™Xİ
+Ù[‹œ™Z™Xİ
+Bˆ^K˜Y›İÊ]ÛœÊB‚ˆYˆ˜[YJÙ[ŠN‚ˆ™]\›ˆÙ[‹›˜[YWÙY]^
+
+Kœİš\
+
+HÜˆ“X\šÙ\ˆ‚‚‚‚‚˜Û\ÜÈY]›Û›ÛYQ[™Ú[™N‚ˆˆˆ¹âë9êâú ,ú/å:" ¹¢ãyfj;ï#9cëú/¤ùaî¹b,9£!ùk¦¹hì9ch{ï#9.#z/æùaiy..ù¢jxà ˆˆˆ‚ˆYˆ×Ú[š]×ÊÙ[ŠN‚ˆÙ[‹œİ™X[HH›Û™BˆÙ[‹™]šXÙHH›Û™BˆÙ[‹˜œHHLŒŒˆÙ[‹œØ[\WÜ˜]HHLˆÙ[‹™[˜X›YH˜[ÙBˆÙ[‹™œ˜[YWÜÜÈHˆÙ[‹˜ÛXÚ×Ùœ˜[Y\ÈH[
+Ù[‹œØ[\WÜ˜]H
+ˆŒÍJB‚ˆYˆİ\
+Ù[‹]šXÙOS›Û™KœOLLŒŒ
+N‚ˆÙ[‹œİÜ
+
+BˆÙ[‹™]šXÙHH]šXÙBˆÙ[‹˜œHHX^
+ÌŒZ[ŠÌŒ›Ø]
+œHÜˆLŒŒ
+JJBˆÙ[‹™[˜X›YHYBˆÙ[‹™œ˜[YWÜÜÈHˆÙ[‹œİ™X[HHÙ“İ]]İ™X[JˆØ[\\˜]O\Ù[‹œØ[\WÜ˜]KˆÚ[›™[ÏL‹ˆ\OH™›Ø]Ìˆ‹ˆ›ØÚÜÚ^™OMLL‹ˆ]šXÙOY]šXÙKˆØ[˜XÚÏ\Ù[‹—ØØ[˜XÚÂˆ
+BˆÙ[‹œİ™X[Kœİ\
+
+B‚ˆYˆØØ[˜XÚÊÙ[‹İ]]Kœ˜[Y\Ë[YWÚ[™›Ëİ]\ÊN‚ˆİ]]K™š[
+
+BˆYˆ›İÙ[‹™[˜X›Y‚ˆ™]\›‚ˆ™X]Ú[\˜[H[
+Ù[‹œØ[\WÜ˜]H
+ˆŒŒÈÙ[‹˜œJBˆ›ÜˆH[ˆ˜[™ÙJœ˜[Y\ÊN‚ˆXœÛÛ]HHÙ[‹™œ˜[YWÜÜÈ
+ÈBˆ\ÙHHXœÛÛ]H	H™X]Ú[\˜[ˆYˆ\ÙHÙ[‹˜ÛXÚ×Ùœ˜[Y\Î‚ˆÈ9çëz(l9aãÈÛXÚûï&ùcêº` z ,ú/å:+¯¹i!øà ‚ˆ[ˆHKŒH
+\ÙHÈX^
+KÙ[‹˜ÛXÚ×Ùœ˜[Y\ÊJBˆÛ™HHX]œÚ[Š‹Œ
+ˆX]œH
+ˆLŒŒ
+ˆ\ÙHÈÙ[‹œØ[\WÜ˜]JBˆˆH›Ø]
+Œ
+ˆ[ˆ
+ˆÛ™JBˆİ]]VÚKHH‚ˆİ]]VÚKWHH‚ˆÙ[‹™œ˜[YWÜÜÈ
+ÏHœ˜[Y\Â‚ˆYˆİÜ
+Ù[ŠN‚ˆÙ[‹™[˜X›YH˜[ÙBˆYˆÙ[‹œİ™X[H\È›İ›Û™N‚ˆN‚ˆÙ[‹œİ™X[KœİÜ
+
+BˆÙ[‹œİ™X[K˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹œİ™X[HH›Û™B‚‚˜Û\ÜÈZYUÛÜšÙ\ŠU™XY
+N‚ˆXİ[ÛˆHÚYÛ˜[
+İŠBˆİ]\ÈHÚYÛ˜[
+İŠB‚ˆYˆ×Ú[š]×ÊÙ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹—Ü[›š[™ÈHYB‚ˆYˆİÜ
+Ù[ŠN‚ˆÙ[‹—Ü[›š[™ÈH˜[ÙB‚ˆYˆ[ŠÙ[ŠN‚ˆN‚ˆ[\ÜZYÂˆ˜[Y\ÈHZYË™Ù]Ú[œ]Û˜[Y\Ê
+BˆYˆ›İ˜[Y\Î‚ˆÙ[‹œİ]\Ë™[Z]
+¹§*¹¨à9­bùb,RQH:/¤ùaiz+¯¹i!ÈŠBˆ™]\›‚ˆÙ[‹œİ]\Ë™[Z]
+“RQH9mìº/ç¹£©{ï&ˆˆ
+È˜[Y\ÖÌJBˆÈ:næ:+©:aáùå*9ë+9. 9.*º/¤ùaiz+¯¹i!øà ¹d#¹îëycëùh§¹b¨:+¯¹i!ú`"y¢êxà ‚ˆÚ]ZYË›Ü[—Ú[œ]
+˜[Y\ÖÌJH\ÈÜ‚ˆÚ[HÙ[‹—Ü[›š[™Î‚ˆ\ÙÈHÜœÛ
+
+BˆYˆ\ÙÈ\È›İ›Û™H[™Ù]]Š\ÙË\H‹ˆŠH[ˆ
+››İWÛÛˆ‹˜ÛÛ›ÛØÚ[™ÙHŠN‚ˆYˆ\ÙË\HOH››İWÛÛˆˆ[™Ù]]Š\ÙË™[ØÚ]H‹
+HOH‚ˆÛÛ[YBˆÛÙHHÙ]]Š\ÙË››İH‹›Û™JBˆYˆÛÙH\È›Û™N‚ˆÛÙHHÙ]]Š\ÙË˜ÛÛ›Û‹›Û™JBˆX\[™ÈHÂˆÍˆœ^WÜ]\ÙH‹ˆÍÎˆœİÜ‹ˆÎˆ›™^‹ˆÎNˆœ™]š[İ\È‹ˆBˆYˆÛÙH[ˆX\[™Î‚ˆÙ[‹˜Xİ[Û‹™[Z]
+X\[™ÖØÛÙWJBˆÙ[‹›\ÛY\
+L
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹œİ]\Ë™[Z]
+“RQH9æäyd+9i,z-){ï&ˆˆ
+ÈİŠJJB‚‚˜Û\ÜÈÙ]\İYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹š][\ÈH×Bˆ^[İ]HU›Ş^[İ]
+Ù[ŠB‚ˆ]HHSX™[
+”Ù]\İ9¯%9aî¹«c9ceHŠBˆ]KœÙ]İ[TÚY]
+™›Û\Ú^™NŒÙ›Û]ÙZYÚŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆ˜\ˆHR›Ş^[İ]
+
+BˆYØİ\œ™[ØˆHT\Ú]ÛŠ¹b¨9aiyodùbcHÈ9ææ9«c9¦ìˆŠBˆ\WØ]Û—ØXØÙ[
+YØİ\œ™[Ø‹œš[X\HŠBˆYØİ\œ™[Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹˜YØİ\œ™[ÜÛÛ™ÊBˆYØˆHT\Ú]ÛŠ¹­îùb¨9§+9g,9¥¡ù.íˆŠBˆYØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹˜YÜÛÛ™ÊBˆ™[[İ™WØˆHT\Ú]ÛŠ¹b(:fi9¢`:`"HŠBˆ™[[İ™WØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™[[İ™WÜÙ[XİY
+Bˆ\ØˆHT\Ú]ÛŠ¹."¹éîÈŠBˆ\Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆÙ[‹›[İ™WÜÙ[XİY
+LJJBˆİÛ—ØˆHT\Ú]ÛŠ¹."ùéîÈŠBˆİÛ—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆÙ[‹›[İ™WÜÙ[XİY
+JJBˆØYØˆHT\Ú]ÛŠº/oyaiy¢`:`"y«c9¦ìˆŠBˆØYØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›ØYÜÙ[XİY
+BˆÙ[‹˜]]×Û™^HPÚXÚĞ›Ş
+¹¤«y¥/¹îäù§gú!ê¹bª9."ù. :i¥ˆŠBˆÙ[‹˜]]×Û™^œÙ]ÚXÚÙY
+YJBˆ›ÜˆÈ[ˆØYØİ\œ™[Ø‹YØ‹™[[İ™WØ‹\Ø‹İÛ—Ø‹ØYØ‹Ù[‹˜]]×Û™^N‚ˆ˜\‹˜YÚYÙ]
+ÊBˆ˜\‹˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+˜\ŠB‚ˆÙ[‹X›HHUX›UÚYÙ]
+JBˆÙ[‹X›KœÙ]Üš^›Û[XY\“X™[ÊÈ¹n£ùcíÈ‹¹«c9¦ìˆ‹¹ª(yo#È‹º, ù )È‹º`'ùn©ˆ—JBˆÙ[‹X›KœÙ]Ù[Xİ[Û™Z]š[ÜŠUX›UÚYÙ]”Ù[Xİ›İÜÊBˆÙ[‹X›KœÙ]Y]šYÙÙ\œÊUX›UÚYÙ]“›ÑY]šYÙÙ\œÊBˆ^[İ]˜YÚYÙ]
+Ù[‹X›JB‚ˆ\ÈHSX™[
+¹nîº+«¹¯%9aî¹bcyab9¢¢¹¢`9§"y«c9¦ì¹k£9¢$RH9b!º/j9nm¹/çykf9méyê"ûï#9ã¬9g.¹cêº+îùcå¹§+9g,İ[xà ˆŠBˆ\ËœÙ]ÛÜ™Ü˜\
+YJBˆ^[İ]˜YÚYÙ]
+\ÊB‚ˆYˆYÜÛÛ™ÊÙ[ŠN‚ˆš[\ËÈHQš[QX[ÙË™Ù]Ü[‘š[S˜[Y\ÊˆÙ[‹¹­îùb¨9¯%9aî¹«c9¦ìˆ‹ˆ‹ºgìúh¤H
+
+‹›\È
+‹Ø]ˆ
+‹™›XÈ
+‹›MH
+‹˜XXÊH‚ˆ
+Bˆ›Üˆ[ˆš[\Î‚ˆYˆ›İ[ˆŞÈœ]—H›Üˆ[ˆÙ[‹š][\×N‚ˆÙ[‹š][\Ë˜\[™
+Èœ]œ›[ÙHˆ¹aj:`ê9o 9d+È‹šÙ^Hˆ¹c§ú, È‹œÜYYˆŒL	HŸJBˆÙ[‹œ™Yœ™\Ú
+
+B‚ˆYˆYØİ\œ™[ÜÛÛ™ÊÙ[ŠN‚ˆ]HİŠÙ[‹›XZ[‹œÛÛ™×Ùš[HÜˆˆŠBˆYˆ›İ]Üˆ›İ]
+]
+K™^\İÊ
+N‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹”Ù]\İ‹º+íùab9.ã¹mé¹/©ùæ¡È9ææ9«c9¦ì¹n¤ú`"y¢êy. :i¥¹«c9¦ì¸à ˆŠBˆÙ[‹›XZ[‹›Ü[—Ù×Ùš]™WÛXœ˜\J
+Bˆ™]\›‚ˆYˆ]›İ[ˆÚ][VÈœ]—H›Üˆ][H[ˆÙ[‹š][\×N‚ˆÙ[‹š][\Ë˜\[™
+Èœ]ˆ]›[ÙHˆ¹aj:`ê9o 9d+È‹šÙ^Hˆ¹c§ú, È‹œÜYYˆŒL	HŸJBˆÙ[‹œ™Yœ™\Ú
+
+BˆYˆÙ[‹š][\Î‚ˆÙ[‹X›KœÙ[Xİ›İÊ[ŠÙ[‹š][\ÊHHJB‚ˆYˆ™Yœ™\Ú
+Ù[ŠN‚ˆÙ[‹X›KœÙ]›İĞÛİ[
+[ŠÙ[‹š][\ÊJBˆ›ÜˆK][H[ˆ[[Y\˜]JÙ[‹š][\ÊN‚ˆ˜[ÈHÜİŠJÌJK]
+][VÈœ]—JK›˜[YK][VÈ›[ÙH—K][VÈšÙ^H—K][VÈœÜYY—WBˆ›ÜˆËˆ[ˆ[[Y\˜]J˜[ÊN‚ˆÙ[‹X›KœÙ]][JKËUX›UÚYÙ]][JŠJB‚ˆYˆ™[[İ™WÜÙ[XİY
+Ù[ŠN‚ˆˆHÙ[‹X›K˜İ\œ™[›İÊ
+BˆYˆHˆ[ŠÙ[‹š][\ÊN‚ˆÙ[‹š][\ËœÜ
+ŠBˆÙ[‹œ™Yœ™\Ú
+
+B‚ˆYˆ[İ™WÜÙ[XİY
+Ù[‹[JN‚ˆˆHÙ[‹X›K˜İ\œ™[›İÊ
+BˆœˆHˆ
+È[BˆYˆHˆ[ŠÙ[‹š][\ÊH[™Hœˆ[ŠÙ[‹š][\ÊN‚ˆÙ[‹š][\ÖÜ—KÙ[‹š][\ÖÛœ—HHÙ[‹š][\ÖÛœ—KÙ[‹š][\ÖÜ—BˆÙ[‹œ™Yœ™\Ú
+
+BˆÙ[‹X›KœÙ[Xİ›İÊœŠB‚ˆYˆØYÜÙ[XİY
+Ù[ŠN‚ˆˆHÙ[‹X›K˜İ\œ™[›İÊ
+BˆYˆHˆ[ŠÙ[‹š][\ÊN‚ˆÙ[‹›XZ[‹›ØYÚ[\ÜYİÛÜšÚ[™×Ùš[JÙ[‹š][\ÖÜ—VÈœ]—JBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹”Ù]\İ‹¹«c9¦ì¹mìº/oyaixà º"éz+éy«c9¦ì¹l&¹§*¹b!º/j;ï#:+íùab9¢iú(cRH9akz/j9b!¹é®øà ˆŠB‚ˆYˆİ\œ™[Ú[™^
+Ù[ŠN‚ˆˆHÙ[‹X›K˜İ\œ™[›İÊ
+Bˆ™]\›ˆˆYˆHˆ[ŠÙ[‹š][\ÊH[ÙHLB‚ˆYˆÙ[XİÚ[™^
+Ù[‹[™^
+N‚ˆYˆH[™^[ŠÙ[‹š][\ÊN‚ˆÙ[‹X›KœÙ[Xİ›İÊ[™^
+Bˆ™]\›ˆYBˆ™]\›ˆ˜[ÙB‚ˆYˆ™^Ú[™^
+Ù[ŠN‚ˆYˆ›İÙ[‹š][\Î‚ˆ™]\›ˆLBˆˆHÙ[‹˜İ\œ™[Ú[™^
+
+Bˆ™]\›ˆYˆˆ[ÙH
+ˆ
+ÈHYˆˆ
+ÈH[ŠÙ[‹š][\ÊH[ÙHLJB‚ˆYˆ™]š[İ\×Ú[™^
+Ù[ŠN‚ˆYˆ›İÙ[‹š][\Î‚ˆ™]\›ˆLBˆˆHÙ[‹˜İ\œ™[Ú[™^
+
+Bˆ™]\›ˆYˆˆH[ÙHˆHB‚‚˜Û\ÜÈ]™T›ÔYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠB‚ˆ]HHSX™[
+¹ã¬9g.¹¯%9aîˆ›ÈŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆÜHR›Ş^[İ]
+
+BˆÙ[‹›ØÚ×ØˆHT\Ú]ÛŠ¼'å$È9¯%9aî¹§*ºe yk¦ˆŠBˆÙ[‹›ØÚ×Ø‹œÙ]ÚXÚØX›JYJBˆÙ[‹›ØÚ×Ø‹ÙÙÛY˜ÛÛ›™Xİ
+Ù[‹ÙÙÛWÛØÚÊBˆÙ[‹œ[šX×ØˆHT\Ú]ÛŠ¸¥¨9í)ù )y`g9«hˆŠBˆÙ[‹œ[šX×Ø‹œÙ]Z[š[][RZYÚ
+LŠBˆÙ[‹œ[šX×Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œİÜ
+BˆÜ˜YÚYÙ]
+Ù[‹›ØÚ×ØŠBˆÜ˜YÚYÙ]
+Ù[‹œ[šX×ØŠBˆÜ˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+Ü
+B‚ˆ™\Ù]HQÜ›İ\›Ş
+¹¯%9aîº.ªù.ïHŠBˆÈHQÜšY^[İ]
+™\Ù]
+Bˆ[Ù\ÈHÂˆ
+¼'ã®9§*9d"y.å¹o.ye,H‹™İZ]\ˆŠK
+¼'ã®9å-yd"y.å¹¢bÈ‹™[XİšX×ÙİZ]\ˆŠKˆ
+¼'ã®H:d¨¹ä-9o.ye,H‹œX[›ÈŠKˆ
+¼'é`H:o$ù¢bÈ‹™[\ÈŠK
+¼'ã®:-'y¥«ù¢bÈ‹˜˜\ÜÈŠKˆ
+¼'ã©Õ‹ùî«ù/-9icÈ‹›ØØ[ÈŠK
+¼'ã¯9aj:`ê9 h¹i#H‹›Û™JBˆBˆ›ÜˆK
+Ù^JH[ˆ[[Y\˜]J[Ù\ÊN‚ˆˆHT\Ú]ÛŠ
+Bˆ‹œÙ]Z[š[][RZYÚ
+MŠBˆ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙKÏZÙ^NˆXZ[‹˜\WÛ]™WÜ™\Ù]
+ÊJBˆË˜YÚYÙ]
+‹KËÌ‹ILŠBˆ^[İ]˜YÚYÙ]
+™\Ù]
+B‚ˆ˜[œÈHQÜ›İ\›Ş
+¹ã¬9g.º`'ùn©ˆÈ:, ù )ÈŠBˆÈHQÜšY^[İ]
+˜[œÊBˆÙ[‹˜[œÜÜÙHHTÜ[›Ş
+
+BˆÙ[‹˜[œÜÜÙKœÙ]˜[™ÙJLL‹LŠBˆÙ[‹˜[œÜÜÙKœÙ]˜[YJ
+BˆÙ[‹˜[œÜÜÙKœÙ]İY™š^
+ˆ9cbºgìÈŠBˆÙ[‹˜[œÜÜÙK˜[YPÚ[™ÙY˜ÛÛ›™Xİ
+Ù[‹\]WØØ\×ÛX™[
+BˆÙ[‹œÜYYHQİX›TÜ[›Ş
+
+BˆÙ[‹œÜYYœÙ]˜[™ÙJLKL
+BˆÙ[‹œÜYYœÙ]Ú[™ÛTİ\
+ŒJBˆÙ[‹œÜYYœÙ]˜[YJKŒ
+BˆÙ[‹œÜYYœÙ]İY™š^
+ˆŠBˆÙ[‹œÜYY˜[YPÚ[™ÙY˜ÛÛ›™Xİ
+XZ[‹™[™Ú[™KœÙ]ÜÜYY
+BˆÙ[‹™[^WÛ\ÈHTÜ[›Ş
+
+BˆÙ[‹™[^WÛ\ËœÙ]˜[™ÙJL
+BˆÙ[‹™[^WÛ\ËœÙ]Ú[™ÛTİ\
+L
+BˆÙ[‹™[^WÛ\ËœÙ]İY™š^
+ˆ\ÈŠBˆÙ[‹˜Ø\×ÛX™[TSX™[
+¹£ª:#d9cæ:, ùi.{ï&Œ9dàHŠBˆ\Wİ˜[œÜÜÙOTT\Ú]ÛŠ¹n¥9å*9cæ:, ùb,9aj:`ê:gìú/jŠBˆ\Wİ˜[œÜÜÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹˜\WÛ]™Wİ˜[œÜÜÙJBˆË˜YÚYÙ]
+SX™[
+¹caúfcz, ÈŠK
+BˆË˜YÚYÙ]
+Ù[‹˜[œÜÜÙKJBˆË˜YÚYÙ]
+SX™[
+º`'ùn©ˆŠKK
+BˆË˜YÚYÙ]
+Ù[‹œÜYYKJBˆË˜YÚYÙ]
+SX™[
+º" ¹¢ãKú,,zgh¹ní¹¥íˆŠK‹
+BˆË˜YÚYÙ]
+Ù[‹™[^WÛ\Ë‹JBˆË˜YÚYÙ]
+Ù[‹˜Ø\×ÛX™[Ë
+BˆË˜YÚYÙ]
+\Wİ˜[œÜÜÙKËJBˆË˜YÚYÙ]
+SX™[
+º`'ùn©¹k§¹¥í¹/g9å*9.£¹aj:`ê9b!º/j;ï&ùcæ:, ù/&¹å'ù¢$9nmº/oyaiy/çy£ yd#9«iyæ¡9¥¬:gìú/j8à ˆŠKKŠBˆ^[İ]˜YÚYÙ]
+˜[œÊB‚ˆY]HQÜ›İ\›Ş
+º ,ú/åÈ:" ¹¢ãyfjŠBˆYÈHQÜšY^[İ]
+Y]
+BˆÙ[‹›Y]›Û›ÛYHHPÚXÚĞ›Ş
+º ,ú/å9o 9d+ú" ¹¢ãyfjŠBˆÙ[‹›Y]›Û›ÛYKœÙ]ÚXÚÙY
+˜[ÙJBˆÙ[‹›Y]›Û›ÛYKÙÙÛY˜ÛÛ›™Xİ
+Ù[‹ÙÙÛWÛY]›Û›ÛYWÛİ]]
+BˆÙ[‹˜Ûİ[[ˆHPÚXÚĞ›Ş
+¹¯%9aî¹bcH9¢ãHÛİ[Z[ˆŠBˆÙ[‹˜Ûİ[[‹œÙ]ÚXÚÙY
+YJBˆÙ[‹›XZ[—Ûİ]HPÛÛX›Ğ›Ş
+
+BˆÙ[‹›[Ûš]Ü—Ûİ]HPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ™Yœ™\ÚÙ]šXÙ\Ê
+Bˆ™YˆHT\Ú]ÛŠ¹b-ù¥¬9hì9chHŠBˆ™Y‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÙ]šXÙ\ÊBˆYË˜YÚYÙ]
+Ù[‹›Y]›Û›ÛYK
+BˆYË˜YÚYÙ]
+Ù[‹˜Ûİ[[‹JBˆYË˜YÚYÙ]
+SX™[
+¹..ú/¤ùaîˆŠKK
+BˆYË˜YÚYÙ]
+Ù[‹›XZ[—Ûİ]KJBˆYË˜YÚYÙ]
+SX™[
+º ,ú/å:/¤ùaîˆŠK‹
+BˆYË˜YÚYÙ]
+Ù[‹›[Ûš]Ü—Ûİ]‹JBˆYË˜YÚYÙ]
+™Y‹ËJBˆ^[İ]˜YÚYÙ]
+Y]
+B‚ˆZYHHQÜ›İ\›Ş
+•TĞˆÈRQH:!&º.#ù§oÈŠBˆ[HU›Ş^[İ]
+ZYJBˆÙ[‹›ZYWÜİ]\ÈHSX™[
+¹l&¹§*¹¨à9­bÈRQH:+¯¹i!ÈŠBˆØØ[ˆHT\Ú]ÛŠ¹¢jù£ãÈRQHŠBˆØØ[‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œØØ[—ÛZYJBˆ[˜YÚYÙ]
+Ù[‹›ZYWÜİ]\ÊBˆ[˜YÚYÙ]
+ØØ[ŠBˆ[˜YÚYÙ]
+SX™[
+ºnæ:+©9¦(9l!;ï&¹¤«y¥/‹ù¦ ¹`g8à y."ù. :i¥¸à y."¹. :i¥¸à y`g9«h¸à ˆŠJBˆ^[İ]˜YÚYÙ]
+ZYJB‚ˆÙ[‹œİ]\ÈHSX™[
+¹ã¬9g.¹â­¹  {ï&¹o¡y§.ˆŠBˆÙ[‹œİ]\ËœÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠBˆ^[İ]˜YÚYÙ]
+Ù[‹œİ]\ÊBˆ^[İ]˜Yİ™]Ú
+JB‚ˆYˆ\]WØØ\×ÛX™[
+Ù[‹˜[YJN‚ˆÙ[Z]Û™\ÏZ[
+˜[YJBˆØ\Ï\Ù[Z]Û™\ÈYˆHÙ[Z]Û™\ÈHÈ[ÙHˆÙ[‹˜Ø\×ÛX™[œÙ]^
+ˆ¹£ª:#d9cæ:, ùi.{ï&ØØ\ßH9dàHˆYˆØ\È[ÙH¹£ª:#d9cæ:, ùi.{ï&Œ9dàKú, ù¥m9d£9o)¹£!ù¬åHŠB‚ˆYˆÙÙÛWÛØÚÊÙ[‹ÚXÚÙY
+N‚ˆYˆÚXÚÙY‚ˆÙ[‹›ØÚ×Ø‹œÙ]^
+¼'å$ˆ9¯%9aî¹mìºe yk¦ˆŠBˆÙ[‹œİ]\ËœÙ]^
+¹ã¬9g.¹â­¹  {ï&¹mìºe yk¦»ï#:`oùacz+ëú)éˆŠBˆ[ÙN‚ˆÙ[‹›ØÚ×Ø‹œÙ]^
+¼'å$È9¯%9aî¹§*ºe yk¦ˆŠBˆÙ[‹œİ]\ËœÙ]^
+¹ã¬9g.¹â­¹  {ï&¹o¡y§.ˆŠB‚ˆYˆ™Yœ™\ÚÙ]šXÙ\ÊÙ[ŠN‚ˆ›ÜˆÛÛX›È[ˆÜÙ[‹›XZ[—Ûİ]Ù[‹›[Ûš]Ü—Ûİ]N‚ˆÛÛX›Ë˜ÛX\Š
+BˆN‚ˆ]šXÙ\ÈHÙœ]Y\WÙ]šXÙ\Ê
+Bˆİ]ÈH×Bˆ›ÜˆK[ˆ[[Y\˜]J]šXÙ\ÊN‚ˆYˆÈ›X^Ûİ]]ØÚ[›™[È—Hˆ‚ˆİ]Ë˜\[™
+
+KÈ›˜[YH—JJBˆ›ÜˆÛÛX›È[ˆÜÙ[‹›XZ[—Ûİ]Ù[‹›[Ûš]Ü—Ûİ]N‚ˆ›ÜˆK˜[YH[ˆİ]Î‚ˆÛÛX›Ë˜Y][JˆÚ_NˆÛ˜[Y_H‹JBˆYˆÙ[‹›[Ûš]Ü—Ûİ]˜Ûİ[
+
+HˆN‚ˆÙ[‹›[Ûš]Ü—Ûİ]œÙ]İ\œ™[[™^
+JBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹›XZ[—Ûİ]˜Y][Jº+¯¹i!ú+îùcå¹i,z-)HŠBˆÙ[‹›[Ûš]Ü—Ûİ]˜Y][Jº+¯¹i!ú+îùcå¹i,z-)HŠB‚ˆYˆØØ[—ÛZYJÙ[ŠN‚ˆN‚ˆ[\ÜZYÂˆ˜[Y\ÈHZYË™Ù]Ú[œ]Û˜[Y\Ê
+BˆYˆ›İ˜[Y\Î‚ˆÙ[‹›ZYWÜİ]\ËœÙ]^
+¹§*¹¨à9­bùb,RQH:/¤ùaiz+¯¹i!ÈŠBˆ™]\›‚ˆÙ[‹›XZ[‹œİ\ÛZYWİÛÜšÙ\Š
+BˆÙ[‹›ZYWÜİ]\ËœÙ]^
+¹«hùg*9æäyd+RQ{ï&—ˆˆ
+È—ˆ‹š›Ú[Š˜[Y\ÊH
+Âˆ——ŒÍy¤«y¥/‹ù¦ ¹`gÍÏy`g9«hˆÎy."ù. :i¥ˆÎOy."¹. :i¥ˆŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹›ZYWÜİ]\ËœÙ]^
+“RQH9b'yiâùc%¹i,z-){ï&ˆˆ
+ÈİŠJJB‚ˆYˆÙÙÛWÛY]›Û›ÛYWÛİ]]
+Ù[ŠN‚ˆYˆÙ[‹›Y]›Û›ÛYKš\ĞÚXÚÙY
+
+N‚ˆœHHÙ[‹›XZ[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+˜œH‹LŒ
+HYˆÙ]]ŠÙ[‹›XZ[‹˜[˜[\Ú\×Ü™\İ[‹›Û™JH[ÙHLŒˆ]šXÙHHÙ[‹›[Ûš]Ü—Ûİ]˜İ\œ™[]J
+BˆN‚ˆÙ[‹›XZ[‹›Y]›Û›ÛYWÙ[™Ú[™Kœİ\
+]šXÙOY]šXÙKœOXœJBˆÙ[‹œİ]\ËœÙ]^
+ˆ¹ã¬9g.¹â­¹  {ï&º ,ú/å:" ¹¢ãyfjÙ›Ø]
+œJN‹ŒYŸH”HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹›Y]›Û›ÛYKœÙ]ÚXÚÙY
+˜[ÙJBˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹º ,ú/å:" ¹¢ãyfj9i,z-)H‹İŠJJBˆ[ÙN‚ˆÙ[‹›XZ[‹›Y]›Û›ÛYWÙ[™Ú[™KœİÜ
+
+B‚‚‚˜Û\ÜÈ\œ˜[™Ù[Y[ØÛÜ™TYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠB‚ˆ]HHSX™[
+RH9¥.yï%ˆÈ9.d:,,y.+yoàÈŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JBˆ[HSX™[
+¹ab9b!¹§¤9«c9¦ì¹æ¡”xà z, ù )øà yd£9o)¹.#¹«­z$/{ï#9a£yå'ù¢$9¯%9icùcàº  ú,,yd£9¥¬9æ¡RQH9/-9icùï%ºacxà ¹c§ùiâùoezgìù.áy/g9..¹b!¹§¤9càº  øà ˆŠBˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+[
+B‚ˆ[˜[\Ú\×Ø›ŞHQÜ›İ\›Ş
+¸¤h:gìù.d9b!¹§¤9.#¹d£9o)¹¥íºeí9î¯ÈŠBˆ[HU›Ş^[İ]
+[˜[\Ú\×Ø›Ş
+Bˆ›İÈHR›Ş^[İ]
+
+BˆÙ[‹œÛÛ™×ÛX™[HSX™[
+¹l&¹§*¹b!¹§¤9«c9¦ìˆŠBˆ[˜[^™HHT\Ú]ÛŠRXÛÛŠXÛÛ—Ü]
+œÜ]ŠJK¹b!¹§¤9d£9o)ˆÈ”HÈ:, ù )ÈŠBˆ\WØ]Û—ØXØÙ[
+[˜[^™Kœš[X\HŠBˆ[˜[^™K˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹˜[˜[^™WÙ[ÜØÛÜ™JBˆ›İË˜YÚYÙ]
+Ù[‹œÛÛ™×ÛX™[JBˆ›İË˜YÚYÙ]
+[˜[^™JBˆ[˜Y^[İ]
+›İÊBˆÙ[‹˜[˜[\Ú\×Üİ]\ÈHSX™[
+¹ëbyo¡yb!¹§¤ŠBˆÙ[‹˜[˜[\Ú\×Üİ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆ[˜YÚYÙ]
+Ù[‹˜[˜[\Ú\×Üİ]\ÊBˆÙ[‹˜ÚÜ™İX›HHUX›UÚYÙ]
+
+BˆÙ[‹˜ÚÜ™İX›KœÙ]Üš^›Û[XY\“X™[ÊÈ¹l#ú" ˆ‹¹¥íºeí‹¹d£9o)ˆ‹¹«­z$/H—JBˆÙ[‹˜ÚÜ™İX›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJBˆ[˜YÚYÙ]
+Ù[‹˜ÚÜ™İX›JBˆ^[İ]˜YÚYÙ]
+[˜[\Ú\×Ø›Ş
+B‚ˆ˜[œ×Ø›ŞHQÜ›İ\›Ş
+¸¤hH9caúfcz, ÈŠBˆHR›Ş^[İ]
+˜[œ×Ø›Ş
+BˆÙ[‹˜[œÜÜÙHHTÜ[›Ş
+
+BˆÙ[‹˜[œÜÜÙKœÙ]˜[™ÙJLL‹LŠBˆÙ[‹˜[œÜÜÙKœÙ]˜[YJ
+BˆÙ[‹˜[œÜÜÙKœÙ]İY™š^
+ˆ9cbºgìÈŠBˆÙ[‹\™Ù]ÚÙ^HHSX™[
+¹æë¹¨!ú, ûï&¸ %ŠBˆÙ[‹˜[œÜÜÙK˜[YPÚ[™ÙY˜ÛÛ›™Xİ
+XZ[‹\]Wİ\™Ù]ÚÙ^WÛX™[
+Bˆ˜[œÜÜÙWØˆHT\Ú]ÛŠ¹å'ù¢$9caúfcz, ùakz/j9¯%9aî¹âbŠBˆ\WØ]Û—ØXØÙ[
+˜[œÜÜÙWØ‹œİXØÙ\ÜÈŠBˆ˜[œÜÜÙWØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹™Ù[™\˜]Wİ˜[œÜÜÙYÜİ[\ÊBˆ˜YÚYÙ]
+SX™[
+¹caúfcz, ÈŠJBˆ˜YÚYÙ]
+Ù[‹˜[œÜÜÙJBˆ˜YÚYÙ]
+Ù[‹\™Ù]ÚÙ^JBˆ˜Yİ™]Ú
+JBˆ˜YÚYÙ]
+˜[œÜÜÙWØŠBˆ^[İ]˜YÚYÙ]
+˜[œ×Ø›Ş
+B‚ˆ\œ˜[™ÙWØ›ŞHQÜ›İ\›Ş
+¸¤hˆRH9¥.yï%¹¥®y¨bŠBˆ›HQÜšY^[İ]
+\œ˜[™ÙWØ›Ş
+BˆÙ[‹˜\œ˜[™ÙWÛ[ÙHHPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜\œ˜[™ÙWÛ[ÙK˜Y][\ÊÂˆ¹.d:f'ùã¬9g.¹âb‹¹§*9d"y.å¹o.ye,yâb‹ºd¨¹ä-9o.ye,yâb‹¹.#y£ä¹å-yâb‹¹­`z(c9¥.yï%¹âb‹¹¤aù®æ¹¥.yï%¹âb‚ˆJBˆÙ[‹\ÙWÜ^Y\—ÜÙ][™ÜÈHPÚXÚĞ›Ş
+¹/oùå*8 '9.d9¢bù¯%9icù.+yoàø 'ycà¹¥l9cà¹.#¹ï%ºacHŠBˆÙ[‹\ÙWÜ^Y\—ÜÙ][™ÜËœÙ]ÚXÚÙY
+YJBˆÙ[‹›]\ÚXØ[Ú[[YÙ[˜ÙHHPÚXÚĞ›Ş
+¹d+ùå*9«­z$/zgìù.d9 )ù¦nº ïyï%¹£¤ˆŠBˆÙ[‹›]\ÚXØ[Ú[[YÙ[˜ÙKœÙ]ÚXÚÙY
+YJBˆÙ[‹™[™\™ŞWØİ\™HHPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[™\™ŞWØİ\™K˜Y][\ÊÈº!ê¹bª9b)9¥«H‹¹®$:/æùh§¹o.ˆ‹¹nlùê,ùã¬9g.ˆ‹¹o.¹o,ykîy«å‹¹¢¤¹ áyabùb-ˆ—JBˆÙ[‹˜\œ˜[™ÙWÛ›İHHSX™[
+¹å'ù¢$9æ¡9¦+ù¥¬9æ¡RQH9/-9icùîäù§¡;ï#9.#yæí9£©yi#yb-¹c§ùoezgìù.+yæ¡9.d9fj:gìúh¤xà ˆŠBˆÙ[‹˜\œ˜[™ÙWÛ›İKœÙ]ÛÜ™Ü˜\
+YJBˆZYWØˆHT\Ú]ÛŠ¹å'ù¢$:gìù.d9 )ù¦nº ïyï%ºacHRQHŠBˆ\WØ]Û—ØXØÙ[
+ZYWØ‹œš[X\HŠBˆZYWØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹™Ù[™\˜]WÛ]\ÚXØ[Ú[[YÙ[˜ÙWÛZYJBˆ›˜YÚYÙ]
+SX™[
+¹¥.yï%¹ª(yo#ÈŠK
+Bˆ›˜YÚYÙ]
+Ù[‹˜\œ˜[™ÙWÛ[ÙKJBˆ›˜YÚYÙ]
+ZYWØ‹ŠBˆ›˜YÚYÙ]
+Ù[‹\ÙWÜ^Y\—ÜÙ][™ÜËKKÊBˆ›˜YÚYÙ]
+Ù[‹›]\ÚXØ[Ú[[YÙ[˜ÙK‹KŠBˆ›˜YÚYÙ]
+Ù[‹™[™\™ŞWØİ\™K‹ŠBˆ›˜YÚYÙ]
+Ù[‹˜\œ˜[™ÙWÛ›İKËKÊBˆ^[İ]˜YÚYÙ]
+\œ˜[™ÙWØ›Ş
+B‚ˆÛX\Ø›ŞHQÜ›İ\›Ş
+¹¦nº ïyï%ºacycà¹¥l:h¡:)âŠBˆØ›HU›Ş^[İ]
+ÛX\Ø›Ş
+BˆÙ[‹œÛX\Üİ[[X\HHSX™[
+¹l&¹§*º+îùcå¹.d9¢bùcà¹¥lŠBˆÙ[‹œÛX\Üİ[[X\KœÙ]ÛÜ™Ü˜\
+YJBˆ™Yœ™\ÚÜÛX\HT\Ú]ÛŠº+îùcå¹odùbcy.d9¢bú+¯¹ïkˆŠBˆ™Yœ™\ÚÜÛX\˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ™Yœ™\ÚÜÛX\Ø\œ˜[™Ù\—Üİ[[X\JBˆØ›˜YÚYÙ]
+Ù[‹œÛX\Üİ[[X\JBˆØ›˜YÚYÙ]
+™Yœ™\ÚÜÛX\
+Bˆ^[İ]˜YÚYÙ]
+ÛX\Ø›Ş
+B‚ˆ[[YÙ[˜ÙWØ›ŞHQÜ›İ\›Ş
+¹«­z$/zgìù.d9 )úh¡:)âŠBˆX›HU›Ş^[İ]
+[[YÙ[˜ÙWØ›Ş
+BˆÙ[‹š[[YÙ[˜ÙWÜİ[[X\HHSX™[
+¹l&¹§*¹b!¹§¤9«­z$/z ïzaãÈŠBˆÙ[‹š[[YÙ[˜ÙWÜİ[[X\KœÙ]ÛÜ™Ü˜\
+YJBˆ[˜[^™WÛ]\ÚX×ØˆHT\Ú]ÛŠ¹b!¹§¤9«­z$/ynm¹å'ù¢$9ï%ºacyëe¹åiHŠBˆ[˜[^™WÛ]\ÚX×Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ™Yœ™\ÚÛ]\ÚXØ[Ú[[YÙ[˜ÙWÜ™]šY]ÊBˆX›˜YÚYÙ]
+Ù[‹š[[YÙ[˜ÙWÜİ[[X\JBˆX›˜YÚYÙ]
+[˜[^™WÛ]\ÚX×ØŠBˆ^[İ]˜YÚYÙ]
+[[YÙ[˜ÙWØ›Ş
+B‚ˆX[X[Ø›ŞHQÜ›İ\›Ş
+¹.®¹méyo«º, ÈÈKPˆ9âb9§+ŠBˆX›HQÜšY^[İ]
+X[X[Ø›Ş
+BˆÙ[‹›X[X[ÜÙXİ[ÛˆHPÛÛX›Ğ›Ş
+
+BˆÙ[‹›X[X[ÜÙXİ[Û‹˜İ\œ™[[™^Ú[™ÙY˜ÛÛ›™Xİ
+XZ[‹›ØYÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊB‚ˆÙ[‹›X[X[ÙİZ]\ˆHTÛY\Š]’Üš^›Û[
+BˆÙ[‹›X[X[ÙİZ]\‹œÙ]˜[™ÙJMLL
+NÈÙ[‹›X[X[ÙİZ]\‹œÙ]˜[YJ
+BˆÙ[‹›X[X[Ø˜\ÜÈHTÛY\Š]’Üš^›Û[
+BˆÙ[‹›X[X[Ø˜\ÜËœÙ]˜[™ÙJMLL
+NÈÙ[‹›X[X[Ø˜\ÜËœÙ]˜[YJ
+BˆÙ[‹›X[X[Ù[\ÈHTÛY\Š]’Üš^›Û[
+BˆÙ[‹›X[X[Ù[\ËœÙ]˜[™ÙJMLL
+NÈÙ[‹›X[X[Ù[\ËœÙ]˜[YJ
+BˆÙ[‹›X[X[ÜX[›ÈHTÛY\Š]’Üš^›Û[
+BˆÙ[‹›X[X[ÜX[›ËœÙ]˜[™ÙJMLL
+NÈÙ[‹›X[X[ÜX[›ËœÙ]˜[YJ
+BˆÙ[‹›X[X[Ùš[HTÛY\Š]’Üš^›Û[
+BˆÙ[‹›X[X[Ùš[œÙ]˜[™ÙJMLL
+NÈÙ[‹›X[X[Ùš[œÙ]˜[YJ
+BˆÙ[‹›X[X[ÜÜXÙHHTÛY\Š]’Üš^›Û[
+BˆÙ[‹›X[X[ÜÜXÙKœÙ]˜[™ÙJMLL
+NÈÙ[‹›X[X[ÜÜXÙKœÙ]˜[YJ
+B‚ˆÙ[‹›X[X[ÛX™[HSX™[
+º, ù¥m:# ùfí;ï&‹ML	H;ïgˆ
+ÍL	{ï#:(j9é.¹¬¯ùå*9ªf9dlùa/úgìù.d:!ê¹bª9ëe¹åiHŠBˆÙ[‹›X[X[ÛX™[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆÙ[‹›X[X[ÛX™[œÙ]ÛÜ™Ü˜\
+YJB‚ˆØ]™WØHHT\Ú]ÛŠ¹/çykf9âb9§+HŠBˆØ]™WØˆHT\Ú]ÛŠ¹/çykf9âb9§+ˆŠBˆ\WØ]Û—ØXØÙ[
+Ø]™WØKœš[X\HŠBˆ\WØ]Û—ØXØÙ[
+Ø]™WØ‹œİXØÙ\ÜÈŠBˆØ]™WØK˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹œØ]™WØ\œ˜[™Ù[Y[İ˜\šX[
+HŠJBˆØ]™WØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹œØ]™WØ\œ˜[™Ù[Y[İ˜\šX[
+ˆŠJB‚ˆÙ[—ØHHT\Ú]ÛŠ¹å'ù¢$H9âbRQHŠBˆÙ[—ØˆHT\Ú]ÛŠ¹å'ù¢$ˆ9âbRQHŠBˆÙ[—ØK˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹™Ù[™\˜]Wİ˜\šX[ÛZYJHŠJBˆÙ[—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹™Ù[™\˜]Wİ˜\šX[ÛZYJˆŠJB‚ˆX›˜YÚYÙ]
+SX™[
+¹«­z$/HŠK
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[ÜÙXİ[Û‹KKÊBˆX›˜YÚYÙ]
+SX™[
+¹d"y.åˆŠKK
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[ÙİZ]\‹KKKÊBˆX›˜YÚYÙ]
+SX™[
+˜\ÜÈŠK‹
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[Ø˜\ÜË‹KKÊBˆX›˜YÚYÙ]
+SX™[
+ºo$ÈŠKË
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[Ù[\ËËKKÊBˆX›˜YÚYÙ]
+SX™[
+ºe+¹ææŠK
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[ÜX[›ËKKÊBˆX›˜YÚYÙ]
+SX™[
+‘š[ŠKK
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[Ùš[KKKÊBˆX›˜YÚYÙ]
+SX™[
+¹åfyæoHŠK‹
+NÈX›˜YÚYÙ]
+Ù[‹›X[X[ÜÜXÙK‹KKÊBˆX›˜YÚYÙ]
+Ù[‹›X[X[ÛX™[ËK
+BˆX›˜YÚYÙ]
+Ø]™WØK
+NÈX›˜YÚYÙ]
+Ù[—ØKJBˆX›˜YÚYÙ]
+Ø]™WØ‹ŠNÈX›˜YÚYÙ]
+Ù[—Ø‹ÊBˆ^[İ]˜YÚYÙ]
+X[X[Ø›Ş
+B‚ˆÛÛ\\™WØ›ŞHQÜ›İ\›Ş
+KĞˆ9k§¹¥íº+åyd+9.#¹âb9§+9c¡¹cìˆŠBˆØ›HQÜšY^[İ]
+ÛÛ\\™WØ›Ş
+B‚ˆÙ[‹˜ÛÛ\\™WÜÙXİ[ÛˆHPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜ÛÛ\\™WÜÙXİ[Û‹œÙ]Z[š[][UÚY
+ŒŒ
+B‚ˆ™[™\—ØHHT\Ú]ÛŠ¹®,¹§äÈHŠBˆ™[™\—ØˆHT\Ú]ÛŠ¹®,¹§äÈˆŠBˆ™[™\—ØK˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹œ™[™\—İ˜\šX[Ø]Y[ÊHŠJBˆ™[™\—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹œ™[™\—İ˜\šX[Ø]Y[ÊˆŠJB‚ˆ^WØHHT\Ú]ÛŠº+åyd+HŠBˆ^WØˆHT\Ú]ÛŠº+åyd+ˆŠBˆ\WØ]Û—ØXØÙ[
+^WØKœš[X\HŠBˆ\WØ]Û—ØXØÙ[
+^WØ‹œİXØÙ\ÜÈŠBˆ^WØK˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹œ™]šY]×İ˜\šX[
+HŠJBˆ^WØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹œ™]šY]×İ˜\šX[
+ˆŠJB‚ˆİÜØXˆHT\Ú]ÛŠ¹`g9«hº+åyd+ŠBˆİÜØX‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œİÜİ˜\šX[Ü™]šY]ÊB‚ˆÙ[‹›ÛÜØÛÛ\\™HHPÚXÚĞ›Ş
+¹cê¹oª¹ã«ùodùbcy«­z$/ykîy«åŠBˆÙ[‹›ÛÜØÛÛ\\™KœÙ]ÚXÚÙY
+YJB‚ˆYÜØHHT\Ú]ÛŠºaáùå*HŠBˆYÜØˆHT\Ú]ÛŠºaáùå*ˆŠBˆYÜØK˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹˜YÜİ˜\šX[
+HŠJBˆYÜØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹˜YÜİ˜\šX[
+ˆŠJB‚ˆ[™ÈHT\Ú]ÛŠ•[™ÈŠBˆ™YÈHT\Ú]ÛŠ”™YÈŠBˆ[™Ë˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹[™×Ø\œ˜[™Ù[Y[ØÚ[™ÙJBˆ™YË˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ™Y×Ø\œ˜[™Ù[Y[ØÚ[™ÙJB‚ˆÛ˜\ÚİHT\Ú]ÛŠ¹/çykf9c¡¹cì¹oêùáiÈŠBˆÛ˜\Úİ˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œØ]™WØ\œ˜[™Ù[Y[ÜÛ˜\Úİ
+Bˆ™\İÜ™WÚ\İÜHHT\Ú]ÛŠ¹ h¹i#y¢`:`"yc¡¹cìˆŠBˆ™\İÜ™WÚ\İÜK˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ™\İÜ™WÜÙ[XİYÚ\İÜJB‚ˆÙ[‹š\İÜWİX›HHUX›UÚYÙ]
+
+BˆÙ[‹š\İÜWİX›KœÙ]Üš^›Û[XY\“X™[ÊÈ¹¥íºeí‹¹âb9§+‹º+í9¦#ˆ‹¹¥¡ù.íˆ—JBˆÙ[‹š\İÜWİX›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJB‚ˆØ›˜YÚYÙ]
+SX™[
+¹kîy«å9«­z$/HŠK
+BˆØ›˜YÚYÙ]
+Ù[‹˜ÛÛ\\™WÜÙXİ[Û‹JBˆØ›˜YÚYÙ]
+Ù[‹›ÛÜØÛÛ\\™K‹KŠBˆØ›˜YÚYÙ]
+™[™\—ØKK
+NÈØ›˜YÚYÙ]
+^WØKKJBˆØ›˜YÚYÙ]
+™[™\—Ø‹KŠNÈØ›˜YÚYÙ]
+^WØ‹KÊBˆØ›˜YÚYÙ]
+İÜØX‹‹
+BˆØ›˜YÚYÙ]
+YÜØK‹JBˆØ›˜YÚYÙ]
+YÜØ‹‹ŠBˆØ›˜YÚYÙ]
+Û˜\Úİ‹ÊBˆØ›˜YÚYÙ]
+[™ËË
+BˆØ›˜YÚYÙ]
+™YËËJBˆØ›˜YÚYÙ]
+™\İÜ™WÚ\İÜKË‹KŠBˆØ›˜YÚYÙ]
+Ù[‹š\İÜWİX›KK
+Bˆ^[İ]˜YÚYÙ]
+ÛÛ\\™WØ›Ş
+B‚ˆ›×ØÛÛ\\™HHQÜ›İ\›Ş
+KĞˆ9.$ù.&¹kîy«åŠBˆÛHQÜšY^[İ]
+›×ØÛÛ\\™JB‚ˆÙ[‹˜X—İØ]™WØHHØ]™Y›Ü›UÚYÙ]
+
+BˆÙ[‹˜X—İØ]™WØˆHØ]™Y›Ü›UÚYÙ]
+
+BˆÙ[‹˜X—İØ]™WØKœÙ]Z[š[][RZYÚ
+L
+BˆÙ[‹˜X—İØ]™WØ‹œÙ]Z[š[][RZYÚ
+L
+B‚ˆÙ[‹›İY™\Ü×ÛX]ÚHPÚXÚĞ›Ş
+º!ê¹bª9dãyn©¹c.zacHŠBˆÙ[‹›İY™\Ü×ÛX]ÚœÙ]ÚXÚÙY
+YJBˆÙ[‹š[œİ[ÜİÚ]ÚHPÚXÚĞ›Ş
+¹ç«9¥íˆKĞˆ9b!ù£hˆŠBˆÙ[‹š[œİ[ÜİÚ]ÚœÙ]ÚXÚÙY
+YJB‚ˆİÚ]ÚØHHT\Ú]ÛŠ¹b!ùb,HŠBˆİÚ]ÚØˆHT\Ú]ÛŠ¹b!ùb,ˆŠBˆ\WØ]Û—ØXØÙ[
+İÚ]ÚØKœš[X\HŠBˆ\WØ]Û—ØXØÙ[
+İÚ]ÚØ‹œİXØÙ\ÜÈŠBˆİÚ]ÚØK˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹š[œİ[ÜİÚ]Úİ˜\šX[
+HŠJBˆİÚ]ÚØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹š[œİ[ÜİÚ]Úİ˜\šX[
+ˆŠJB‚ˆ[˜[^™WÙY™ˆHT\Ú]ÛŠ¹b!¹§¤KĞˆ9më¹o ˆŠBˆ[˜[^™WÙY™‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹˜[˜[^™WØX—ÙY™™\™[˜ÙJB‚ˆÙ[‹™Y™—ÛX™[HSX™[
+KĞˆ9më¹o »ï&¹l&¹§*¹b!¹§¤ŠBˆÙ[‹™Y™—ÛX™[œÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹™Y™—ÛX™[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠB‚ˆÛ˜YÚYÙ]
+SX™[
+H9¬è¹ohˆŠK
+BˆÛ˜YÚYÙ]
+Ù[‹˜X—İØ]™WØKKK
+BˆÛ˜YÚYÙ]
+SX™[
+ˆ9¬è¹ohˆŠKK
+BˆÛ˜YÚYÙ]
+Ù[‹˜X—İØ]™WØ‹KKK
+BˆÛ˜YÚYÙ]
+Ù[‹›İY™\Ü×ÛX]Ú‹
+BˆÛ˜YÚYÙ]
+Ù[‹š[œİ[ÜİÚ]Ú‹JBˆÛ˜YÚYÙ]
+İÚ]ÚØK‹ŠBˆÛ˜YÚYÙ]
+İÚ]ÚØ‹‹ÊBˆÛ˜YÚYÙ]
+[˜[^™WÙY™‹‹
+BˆÛ˜YÚYÙ]
+Ù[‹™Y™—ÛX™[ËKJB‚ˆ^[İ]˜YÚYÙ]
+›×ØÛÛ\\™JB‚ˆ™[™\—Ø›ŞHQÜ›İ\›Ş
+¸¤hÈ9¥¬9ï%ºaczgìù®¤9®,¹§äÈŠBˆ˜›HQÜšY^[İ]
+™[™\—Ø›Ş
+BˆÙ[‹œÛİ[™›ÛÙY]HS[™QY]
+
+BˆÙ[‹œÛİ[™›ÛÙY]œÙ]XÙZÛ\•^
+º`"y¢êHœÙŒˆÈœÙŒÈÛİ[™›ÛŠBˆÙ—ØˆHT\Ú]ÛŠº`"y¢êHÛİ[™›ÛŠBˆÙ—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹˜ÚÛÜÙWÜÛİ[™›Û
+Bˆ™[™\—İØ]—ØˆHT\Ú]ÛŠ¹®,¹§äù¥¬9ï%ºacHĞUˆŠBˆ\WØ]Û—ØXØÙ[
+™[™\—İØ]—Ø‹œİXØÙ\ÜÈŠBˆ™[™\—İØ]—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ™[™\—Ø\œ˜[™Ù[Y[İØ]ŠBˆ™[™\—Û\×ØˆHT\Ú]ÛŠ¹®,¹§äù¥¬9ï%ºacHTÈŠBˆ™[™\—Û\×Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹œ™[™\—Ø\œ˜[™Ù[Y[Û\ÊBˆ˜›˜YÚYÙ]
+SX™[
+”Ûİ[™›ÛŠK
+Bˆ˜›˜YÚYÙ]
+Ù[‹œÛİ[™›ÛÙY]JBˆ˜›˜YÚYÙ]
+Ù—Ø‹ŠBˆ˜›˜YÚYÙ]
+™[™\—İØ]—Ø‹KJBˆ˜›˜YÚYÙ]
+™[™\—Û\×Ø‹KŠBˆ^[İ]˜YÚYÙ]
+™[™\—Ø›Ş
+B‚ˆØÛÜ™WØ›ŞHQÜ›İ\›Ş
+¸¤i9.d9¢bù¯%9icú,,HŠBˆÛHR›Ş^[İ]
+ØÛÜ™WØ›Ş
+BˆXYHT\Ú]ÛŠ¹kï9aîˆXYÚY]È9d£9o)º,,HŠBˆXY˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹™^ÜÛXYÜÚY]
+BˆİZ]\ˆHT\Ú]ÛŠ¹d"y.å¹¯%9icùcàº  ú,,HŠBˆİZ]\‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹™^ÜÚ[œİ[Y[ÜØÛÜ™J™İZ]\ˆŠJBˆ˜\ÜÈHT\Ú]ÛŠº-'y¥«ù¯%9icùcàº  ú,,HŠBˆ˜\ÜË˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹™^ÜÚ[œİ[Y[ÜØÛÜ™J˜˜\ÜÈŠJBˆ[\ÈHT\Ú]ÛŠºo$ù¢bù¯%9icùcàº  ú,,HŠBˆ[\Ë˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹™^ÜÚ[œİ[Y[ÜØÛÜ™J™[\ÈŠJBˆX[›ÈHT\Ú]ÛŠºe+¹ææ9¯%9icùcàº  ú,,HŠBˆX[›Ë˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆXZ[‹™^ÜÚ[œİ[Y[ÜØÛÜ™JœX[›ÈŠJBˆ]\ÚXŞ[HT\Ú]ÛŠ¹kï9aîˆ]\ÚXÖSŠBˆ]\ÚXŞ[˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹™^ÜÛ]\ÚXŞ[
+BˆY[ÙHHT\Ú]ÛŠ¹..ù¥âùo¢ùcàº  ú/k9a¦HŠBˆY[ÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+XZ[‹™^ÜÛY[ÙWÜ™Y™\™[˜ÙJBˆ›Üˆˆ[ˆÛXYİZ]\‹˜\ÜË[\ËX[›Ë]\ÚXŞ[Y[ÙWN‚ˆÛ˜YÚYÙ]
+ŠBˆ[Ü›İÈHR›Ş^[İ]
+
+Bˆ›ÜˆX™[[œİ[ˆÊ¹d"y.åˆ]\ÚXÖS‹™İZ]\ˆŠK
+˜\ÜÈ]\ÚXÖS‹˜˜\ÜÈŠK
+ºo$È]\ÚXÖS‹™[\ÈŠK
+ºe+¹ææ]\ÚXÖS‹œX[›ÈŠWN‚ˆTT\Ú]ÛŠX™[
+Bˆ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙKZ[œİˆXZ[‹™^ÜÚ[œİ[Y[Û]\ÚXŞ[
+
+JBˆ[Ü›İË˜YÚYÙ]
+ŠBˆ^[İ]˜Y^[İ]
+[Ü›İÊBˆ^[İ]˜YÚYÙ]
+ØÛÜ™WØ›Ş
+B‚ˆÙ[‹œ›ÙÜ™\ÜÈHT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]›Ü›X]
+¹¥.yï%ˆÈ9aîº,,H	\	HŠBˆ^[İ]˜YÚYÙ]
+Ù[‹œ›ÙÜ™\ÜÊB‚‚‚˜Û\ÜÈ\ÚİÜØÛÜ™PØ[˜\ÊUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[[XZ[‚ˆÙ[‹›[ÙOH¹.¥9î¯ú,,H‚ˆÙ[‹œÜÚ][ÛLŒˆÙ[‹œÚİ×Û\šXÜÏUYBˆÙ[‹œÙ]Z[š[][RZYÚ
+ŒÌ
+B‚ˆYˆÙ]Û[ÙJÙ[‹[ÙJN‚ˆÙ[‹›[ÙO\İŠ[ÙJBˆÙ[‹\]J
+B‚ˆYˆÙ]ÜÜÚ][ÛŠÙ[‹ÙXÛÛ™ÊN‚ˆÙ[‹œÜÚ][Û[X^
+›Ø]
+ÙXÛÛ™ÊJBˆÙ[‹\]J
+B‚ˆYˆÙ]ÜÚİ×Û\šXÜÊÙ[‹[˜X›Y
+N‚ˆÙ[‹œÚİ×Û\šXÜÏX›ÛÛ
+[˜X›Y
+BˆÙ[‹\]J
+B‚ˆYˆÛZYJÙ[‹›İJN‚ˆYˆ›ZYHˆ[ˆ›İN‚ˆ™]\›ˆ[
+›İK™Ù]
+›ZYH‹Œ
+JBˆX]Ú\™K›X]Ú
+ˆ—ŠĞKQ×JJÈØ—OÊJO×
+ÊI‹İŠ›İK™Ù]
+››İH‹ÍŠJJBˆYˆ›İX]Ú‚ˆ™]\›ˆŒˆ]Ú^ÈÈŒ‘Œ‹‘H‘ˆK‘ÈËHKˆŒL_VÛX]Ú™Ü›İ\
+JWBˆ]Ú
+ÏHHYˆX]Ú™Ü›İ\
+ŠOOHˆÈˆ[ÙHLHYˆX]Ú™Ü›İ\
+ŠOOH˜ˆˆ[ÙHˆ™]\›ˆLŠŠ[
+X]Ú™Ü›İ\
+ÊJJÌJJÜ]Ú‚ˆYˆZ[]™[
+Ù[‹]™[
+N‚ˆZ[\TTZ[\ŠÙ[ŠBˆZ[\‹œÙ]™[™\’[
+TZ[\‹[X[X\Ú[™ÊBˆZ[\‹™š[™Xİ
+Ù[‹œ™Xİ
+
+KPÛÛÜŠˆÌLNŠJBˆÚY[X^
+LÙ[‹ÚY
+
+JBˆÜMˆØ\LŒ‚ˆX›]\™O\Ù[‹›[ÙOOH¹akyî¯ú,,H‚ˆ[™WØÛİ[MˆYˆX›]\™H[ÙHBˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠˆĞ‘PPHŠKJJBˆ›Üˆ[™^[ˆ˜[™ÙJ[™WØÛİ[
+N‚ˆO]Ü
+Ú[™^
+™Ø\ˆZ[\‹™˜]Ó[™JKÚYLJBˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠˆÑ‘ĞLNŠKŠJBˆZ[\‹™˜]Ó[™JÍÜLNÍÜ
+Ê[™WØÛİ[LJJ™Ø\
+ÌN
+B‚ˆ›İ\ÏVÂˆ›İH›Üˆ›İH[ˆÙ]]ŠÙ[‹›XZ[‹›Y[ÙWÜ™Y™\™[˜ÙH‹×JBˆYˆÙ[‹œÜÚ][Û‹LHH›Ø]
+›İK™Ù]
+œİ\‹
+JHHÙ[‹œÜÚ][ÛŠÌMBˆVÎŒÌ—Bˆ[š[™ÏVÍNKMKLKBˆ›Üˆ›İH[ˆ›İ\Î‚ˆİ\Y›Ø]
+›İK™Ù]
+œİ\‹
+JBˆMLŠÊİ\JÙ[‹œÜÚ][Û‹LJJKÌMŠ›X^
+ŒÚYNLŠBˆZYO\Ù[‹—ÛZYJ›İJBˆYˆX›]\™N‚ˆÚÚXÙ\ÏVÊZYK[Ü[—Û›İK[™^
+H›Üˆ[™^Ü[—Û›İH[ˆ[[Y\˜]J[š[™ÊHYˆ[ZYK[Ü[—Û›İOLBˆœ™]İš[™Ï[Z[ŠÚÚXÙ\ËY˜][J
+KÙ^O[[X™H][Nš][VÌJBˆZ[\‹œÙ][ŠPÛÛÜŠˆÑ‘PLHŠJBˆZ[\‹™˜]Õ^
+T™XİŠLLKÜ
+Üİš[™Ê™Ø\LLKŒŠK][YÛÙ[\‹İŠœ™]
+JBˆ[ÙN‚ˆO[X^
+NZ[ŠÜ
+Í
+™Ø\
+ÌNÜ
+Í
+™Ø\JZYKMŒ
+J™Ø\ÌËJJBˆZ[\‹œÙ]œ\Ú
+PÛÛÜŠˆÑ‘ĞLNŠJNÈZ[\‹œÙ][Š]“›Ô[ŠBˆZ[\‹™˜]Ñ[\ÙJTÚ[ŠJKËJBˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠˆÑ‘ĞLNŠKŠJNÈZ[\‹™˜]Ó[™JTÚ[Š
+Í‹JKTÚ[Š
+Í‹KLÌ
+JB‚ˆYˆÙ[‹œÚİ×Û\šXÜÎ‚ˆ\šXÏHˆ‚ˆ›Üˆ›İÈ[ˆÙ]]ŠÙ[‹›XZ[‹›\šX×Ü™Y™\™[˜ÙH‹×JN‚ˆYˆÙ[‹œÜÚ][ÛY›Ø]
+›İË™Ù]
+œİ\‹
+JN‚ˆ\šXÏ\İŠ›İË™Ù]
+^‹ˆŠJBˆ[ÙN‚ˆœ™XZÂˆZ[\‹œÙ][ŠPÛÛÜŠˆÑ‘‘‘‘‘ˆŠJBˆ›Û\Z[\‹™›Û
+
+NÈ›ÛœÙ]Ú[Ú^™JMJNÈ›ÛœÙ]›Û
+YJNÈZ[\‹œÙ]›Û
+›Û
+BˆZ[\‹™˜]Õ^
+T™XİŠÙ[‹šZYÚ
+
+KMMKÚYMŠK][YÛÙ[\‹\šXÈÜˆ¹odùbcy«c9¦ì¹¬¨y§"ycëùå*9«c:+ãHŠBˆYˆ›İ›İ\Î‚ˆZ[\‹œÙ][ŠPÛÛÜŠˆĞNNMPMˆŠJBˆZ[\‹™˜]Õ^
+T™XİŠÜ
+Û[™WØÛİ[
+™Ø\
+ÍKÚYMÌ
+K][YÛÙ[\‹º+íùab:/ä:(c9.d:,,yb!¹§¤;ï#:!ê¹bª9å'ù¢$9..ù¥âùo¢ù.¥9î¯ú,,yd£9akyî¯ú,,HŠB‚‚˜Û\ÜÈØÛÜ™T\™›Ü›X[˜ÙTYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹˜İ\œ™[Ø˜\ˆHLB‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+¹¯%9aîº,,zghˆÈ:!ê¹bª9ïîú,,HŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆÜHR›Ş^[İ]
+
+BˆÙ[‹œØÛÜ™Wİ\HHPÛÛX›Ğ›Ş
+
+BˆÙ[‹œØÛÜ™Wİ\K˜Y][\ÊÈ“XYÚY]‹¹.¥9î¯ú,,H‹¹akyî¯ú,,H‹º-'y¥«ú,,H‹ºo$ú,,H‹ºe+¹ææ:,,H—JBˆÙ[‹œØÛÜ™Wİ\K˜İ\œ™[[™^Ú[™ÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÜØÛÜ™JBˆÙ[‹˜]]×Ù›ÛİÈHPÚXÚĞ›Ş
+º-çúf£ù¤«y¥/¹i-:!ê¹bª9ïîú,,HŠBˆÙ[‹˜]]×Ù›ÛİËœÙ]ÚXÚÙY
+YJBˆÙ[‹˜šY×Û[ÙHHPÚXÚĞ›Ş
+¹¯%9aî¹i)ùkeùª(yo#ÈŠBˆÙ[‹˜šY×Û[ÙKœÙ]ÚXÚÙY
+YJBˆÙ[‹˜šY×Û[ÙKÙÙÛY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÜØÛÜ™JBˆÙ[‹›\šXÜ×İÙÙÛHHPÚXÚĞ›Ş
+¹¦/¹é.¹«c:+ãHŠBˆÙ[‹›\šXÜ×İÙÙÛKœÙ]ÚXÚÙY
+ˆTÙ][™ÜÊ““Õ”’PH‹’]ÙZY\“]\ÚXÈŠK˜[YJœØÛÜ™KÜÚİ×Û\šXÜÈ‹YK\OX›ÛÛ
+Bˆ
+BˆÙ[‹›\šXÜ×İÙÙÛKÙÙÛY˜ÛÛ›™Xİ
+Ù[‹—İÙÙÛWÛ\šXÜÊBˆ™Yœ™\ÚHT\Ú]ÛŠ¹b-ù¥¬:,,zghˆŠBˆ™Yœ™\Ú˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÜØÛÜ™JBˆÜ˜YÚYÙ]
+SX™[
+º,,zghˆŠJBˆÜ˜YÚYÙ]
+Ù[‹œØÛÜ™Wİ\JBˆÜ˜YÚYÙ]
+Ù[‹˜]]×Ù›ÛİÊBˆÜ˜YÚYÙ]
+Ù[‹˜šY×Û[ÙJBˆÜ˜YÚYÙ]
+Ù[‹›\šXÜ×İÙÙÛJBˆÜ˜YÚYÙ]
+™Yœ™\Ú
+BˆÜ˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+Ü
+B‚ˆÙ[‹››İÈHSX™[
+¹odùbcyl#ú" »ï&¸ %ŠBˆÙ[‹››İËœÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠBˆ^[İ]˜YÚYÙ]
+Ù[‹››İÊB‚ˆÙ[‹˜Ø[˜\ÏQ\ÚİÜØÛÜ™PØ[˜\ÊXZ[ŠBˆÙ[‹˜Ø[˜\ËœÙ]ÜÚİ×Û\šXÜÊÙ[‹›\šXÜ×İÙÙÛKš\ĞÚXÚÙY
+
+JBˆ^[İ]˜YÚYÙ]
+Ù[‹˜Ø[˜\ÊB‚ˆÙ[‹˜œ›İÜÙ\ˆHU^œ›İÜÙ\Š
+BˆÙ[‹˜œ›İÜÙ\‹œÙ]Ü[‘^\›˜[[šÜÊ˜[ÙJBˆ^[İ]˜YÚYÙ]
+Ù[‹˜œ›İÜÙ\‹JB‚ˆÙ[‹[Y\ˆHU[Y\ŠÙ[ŠBˆÙ[‹[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹™›Ûİ×Ü^X˜XÚÊBˆÙ[‹[Y\‹œİ\
+L
+B‚ˆYˆİX—Ù›Ü—ØÚÜ™
+Ù[‹ÚÜ™
+N‚ˆÈ˜XİXØ[ÚÜ™\Ú\H™Y™\™[˜ÙK›İHY[ÙH˜[œØÜš\[Û‹‚ˆÚ\\ÈHÂˆÈˆÌŒL‹ÈÈˆ‹‘ˆŒÌˆ‹‘Èˆˆ‹ˆ‘HˆŒŒŒL‹‘ˆˆŒLÌÌŒLH‹‘ˆÈˆŒÌŒˆ‹‘ÈˆŒÌŒÈ‹ˆ‘ÈÈˆM‹HˆŒŒŒ‹HÈˆLÌÌÌH‹ˆˆˆ‹ˆÛHˆÍMMÈ‹ÈÛHˆM‹‘HˆŒÌH‹‘ÛHˆÍˆ‹ˆ‘[HˆŒŒŒ‹‘›HˆŒLÌÌLLH‹‘ˆÛHˆŒŒŒˆ‹‘ÛHˆŒÍMLÌÌÈ‹ˆ‘ÈÛHˆ‹[HˆŒŒL‹HÛHˆLÌÌŒH‹›HˆÌˆ‹ˆBˆ[\Ü™H\ÈÜ™BˆOWÜ™K›X]Ú
+ˆ—ŠĞKQ×JÎˆßŠOÛOÊH‹ÚÜ™ÜˆˆŠBˆÙ^O[K™Ü›İ\
+JHYˆH[ÙHÚÜ™ˆ™]\›ˆÚ\\Ë™Ù]
+Ù^K¹£"yd£9o)¹¨.zgìËú/k9/cz`"y¢êy¢¢¹/cHŠB‚ˆYˆÚ[
+Ù[ŠN‚ˆ›İÜÏ\Ù[‹›XZ[‹—ÜØÛÜ™WÜ›İÜ×İ˜[œÜÜÙY
+
+HYˆ\Ø]ŠÙ[‹›XZ[‹—ÜØÛÜ™WÜ›İÜ×İ˜[œÜÜÙYŠH[ÙH×BˆYˆ›İ›İÜÎ‚ˆ™]\›ˆ¹l&¹¥è:,,zghÚº+íùab9g*8 'RH9¥.yï%ˆÈ9.d:,,x 'y.+yb!¹§¤9«c9¦ì¸à Üˆ‚‚ˆ[ÙO\Ù[‹œØÛÜ™Wİ\K˜İ\œ™[^
+
+Bˆ›ÛHŒˆYˆÙ[‹˜šY×Û[ÙKš\ĞÚXÚÙY
+
+H[ÙHŒMœ‚ˆ›ØÚÜÏV×Bˆ›Üˆ›İ×Ú[™^›İÈ[ˆ[[Y\˜]J›İÜÊN‚ˆÚÜ™HˆÈ‹š›Ú[Š›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈ“ˆ—JBˆ^˜OHˆ‚ˆ›İ\ÏVÛˆ›Üˆˆ[ˆÙ]]ŠÙ[‹›XZ[‹›Y[ÙWÜ™Y™\™[˜ÙH‹×JHYˆ›İÖÈœÙXÛÛ™È—HH›Ø]
+‹™Ù]
+œİ\‹‹™Ù]
+œÙXÛÛ™È‹
+JJH›İÖÈœÙXÛÛ™È—JÌL—Bˆ™^ÜÙXÛÛ™Ï\›İÜÖÜ›İ×Ú[™^
+ÌWVÈœÙXÛÛ™È—HYˆ›İ×Ú[™^
+ÌO[Š›İÜÊH[ÙH›İÖÈœÙXÛÛ™È—JÌL‚ˆ\šX×Û[™\ÏVÂˆİŠ][K™Ù]
+^‹ˆŠJH›Üˆ][H[ˆÙ]]ŠÙ[‹›XZ[‹›\šX×Ü™Y™\™[˜ÙH‹×JBˆYˆ›İÖÈœÙXÛÛ™È—HH›Ø]
+][K™Ù]
+œİ\‹
+JH™^ÜÙXÛÛ™ÂˆBˆYˆ[ÙOOH¹.¥9î¯ú,,H‚ˆ]Ú\ÏHˆ‹š›Ú[Š[™\ØØ\JİŠ‹™Ù]
+››İH‹ˆŠJJH›Üˆˆ[ˆ›İ\ÖÎŒM—JHÜˆº+íùà®yaîø '9..ù¥âùo¢ùcàº  ú/k9a¦x 'yå'ù¢$9k§ºfazgìùë)ˆ‚ˆ^˜OYˆ]ˆÛ\ÜÏIÜİY™‰Ï]¼'a'ˆ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ Ù]]¸à 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ Ü]Ú\ßH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ Ù]]¸à 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ Ù]]¸à 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ Ù]]¸à 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ Ù]Ù]ˆ‚ˆ[Yˆ[ÙOOH¹akyî¯ú,,H‚ˆ[š[™ÏVÊ™H‹
+K
+ˆ‹NJK
+‘È‹MJK
+‘‹L
+K
+H‹JK
+‘H‹
+WBˆ[™\Ï^Û˜[YN–×H›Üˆ˜[YKÈ[ˆ[š[™ßBˆ›Üˆ›İH[ˆ›İ\ÖÎŒM—N‚ˆ˜]Ï\İŠ›İK™Ù]
+››İH‹ÍŠJBˆX]Ú\™K›X]Ú
+ˆ—ŠĞKQ×JJÈØ—OÊJO×
+ÊI‹˜]ÊBˆ]Ú^ÈÈŒ‘Œ‹‘H‘ˆK‘ÈËHKˆŒL_K™Ù]
+X]Ú™Ü›İ\
+JK
+HYˆX]Ú[ÙHˆYˆX]Ú[™X]Ú™Ü›İ\
+ŠOOHˆÈˆ]Ú
+ÏLBˆYˆX]Ú[™X]Ú™Ü›İ\
+ŠOOH˜ˆˆ]ÚOLBˆZYOZ[
+›İK™Ù]
+›ZYH‹LŠŠ[
+X]Ú™Ü›İ\
+ÊJJÌJJÜ]ÚYˆX]Ú[ÙHŒ
+JBˆÚÚXÙ\ÏVÊZYK[Ü[—Û›İK˜[YJH›Üˆ˜[YKÜ[—Û›İH[ˆ[š[™ÈYˆ[ZYK[Ü[—Û›İOLBˆœ™]İš[™Ï[Z[ŠÚÚXÙ\ËY˜][J™HŠKÙ^O[[X™HÌJBˆ›Üˆ˜[YKÈ[ˆ[š[™Î‚ˆ[™\ÖÛ˜[YWK˜\[™
+İŠœ™]
+HYˆ˜[YOO\İš[™È[ÙH‹HŠBˆXHœˆ‹š›Ú[ŠˆÛ˜[Y__ŠÈ‹H‹š›Ú[Š[™\ÖÛ˜[YWHÜˆÈ‹H—JJÈŸˆ›Üˆ˜[YKÈ[ˆ[š[™ÊBˆ^˜OYˆ]ˆÛ\ÜÏIİX‰ÏİXŸOÙ]ˆ‚ˆ[Yˆ[ÙOOH¹d"y.åˆPˆ‚ˆš\œİJ›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆ^˜OYˆ]ˆÛ\ÜÏIİX‰ÏÚÜ™Ú\NˆÜÙ[‹—İX—Ù›Ü—ØÚÜ™
+š\œİ
+_Oœ‘HHÈˆOÙ]ˆ‚ˆ[Yˆ[ÙOOHº-'y¥«ú,,H‚ˆš\œİJ›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆ^˜OYˆ]ˆÛ\ÜÏIÚ[	Ï¹¨.zgìûï&Ú[™\ØØ\Jš\œİ
+_H0­È9o.¹¢ãy¨.zgìûï#9o,y¢ãycëùå*9.¥9n©‹ùîãú/áúgìÏÙ]ˆ‚ˆ[Yˆ[ÙOOHºo$ú,,H‚ˆ^˜OH]ˆÛ\ÜÏIİX‰Ï’^^^^^^^Oœ”ÑKKK[ËKKKKKK[ËKKOœ‘ËKKKKKK[ËKKKKKKOÙ]ˆ‚ˆ[Yˆ[ÙOOHºe+¹ææ:,,H‚ˆ^˜OH]ˆÛ\ÜÏIÚ[	Ï¹mé¹¢bûï&¹¨.zgìËù.¥9n©ˆ0­È9cìù¢bûï&¹d£9o)º/k9/cKùb!º)èÏÙ]ˆ‚ˆYˆ\šX×Û[™\È[™Ù[‹›\šXÜ×İÙÙÛKš\ĞÚXÚÙY
+
+N‚ˆ^˜H
+ÏH]ˆÛ\ÜÏIÛ\šXÜÉÏˆŠÈœˆ‹š›Ú[Š[™\ØØ\J[™JH›Üˆ[™H[ˆ\šX×Û[™\ÊJÈÙ]ˆ‚ˆ›ØÚÜË˜\[™
+ˆˆ]ˆYIØ˜\Ü›İÖÉØ˜\‰×_IÈÛ\ÜÏIØ˜\‰Ïˆ‚ˆˆ]ˆÛ\ÜÏIÜÙXÉÏÚ[™\ØØ\J›İË™Ù]
+	ÜÙXİ[Û‰Ë	ÉÊJ_OÙ]ˆ‚ˆˆ]ˆÛ\ÜÏIÛ[IÏˆŞÜ›İÖÉØ˜\‰×_H	›˜œÜÈÜÙ[‹›XZ[‹—Ù›Ü›X]İ[YJ›İÖÉÜÙXÛÛ™É×J_OÙ]ˆ‚ˆˆ]ˆÛ\ÜÏIØÚÜ™	ÏÚ[™\ØØ\JÚÜ™
+_OÙ]Ù^˜_OÙ]ˆ‚ˆ
+Bˆ™]\›ˆˆˆˆ[İ[O‚ˆ›Ù^ŞØ˜XÚÙÜ›İ[™ˆÌLYØÛÛÜˆÙXYŒ™Ù›ÛY˜[Z[N‰ÓZXÜ›ÜÛÙXRZHRIÎÙ›Û\Ú^™NÙ›ÛNß_Bˆ˜˜\ŞÜY[™ÎŒNÛX\™Ú[ŒLœØ›Ü™\Œ\ÛÛYÌÍMLNØ›Ü™\‹\˜Y]\ÎŒLœØ˜XÚÙÜ›İ[™ˆÌMÌß_BˆœÙXŞŞØÛÛÜˆÎØLÍNÙ›Û\Ú^™NŒY[__H›[^ŞØÛÛÜˆÍ™˜MNÙ›Û\Ú^™NŒ™[__Bˆ˜ÚÜ™ŞØÛÛÜˆÍYLXÙNÙ›Û]ÙZYÚÙ›Û\Ú^™NŒKŒÍY[NÛX\™Ú[_BˆXŞÙ›ÛY˜[Z[NÛÛœÛÛ\Ë[Û›ÜÜXÙNØÛÛÜˆÙÌÎÙ›Û\Ú^™NŒÍY[__BˆœİY™ŞÙ›ÛY˜[Z[N‰ÔÙYÛÙHRHŞ[X›Û	ËÛÛœÛÛ\Ë[Û›ÜÜXÙNØÛÛÜˆÙÌÎÙ›Û\Ú^™NŒÌ™[NÛ[™KZZYÚŒKŒ_Bˆš[ŞØÛÛÜˆØÍÎÙ›Û\Ú^™NŒÌ™[__Bˆ›\šXÜŞŞØÛÛÜˆÙ™™Ù›Û\Ú^™NŒY[Nİ^X[YÛ˜Ù[\ÛX\™Ú[‹]ÜŒLœÜY[™ÎØ˜XÚÙÜ›İ[™ˆÌLMÌŒNØ›Ü™\‹\˜Y]\Î_Bˆ˜Xİ]™^ŞØ›Ü™\ŒœÛÛYÎ˜Ù™Ø˜XÚÙÜ›İ[™ˆÌŒLNM__BˆÜİ[O›ÙOÉÉËš›Ú[Š›ØÚÜÊ_OØ›ÙOÚ[ˆˆˆ‚‚ˆYˆ™Yœ™\ÚÜØÛÜ™JÙ[ŠN‚ˆÙ[‹˜Ø[˜\ËœÙ]Û[ÙJÙ[‹œØÛÜ™Wİ\K˜İ\œ™[^
+
+JBˆÙ[‹˜œ›İÜÙ\‹œÙ][
+Ù[‹—Ú[
+
+JB‚ˆYˆİÙÙÛWÛ\šXÜÊÙ[‹[˜X›Y
+N‚ˆTÙ][™ÜÊ““Õ”’PH‹’]ÙZY\“]\ÚXÈŠKœÙ]˜[YJœØÛÜ™KÜÚİ×Û\šXÜÈ‹›ÛÛ
+[˜X›Y
+JBˆÙ[‹˜Ø[˜\ËœÙ]ÜÚİ×Û\šXÜÊ[˜X›Y
+BˆÙ[‹œ™Yœ™\ÚÜØÛÜ™J
+B‚ˆYˆ›Ûİ×Ü^X˜XÚÊÙ[ŠN‚ˆYˆ›İÙ[‹˜]]×Ù›ÛİËš\ĞÚXÚÙY
+
+N‚ˆ™]\›‚ˆ›İÜÏYÙ]]ŠÙ[‹›XZ[‹˜ÚÜ™İ[Y[[™H‹×JBˆYˆ›İ›İÜÎ‚ˆ™]\›‚ˆ[^OJÙ[‹›XZ[‹›]™WÜ›Ë™[^WÛ\Ë˜[YJ
+KÌLYˆ\Ø]ŠÙ[‹›XZ[‹›]™WÜ›ÈŠH[ÙH
+BˆÜÏ[X^
+Ù[‹›XZ[‹™[™Ú[™KœÜÚ][Û—ÜÙXÛÛ™Ê
+KY[^JBˆÙ[‹˜Ø[˜\ËœÙ]ÜÜÚ][ÛŠÜÊBˆİ\œ™[\›İÜÖÌVÈ˜˜\ˆ—Bˆ›Üˆ›İÈ[ˆ›İÜÎ‚ˆYˆÜÈH›İÖÈœÙXÛÛ™È—N‚ˆİ\œ™[\›İÖÈ˜˜\ˆ—Bˆ[ÙN‚ˆœ™XZÂˆYˆİ\œ™[OHÙ[‹˜İ\œ™[Ø˜\‚ˆÙ[‹˜İ\œ™[Ø˜\Xİ\œ™[ˆ\šXÏHˆ‚ˆYˆÙ[‹›\šXÜ×İÙÙÛKš\ĞÚXÚÙY
+
+N‚ˆ›Üˆ][H[ˆÙ]]ŠÙ[‹›XZ[‹›\šX×Ü™Y™\™[˜ÙH‹×JN‚ˆYˆÜÈH›Ø]
+][K™Ù]
+œİ\‹
+JN‚ˆ\šXÏ\İŠ][K™Ù]
+^‹ˆŠJBˆ[ÙN‚ˆœ™XZÂˆÙ[‹››İËœÙ]^
+ˆ¹odùbcyl#ú" »ï&Øİ\œ™[Hˆ
+È
+ˆ¸à 9«c:+ã{ï&Û\šXßHˆYˆ\šXÈ[ÙHˆŠJBˆÙ[‹˜œ›İÜÙ\‹œØÜ›ÛĞ[˜ÚÜŠˆ˜˜\Øİ\œ™[HŠB‚‚˜Û\ÜÈ\šXÜÔİY[ÔYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹œ™\İ[ÈH×Bˆ^[İ]HU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+RH9«c:+ãyb&ù/g;ï"9¦kº`&º+çHÈ9ì©:+ëHÈ:"ìz+ë{ï"HŠBˆ]KœÙ]İ[TÚY]
+™›Û\Ú^™NŒÙ›Û]ÙZYÚŠBˆ^[İ]˜YÚYÙ]
+]JBˆ›İXÙHHSX™[
+ˆ¹¨.y£k¹..úh¦9å'ù¢$9cëùï%º/¤yb'yê/ûï#9.#y¤'9í(¹¢%¹i#yb-¹mì¹§"y«c9¦ì¸à ˆ‚ˆ¹ì©:+ëy¥+ù£ yn.9å*9cèú+ë{ï#9cäzgìøà y¢¯:gíyd£9g,9gçùå*:+ãz+íùå,y«ãz+ëy/oùå*: !yi#y¨.8à ˆ‚ˆ
+Bˆ›İXÙKœÙ]ÛÜ™Ü˜\
+YJBˆ›İXÙKœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+›İXÙJBˆ›Ü›HHQÜ›İ\›Ş
+¹b&ù/g9cà¹¥lŠBˆÜšYHQÜšY^[İ]
+›Ü›JBˆÙ[‹[YHHS[™QY]
+
+BˆÙ[‹[YKœÙ]XÙZÛ\•^
+¹/¢ûï&¹é®ùo 9k­¹.hyd#¹æ¡:aãz`(ˆŠBˆÙ[‹›[™İXYÙHHPÛÛX›Ğ›Ş
+
+NÈÙ[‹›[™İXYÙK˜Y][\ÊÈ¹¦kº`&º+çH‹¹ì©:+ëH‹º"ìz+ëH—JBˆÙ[‹œİ[HHPÛÛX›Ğ›Ş
+
+NÈÙ[‹œİ[K˜Y][\ÊÈ¹­`z(c‹¹¤aù®æˆ‹¹¬$z,(È‹”‰ˆ—JBˆÙ[‹›[ÛÙHPÛÛX›Ğ›Ş
+
+NÈÙ[‹›[ÛÙ˜Y][\ÊÈ¹®*y¦¥ˆ‹¹àëz(`‹¹/)9¡'È‹¹¬®ù¡"—JBˆÙ[™\˜]HHT\Ú]ÛŠ¹å'ù¢$È9.*¹¥®y¨bŠBˆ\WØ]Û—ØXØÙ[
+Ù[™\˜]Kœš[X\HŠBˆÙ[™\˜]K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹™Ù[™\˜]JBˆÜšY˜YÚYÙ]
+SX™[
+¹..úh¦È9¥ay.¢ÈŠK
+NÈÜšY˜YÚYÙ]
+Ù[‹[YKKKJBˆÜšY˜YÚYÙ]
+SX™[
+º+ëz* ŠKK
+NÈÜšY˜YÚYÙ]
+Ù[‹›[™İXYÙKKJBˆÜšY˜YÚYÙ]
+SX™[
+ºhã¹¨/ŠKKŠNÈÜšY˜YÚYÙ]
+Ù[‹œİ[KKÊBˆÜšY˜YÚYÙ]
+SX™[
+¹ áyîêˆŠKK
+NÈÜšY˜YÚYÙ]
+Ù[‹›[ÛÙKJBˆÜšY˜YÚYÙ]
+Ù[™\˜]K‹JBˆ^[İ]˜YÚYÙ]
+›Ü›JBˆÙ[‹˜\šX[HPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜\šX[˜İ\œ™[[™^Ú[™ÙY˜ÛÛ›™Xİ
+Ù[‹œÚİ×İ˜\šX[
+Bˆ^[İ]˜YÚYÙ]
+Ù[‹˜\šX[
+BˆÙ[‹™Y]ÜˆHTZ[•^Y]
+
+BˆÙ[‹™Y]Ü‹œÙ]XÙZÛ\•^
+¹å'ù¢$9æ¡9«c:+ãy/&¹¦/¹é.¹g*:/æzaã;ï#9cëùæí9£©y/ë¹¥.xà ˆŠBˆ^[İ]˜YÚYÙ]
+Ù[‹™Y]Ü‹JBˆ]ÛœÈHR›Ş^[İ]
+
+BˆØ]™WİHT\Ú]ÛŠ¹kï9aîˆŠNÈØ]™WÛ˜ÈHT\Ú]ÛŠ¹kï9aîˆÈŠBˆ\ÙWØİ\œ™[HT\Ú]ÛŠº+¯¹..¹odùbcy«c9¦ì¹«c:+ãHŠBˆØ]™Wİ˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆÙ[‹œØ]™JŠJBˆØ]™WÛ˜Ë˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆÙ[‹œØ]™J›˜ÈŠJBˆ\ÙWØİ\œ™[˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹\ÙWØİ\œ™[
+Bˆ]ÛœË˜YÚYÙ]
+Ø]™Wİ
+NÈ]ÛœË˜YÚYÙ]
+Ø]™WÛ˜ÊNÈ]ÛœË˜YÚYÙ]
+\ÙWØİ\œ™[
+NÈ]ÛœË˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+]ÛœÊB‚ˆYˆÙ[™\˜]JÙ[ŠN‚ˆ[YHHÙ[‹[YK^
+
+Kœİš\
+
+BˆYˆ›İ[YN‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹RH9«c:+ãH‹º+íùab9hjùa¦y..úh¦9¢%¹¥ay.¢øà ˆŠBˆ™]\›‚ˆÙ[‹œ™\İ[ÈHÙ[™\˜]WÛ\šXÜÊ[YKÙ[‹›[™İXYÙK˜İ\œ™[^
+
+KÙ[‹œİ[K˜İ\œ™[^
+
+KÙ[‹›[ÛÙ˜İ\œ™[^
+
+KÊBˆÙ[‹˜\šX[˜›ØÚÔÚYÛ˜[ÊYJNÈÙ[‹˜\šX[˜ÛX\Š
+BˆÙ[‹˜\šX[˜Y][\ÊÚ][VÈ]H—H›Üˆ][H[ˆÙ[‹œ™\İ[×JBˆÙ[‹˜\šX[˜›ØÚÔÚYÛ˜[Ê˜[ÙJNÈÙ[‹˜\šX[œÙ]İ\œ™[[™^
+
+NÈÙ[‹œÚİ×İ˜\šX[
+
+B‚ˆYˆÚİ×İ˜\šX[
+Ù[‹[™^
+N‚ˆYˆH[™^[ŠÙ[‹œ™\İ[ÊN‚ˆÙ[‹™Y]Ü‹œÙ]Z[•^
+Ù[‹œ™\İ[ÖÚ[™^VÈ›\šXÜÈ—JB‚ˆYˆØ]™JÙ[‹Ú[™
+N‚ˆ^HÙ[‹™Y]Ü‹ÔZ[•^
+
+Kœİš\
+
+BˆYˆ›İ^ˆ™]\›‚ˆ]ÈHQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹¹kï9aî¹«c:+ãH‹İŠVÔ•×ÑTˆÈˆ›\šXÜËÚÚ[™HŠKˆÚÚ[™\\Š
+_H
+
+‹ÚÚ[™JHŠBˆYˆ]‚ˆ]
+]
+Kœ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ]
+]
+KÜš]Wİ^
+\šXÜ×İ×Û˜Ê^
+HYˆÚ[™OH›˜Èˆ[ÙH^
+È—ˆ‹[˜ÛÙ[™ÏH]‹NŠB‚ˆYˆ\ÙWØİ\œ™[
+Ù[ŠN‚ˆ^HÙ[‹™Y]Ü‹ÔZ[•^
+
+Kœİš\
+
+BˆYˆ›İ^ˆ™]\›‚ˆÙ[‹›XZ[‹›\šX×Ü™Y™\™[˜ÙHHŞÈ[YHˆH
+ˆËŒË^ˆ[™Kœİš\
+
+_H›ÜˆK[™H[ˆ[[Y\˜]J^œÜ][™\Ê
+JHYˆ[™Kœİš\
+
+H[™›İ[™Kœİ\İÚ]
+–ÈŠWBˆÙ[‹›XZ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJ¹mì¹l!ˆRH9«c:+ãyb'yê/ú+¯¹..¹odùbcy«c9¦ì¹«c:+ãHŠB‚‚˜Û\ÜÈ›ÚXÙSX”YÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[[XZ[‚ˆ^[İ]TU›Ş^[İ]
+Ù[ŠBˆ]OTSX™[
+RH9«c9hì:/k9£hˆŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆ›İXÙOTSX™[
+ˆŒKŒŒ9ab9nî¹êâùâë9êâù«c9hì:/k9£h¹méy/g9­`{ï&º`"y¢êycàº  ù.®¹hì8à z`"y¢êyo¡z/k9£hˆ›ØØ[İ[xà H‚ˆ¹å'ù¢$9.îùb¨zacyïk¸à ¹ª(yg¢ù£ª9ä!¹o%y¤ã¹.#¹..ù¤«y¥/¹fj:)èú )»ï#9d#¹îëycëù£©y§+9g,ÙYYUËÔ•È9¢%¹.¤yêëÈÔxà ˆ‚ˆ
+Bˆ›İXÙKœÙ]ÛÜ™Ü˜\
+YJBˆ›İXÙKœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+›İXÙJB‚ˆ›ŞTQÜ›İ\›Ş
+¹«c9hì:/k9£h¹.îùb¨HŠBˆÛTQÜšY^[İ]
+›Ş
+BˆÙ[‹œ™Y™\™[˜ÙOTS[™QY]
+
+BˆÙ[‹œÛİ\˜ÙOTS[™QY]
+
+Bˆ™Y—ØTT\Ú]ÛŠº`"y¢êycàº  ù.®¹hìŠBˆÜ˜×ØTT\Ú]ÛŠº`"y¢êH›ØØ[İ[HŠBˆ™Y—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œXÚ×Ü™Y™\™[˜ÙJBˆÜ˜×Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œXÚ×ÜÛİ\˜ÙJBˆÙ[‹™[™Ú[™OTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[™Ú[™K˜Y][\ÊÈ”ÙYYUÈ9£©ycèÈ‹”•È9£©ycèÈ‹¹.¤yêëÈÔH9£©ycèÈ—JBˆÙ[‹œİ™[™İTTÛY\Š]’Üš^›Û[
+BˆÙ[‹œİ™[™İœÙ]˜[™ÙJL
+BˆÙ[‹œİ™[™İœÙ]˜[YJÍJBˆØ]™OTT\Ú]ÛŠ¹å'ù¢$9«c9hì:/k9£h¹.îùb¨HŠBˆ\WØ]Û—ØXØÙ[
+Ø]™Kœš[X\HŠBˆØ]™K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œØ]™WÚ›ØŠBˆÛ˜YÚYÙ]
+SX™[
+¹càº  ù.®¹hìŠK
+NÈÛ˜YÚYÙ]
+Ù[‹œ™Y™\™[˜ÙKJNÈÛ˜YÚYÙ]
+™Y—Ø‹ŠBˆÛ˜YÚYÙ]
+SX™[
+¹o¡z/k9£h¹.®¹hìŠKK
+NÈÛ˜YÚYÙ]
+Ù[‹œÛİ\˜ÙKKJNÈÛ˜YÚYÙ]
+Ü˜×Ø‹KŠBˆÛ˜YÚYÙ]
+SX™[
+¹o%y¤ãˆŠK‹
+NÈÛ˜YÚYÙ]
+Ù[‹™[™Ú[™K‹JBˆÛ˜YÚYÙ]
+SX™[
+ºgìú"l¹o.¹n©ˆŠKË
+NÈÛ˜YÚYÙ]
+Ù[‹œİ™[™İËJBˆÛ˜YÚYÙ]
+Ø]™KŠBˆ^[İ]˜YÚYÙ]
+›Ş
+B‚ˆšYÚÏTSX™[
+¹/oùå*9ç'ùk§¹.®¹âjyhì:gìùbcyn¥9èkº+©9¢éy§"yoáz) y£¢9§`Ëùd#9¡#ûï&ùªf9dlùa/úgìù.d9/çykf9.îùb¨y§iy®¤9/èy kûï#9/¯ù.£¹d#¹îëy£¢9§`ùë¨yä!¸à ˆŠBˆšYÚËœÙ]ÛÜ™Ü˜\
+YJBˆ^[İ]˜YÚYÙ]
+šYÚÊBˆ^[İ]˜Yİ™]Ú
+JB‚ˆYˆXÚ×Ü™Y™\™[˜ÙJÙ[ŠN‚ˆÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJÙ[‹¹càº  ù.®¹hì‹ˆ‹ºgìúh¤H
+
+‹Ø]ˆ
+‹›\È
+‹™›XÈ
+‹›MJHŠBˆYˆˆÙ[‹œ™Y™\™[˜ÙKœÙ]^
+
+B‚ˆYˆXÚ×ÜÛİ\˜ÙJÙ[ŠN‚ˆY˜][Hˆ‚ˆYˆÙ[‹›XZ[‹œİ[WÙ\‚ˆT]
+Ù[‹›XZ[‹œİ[WÙ\ŠKÈ›ØØ[ËØ]ˆ‚ˆYˆ™^\İÊ
+NˆY˜][\İŠ
+BˆÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJÙ[‹•›ØØ[İ[H‹Y˜][ºgìúh¤H
+
+‹Ø]ˆ
+‹›\È
+‹™›XÊHŠBˆYˆˆÙ[‹œÛİ\˜ÙKœÙ]^
+
+B‚ˆYˆØ]™WÚ›ØŠÙ[ŠN‚ˆ™Y\Ù[‹œ™Y™\™[˜ÙK^
+
+Kœİš\
+
+BˆÜ˜Ï\Ù[‹œÛİ\˜ÙK^
+
+Kœİš\
+
+BˆYˆ›İ™YˆÜˆ›İ]
+™YŠK™^\İÊ
+HÜˆ›İÜ˜ÈÜˆ›İ]
+Ü˜ÊK™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íú`"y¢êy§"y¥b9æ¡9càº  ù.®¹hì9.#ˆ›ØØ[İ[xà ˆŠBˆ™]\›‚ˆ›ØœÏPTÑWÑT‹È›ÚXÙWÚ›ØœÈ‚ˆ›ØœË›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ›Ø^Âˆ™\œÚ[Ûˆ•‘T”ÒSÓ‹ˆ™[™Ú[™HœÙ[‹™[™Ú[™K˜İ\œ™[^
+
+Kˆœ™Y™\™[˜ÙWØ]Y[Èœ™Y‹ˆœÛİ\˜ÙWİ›ØØ[œÜ˜Ëˆ[Xœ™WÜİ™[™İœÙ[‹œİ™[™İ˜[YJ
+KÌLŒˆ˜Ü™X]YØ][YK[YJ
+Kˆ˜]]Üš^˜][Û—Û›İHˆ•\Ù\ˆ\È™\ÜÛœÚX›H›Üˆ]š[™È™XÙ\ÜØ\HšYÚËØÛÛœÙ[›ÜˆH\™Ù]›ÚXÙKˆ‚ˆBˆ˜[YOYˆ›ÚXÙWÚ›Ø—ŞÚ[
+[YK[YJ
+J_KšœÛÛˆ‚ˆZ›ØœËÛ˜[YBˆÜš]Wİ^
+œÛÛ‹™[\Ê›Ø‹[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹.îùb¨ymì¹b&ùnîˆ‹ˆ¹«c9hì:/k9£h¹.îùb¨zacyïk¹mì¹/çykf;ï&—ÜHŠB‚‚‚˜Û\ÜÈ[œİ[Y[^\šY[˜ÙTYÙJUÚYÙ]
+N‚ˆˆˆ‚ˆ9.d9¢bùcâùioy£©ùb-¹.+yoàûï&‚ˆ9«ãùéãy.d9fj9cê¹¦/¹é.¹§ 9æî9alùæ¡:+¯¹ïk»ï#9¢¢¹i#y§`¹méy/g9êæycà¹¥l:/k9¢$9cëùä!º)èùæ¡9¯%9icú`"zhnxà ‚ˆˆˆ‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹›ÛÜÜÙXİ[Û—Ú[™^HLB‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+¹.d9¢bù¯%9icù.+yoàÈŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆ[HSX™[
+º`"y¢êy/h9ã¬9g.¹¯%9icùæ¡9.d9fj;ï#9ªf9dlùa/úgìù.d:!ê¹bª9alúeëykîyn¥9c§ù.d9fj:/j;ï#9nm¹¦/¹é.º+éy.d9¢bù§ :g :) yæ¡:,,zgh¸à y£¤¹îàùd£9¯%9icùcà¹¥l8à ˆŠBˆ[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ^[İ]˜YÚYÙ]
+[
+B‚ˆÈÛ™K]\\™›Ü›Y\ˆ[ÙBˆ]ZXÚÈHQÜ›İ\›Ş
+¹. :e+º/æùaiy¯%9icùª(yo#ÈŠBˆ[HR›Ş^[İ]
+]ZXÚÊBˆÙ[‹š[œİ[Y[Ø]ÛœÈHßBˆ][\ÈHÂˆ
+¼'ã®9§*9d"y.å¹¢bÈ‹™İZ]\ˆŠKˆ
+¼'ã®9å-yd"y.å¹¢bÈ‹™[XİšX×ÙİZ]\ˆŠKˆ
+¼'ã®:-'y¥«ù¢bÈ‹˜˜\ÜÈŠKˆ
+¼'é`H:o$ù¢bÈ‹™[\ÈŠKˆ
+¼'ã®H:e+¹ææ9¢bÈ‹œX[›ÈŠKˆBˆ›Üˆ^Ù^H[ˆ][\Î‚ˆTT\Ú]ÛŠ^
+Bˆ‹œÙ]ÚXÚØX›JYJBˆ‹œÙ]Z[š[][RZYÚ
+
+Bˆ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙKÏZÙ^NˆÙ[‹œÙ[XİÚ[œİ[Y[
+ÊJBˆÙ[‹š[œİ[Y[Ø]ÛœÖÚÙ^WOX‚ˆ[˜YÚYÙ]
+ŠBˆ^[İ]˜YÚYÙ]
+]ZXÚÊB‚ˆÙ[‹XœÈHUX•ÚYÙ]
+
+BˆÙ[‹XœË˜YXŠÙ[‹—ØZ[ÙİZ]\—İXŠ
+K¹§*9d"y.åˆŠBˆÙ[‹XœË˜YXŠÙ[‹—ØZ[Ù[XİšX×ÙİZ]\—İXŠ
+K¹å-yd"y.åˆŠBˆÙ[‹XœË˜YXŠÙ[‹—ØZ[Ø˜\Ü×İXŠ
+Kº-'y¥«ÈŠBˆÙ[‹XœË˜YXŠÙ[‹—ØZ[Ù[\×İXŠ
+Kºo$ÈŠBˆÙ[‹XœË˜YXŠÙ[‹—ØZ[ÜX[›×İXŠ
+Kºe+¹ææŠBˆ^[İ]˜YÚYÙ]
+Ù[‹XœËJB‚ˆ˜XİXÙHHQÜ›İ\›Ş
+¹£¤¹îàùbªy¢bÈŠBˆHQÜšY^[İ]
+˜XİXÙJBˆÙ[‹œÙXİ[Û—ØÛÛX›ÈHPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ™Yœ™\ÚÜÙXİ[Ûœ×ØˆHT\Ú]ÛŠ¹b-ù¥¬9«­z$/HŠBˆÙ[‹œ™Yœ™\ÚÜÙXİ[Ûœ×Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÜÙXİ[ÛœÊBˆÙ[‹›ÛÜØÚXÚØ›ŞHPÚXÚĞ›Ş
+¹oª¹ã«ùodùbcy«­z$/HŠBˆÙ[‹›ÛÜØÚXÚØ›ŞÙÙÛY˜ÛÛ›™Xİ
+Ù[‹ÙÙÛWÜÙXİ[Û—ÛÛÜ
+BˆÙ[‹˜Ûİ[[—ØÚXÚØ›ŞHPÚXÚĞ›Ş
+¹«ãù«(yo 9iâùbcH9¢ãHÛİ[Z[ˆŠBˆÙ[‹˜Ûİ[[—ØÚXÚØ›ŞœÙ]ÚXÚÙY
+YJBˆÙ[‹œ˜XİXÙWÜÜYYHPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ˜XİXÙWÜÜYY˜Y][\ÊÈÌ	H9¡h¹îàÈ‹IH9£¤¹îàÈ‹ŒL	H9c§ú`'È—JBˆÙ[‹œ˜XİXÙWÜÜYYœÙ]İ\œ™[[™^
+ŠBˆÙ[‹˜İ\œ™[Ø˜\ˆHSX™[
+¹odùbc{ï&¸ %ŠBˆÙ[‹˜İ\œ™[Ø˜\‹œÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠBˆ[\ØˆHT\Ú]ÛŠº-ìùb,9¢`:`"y«­z$/HŠBˆ[\Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹š[\İ×ÜÙXİ[ÛŠBˆ˜YÚYÙ]
+SX™[
+¹«­z$/HŠK
+Bˆ˜YÚYÙ]
+Ù[‹œÙXİ[Û—ØÛÛX›ËJBˆ˜YÚYÙ]
+Ù[‹œ™Yœ™\ÚÜÙXİ[Ûœ×Ø‹ŠBˆ˜YÚYÙ]
+[\Ø‹ÊBˆ˜YÚYÙ]
+Ù[‹›ÛÜØÚXÚØ›ŞK
+Bˆ˜YÚYÙ]
+Ù[‹˜Ûİ[[—ØÚXÚØ›ŞKJBˆ˜YÚYÙ]
+SX™[
+¹îàù.h:`'ùn©ºh¡:+¯ˆŠKKŠBˆ˜YÚYÙ]
+Ù[‹œ˜XİXÙWÜÜYYKÊBˆ˜YÚYÙ]
+Ù[‹˜İ\œ™[Ø˜\‹‹K
+Bˆ^[İ]˜YÚYÙ]
+˜XİXÙJB‚ˆ›İÛHHR›Ş^[İ]
+
+BˆØ]™HHT\Ú]ÛŠ¹/çykf9§+9«c9¦ì¹.d9¢bú+¯¹ïkˆŠBˆ\WØ]Û—ØXØÙ[
+Ø]™Kœš[X\HŠBˆØ]™K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œØ]™WÚ[œİ[Y[Ü›Ùš[JBˆØÛÜ™HHT\Ú]ÛŠ¹¢dùo 9¯%9aîº,,zghˆŠBˆØÛÜ™K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›Ü[—ÜØÛÜ™WÜYÙJBˆ^HHT\Ú]ÛŠ¹o 9iâÈÈ9¦ ¹`gŠBˆ\WØ]Û—ØXØÙ[
+^KœİXØÙ\ÜÈŠBˆ^K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ^WİÚ]ØÛİ[[ŠBˆ›İÛK˜YÚYÙ]
+Ø]™JBˆ›İÛK˜YÚYÙ]
+ØÛÜ™JBˆ›İÛK˜Yİ™]Ú
+JBˆ›İÛK˜YÚYÙ]
+^JBˆ^[İ]˜Y^[İ]
+›İÛJB‚ˆÙ[‹[Y\TU[Y\ŠÙ[ŠBˆÙ[‹[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹\]WÜ˜XİXÙWÜİ]\ÊBˆÙ[‹[Y\‹œİ\
+Œ
+B‚ˆYˆØÛÛ[[Û—ÙY™šXİ[JÙ[ŠN‚ˆÛÛX›ÏTPÛÛX›Ğ›Ş
+
+BˆÛÛX›Ë˜Y][\ÊÈ¹ë 9c%ˆ‹¹¨!ùaáˆ‹¹.,9kã‹¹.$ù.&ˆ—JBˆÛÛX›ËœÙ]İ\œ™[^
+¹¨!ùaáˆŠBˆ™]\›ˆÛÛX›Â‚ˆYˆØZ[ÙİZ]\—İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTQÜšY^[İ]
+ÊBˆÙ[‹™İZ]\—ÙY™šXİ[O\Ù[‹—ØÛÛ[[Û—ÙY™šXİ[J
+BˆÙ[‹™İZ]\—İ[š[™ÏTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™İZ]\—İ[š[™Ë˜Y][\ÊÈ¹¨!ùaáˆPQĞ‘H‹‘›Ü‹ºfcycbºgìÈXˆ‹º!ê¹k¦¹.bH—JBˆÙ[‹™İZ]\—ØØ\ÏTTÜ[›Ş
+
+BˆÙ[‹™İZ]\—ØØ\ËœÙ]˜[™ÙJLŠBˆÙ[‹™İZ]\—ØØ\ËœÙ]İY™š^
+ˆ9dàHŠBˆÙ[‹™İZ]\—Üİ[OTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™İZ]\—Üİ[K˜Y][\ÊÈº!ê¹bª9£ª:#d‹¹¢jùo)ˆ‹¹b!º)èùd£9o)ˆ‹”İÙ\ˆÚÜ™‹¹¢ê9âaú" ¹icÈ‹‘š[™Ù\œİ[ycàº  È—JBˆÙ[‹™İZ]\—Ù[œÚ]OTTÛY\Š]’Üš^›Û[
+BˆÙ[‹™İZ]\—Ù[œÚ]KœÙ]˜[™ÙJKL
+NÈÙ[‹™İZ]\—Ù[œÚ]KœÙ]˜[YJJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icúf¯¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹™İZ]\—ÙY™šXİ[KJBˆ˜YÚYÙ]
+SX™[
+º, ùo)ˆŠKK
+NÈ˜YÚYÙ]
+Ù[‹™İZ]\—İ[š[™ËKJBˆ˜YÚYÙ]
+SX™[
+Ø\ÈŠK‹
+NÈ˜YÚYÙ]
+Ù[‹™İZ]\—ØØ\Ë‹JBˆ˜YÚYÙ]
+SX™[
+¹/-9icù¥®yo#ÈŠKË
+NÈ˜YÚYÙ]
+Ù[‹™İZ]\—Üİ[KËJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icùká¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹™İZ]\—Ù[œÚ]KJBˆ\ÏTSX™[
+¹nîº+«»ï&¹«c9¢bú!ê¹o.yd"y.å¹¥í¹cëú`"y¢êx '9ë 9c%ˆ
+È9¢jùo)¸ '{ï&ù.d:f'ùcã9d"y.å¹¥í¹cëúfcy/c¹ká¹n©»ï#:`oùacy.#ºe+¹ææùcé¹. 9¢¢¹d"y.å¹¢¨ºh¤y«­xà ˆŠBˆ\ËœÙ]ÛÜ™Ü˜\
+YJNÈ\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ˜YÚYÙ]
+\ËKKŠBˆ™]\›ˆÂ‚ˆYˆØZ[Ø˜\Ü×İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTQÜšY^[İ]
+ÊBˆÙ[‹˜˜\Ü×ÙY™šXİ[O\Ù[‹—ØÛÛ[[Û—ÙY™šXİ[J
+BˆÙ[‹˜˜\Ü×Üİš[™ÜÏTPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜˜\Ü×Üİš[™ÜË˜Y][\ÊÈ9o)¹¨!ùaáˆPQÈ‹yo)ˆ‘PQÈ—JBˆÙ[‹˜˜\Ü×Ü]\›TPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜˜\Ü×Ü]\›‹˜Y][\ÊÈ¹¨.zgìù/&9ab‹¹¨.zgìÊù.¥9n©ˆ‹¹¨.zgìÊùajùn©ˆ‹•Ø[Ú[™ùcàº  È‹¹¦í9¥âùo¢ùc%ˆ—JBˆÙ[‹˜˜\Ü×Ù[œÚ]OTTÛY\Š]’Üš^›Û[
+BˆÙ[‹˜˜\Ü×Ù[œÚ]KœÙ]˜[™ÙJKL
+NÈÙ[‹˜˜\Ü×Ù[œÚ]KœÙ]˜[YJJBˆÙ[‹˜˜\Ü×ÛØİ]™OTPÛÛX›Ğ›Ş
+
+BˆÙ[‹˜˜\Ü×ÛØİ]™K˜Y][\ÊÈ¹«hùn.:gìùc.ˆ‹¹/cºgìù¦í9ê,È‹ºjæ9¢¢¹/cy¦í9i&ˆ—JBˆ˜YÚYÙ]
+SX™[
+¹¯%9icúf¯¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹˜˜\Ü×ÙY™šXİ[KJBˆ˜YÚYÙ]
+SX™[
+¹.d9fjŠKK
+NÈ˜YÚYÙ]
+Ù[‹˜˜\Ü×Üİš[™ÜËKJBˆ˜YÚYÙ]
+SX™[
+˜\ÜÈ[™HŠK‹
+NÈ˜YÚYÙ]
+Ù[‹˜˜\Ü×Ü]\›‹‹JBˆ˜YÚYÙ]
+SX™[
+ºgìùë)¹ká¹n©ˆŠKË
+NÈ˜YÚYÙ]
+Ù[‹˜˜\Ü×Ù[œÚ]KËJBˆ˜YÚYÙ]
+SX™[
+ºgìùc.ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹˜˜\Ü×ÛØİ]™KJBˆ\ÏTSX™[
+¹nîº+«»ï&¹ã¬9g.¹/-9e,y/&9ab8 '9¨.zgìÊù.¥9n©¸ '{ï#9ê,ùk¦¹/cºh¤{ï&úg :) y¦í9ã¬9.èùæ¡9¡'ú)ây¥í¹a£yh§¹b¨9ajùn©¹d£9îãú/áúgìøà ˆŠBˆ\ËœÙ]ÛÜ™Ü˜\
+YJNÈ\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ˜YÚYÙ]
+\ËKKŠBˆ™]\›ˆÂ‚ˆYˆØZ[Ù[XİšX×ÙİZ]\—İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTQÜšY^[İ]
+ÊBˆÙ[‹™[XİšX×ÙY™šXİ[O\Ù[‹—ØÛÛ[[Û—ÙY™šXİ[J
+BˆÙ[‹™[XİšX×İ[š[™ÏTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[XİšX×İ[š[™Ë˜Y][\ÊÈ¹¨!ùaáˆPQĞ‘H‹‘›Ü‹ºfcycbºgìÈXˆ‹‘›ÜÈ—JBˆÙ[‹™[XİšX×Ü›ÛOTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[XİšX×Ü›ÛK˜Y][\ÊÈº!ê¹bª:+á¹b*È‹º" ¹icùd"y.åˆ‹¹..úgìùd"y.åˆ‹”İÙ\ˆÚÜ™‹¹®!zgìúdî¹n¥H‹”ÛÛÈ—JBˆÙ[‹™[XİšX×İÛ™OTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[XİšX×İÛ™K˜Y][\ÊÈº-çúf£ùc§ù¦ìˆ‹ÛX[ˆ‹Ü[˜Ú‹“İ™\™š]™H‹’YÚØZ[ˆ—JBˆÙ[‹™[XİšX×Ù[œÚ]OTTÛY\Š]’Üš^›Û[
+BˆÙ[‹™[XİšX×Ù[œÚ]KœÙ]˜[™ÙJKL
+NÈÙ[‹™[XİšX×Ù[œÚ]KœÙ]˜[YJJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icúf¯¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹™[XİšX×ÙY™šXİ[KJBˆ˜YÚYÙ]
+SX™[
+º, ùo)ˆŠKK
+NÈ˜YÚYÙ]
+Ù[‹™[XİšX×İ[š[™ËKJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icú)äº"lˆŠK‹
+NÈ˜YÚYÙ]
+Ù[‹™[XİšX×Ü›ÛK‹JBˆ˜YÚYÙ]
+SX™[
+ºgìú"l¹nîº+«ˆŠKË
+NÈ˜YÚYÙ]
+Ù[‹™[XİšX×İÛ™KËJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icùká¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹™[XİšX×Ù[œÚ]KJBˆ\ÏTSX™[
+•U”ˆ9ao9k®yakz/j9ª(yg¢ùab9å'ù¢$9ç'ùk§ˆİZ]\ˆİ[{ï#9a£z/æú(c9§*9d"y.å‹ùå-yd"y.å¹.£:f-¹«­z+á¹b*ûï&ù£¤¹îàù¥íº`"y¢êyå-yd"y.å¹¢bù/&º!ê¹bª9alúeëyå-yd"y.å¹c§ú/j8à ˆŠBˆ\ËœÙ]ÛÜ™Ü˜\
+YJNÈ\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ˜YÚYÙ]
+\ËKKŠBˆ™]\›ˆÂ‚ˆYˆØZ[Ù[\×İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTQÜšY^[İ]
+ÊBˆÙ[‹™[\×ÙY™šXİ[O\Ù[‹—ØÛÛ[[Û—ÙY™šXİ[J
+BˆÙ[‹™[\×ÙÜ›Ûİ™OTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[\×ÙÜ›Ûİ™K˜Y][\ÊÈº!ê¹bª9£ª:#d‹”Ü™X]‹”›ØÚÈ™X]‹˜[Y‹‘[šùcàº  È‹”ÚY™›ycàº  È—JBˆÙ[‹™[\×ÚZ]TPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[\×ÚZ]˜Y][\ÊÈ¹ajùb!ºgìùë)ˆ‹¹c`yakyb!ºgìùë)ˆ‹¹o :eëzel¹­íùd"‹”šYy..¹..È—JBˆÙ[‹™[\×Ùš[TPÛÛX›Ğ›Ş
+
+BˆÙ[‹™[\×Ùš[˜Y][\ÊÈ¹l$zaãÈš[‹¹«­z$/ybcHš[‹¹bkù«c9b¨9o.ˆ‹¹.,9kãš[—JBˆÙ[‹™[\×Üİ™[™İTTÛY\Š]’Üš^›Û[
+BˆÙ[‹™[\×Üİ™[™İœÙ]˜[™ÙJKL
+NÈÙ[‹™[\×Üİ™[™İœÙ]˜[YJJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icúf¯¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹™[\×ÙY™šXİ[KJBˆ˜YÚYÙ]
+SX™[
+‘Ü›Ûİ™HŠKK
+NÈ˜YÚYÙ]
+Ù[‹™[\×ÙÜ›Ûİ™KKJBˆ˜YÚYÙ]
+SX™[
+’KR]ÔšYHŠK‹
+NÈ˜YÚYÙ]
+Ù[‹™[\×ÚZ]‹JBˆ˜YÚYÙ]
+SX™[
+‘š[ŠKË
+NÈ˜YÚYÙ]
+Ù[‹™[\×Ùš[ËJBˆ˜YÚYÙ]
+SX™[
+¹b¦ùn©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹™[\×Üİ™[™İJBˆ\ÏTSX™[
+¹nîº+«»ï&ºo$ù¢bù£¤¹îàù¥í¹/&9ab9ç"ù«­z$/yd£9l#ú" ¹£ä9é.»ï&ùbkù«c8à zeí9icùbcyæ¡š[9å*X\šÙ\ˆ9kîzod9/&¹«å9ceyî«ùç"ù¥íºeí9¦í9¥®y/¯øà ˆŠBˆ\ËœÙ]ÛÜ™Ü˜\
+YJNÈ\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ˜YÚYÙ]
+\ËKKŠBˆ™]\›ˆÂ‚ˆYˆØZ[ÜX[›×İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTQÜšY^[İ]
+ÊBˆÙ[‹œX[›×ÙY™šXİ[O\Ù[‹—ØÛÛ[[Û—ÙY™šXİ[J
+BˆÙ[‹œX[›×ÛYTPÛÛX›Ğ›Ş
+
+BˆÙ[‹œX[›×ÛY˜Y][\ÊÈ¹¨.zgìÈ‹¹¨.zgìÊù.¥9n©ˆ‹¹ajùn©¹/cºgìÈ‹¹b!º)èùd£9o)ˆ—JBˆÙ[‹œX[›×ÜšYÚTPÛÛX›Ğ›Ş
+
+BˆÙ[‹œX[›×ÜšYÚ˜Y][\ÊÈ¹."yd£9o)ˆ‹º/k9/cy/&9ab‹¹b!º)èùd£9o)ˆ‹”Y:dî¹n¥H‹”šÙ\ú" ¹icùg¢È—JBˆÙ[‹œX[›×Üİ\İZ[TPÛÛX›Ğ›Ş
+
+BˆÙ[‹œX[›×Üİ\İZ[‹˜Y][\ÊÈº!ê¹bª9£ª:#d‹¹l$yníºgìÈ‹¹.+yëbyníºgìÈ‹¹¬&ùfí:eoùníºgìÈ—JBˆÙ[‹œX[›×Ù[œÚ]OTTÛY\Š]’Üš^›Û[
+BˆÙ[‹œX[›×Ù[œÚ]KœÙ]˜[™ÙJKL
+NÈÙ[‹œX[›×Ù[œÚ]KœÙ]˜[YJJBˆ˜YÚYÙ]
+SX™[
+¹¯%9icúf¯¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹œX[›×ÙY™šXİ[KJBˆ˜YÚYÙ]
+SX™[
+¹mé¹¢bÈŠKK
+NÈ˜YÚYÙ]
+Ù[‹œX[›×ÛYKJBˆ˜YÚYÙ]
+SX™[
+¹cìù¢bÈŠK‹
+NÈ˜YÚYÙ]
+Ù[‹œX[›×ÜšYÚ‹JBˆ˜YÚYÙ]
+SX™[
+¹níºgìÈŠKË
+NÈ˜YÚYÙ]
+Ù[‹œX[›×Üİ\İZ[‹ËJBˆ˜YÚYÙ]
+SX™[
+¹îáù/dùká¹n©ˆŠK
+NÈ˜YÚYÙ]
+Ù[‹œX[›×Ù[œÚ]KJBˆ\ÏTSX™[
+¹nîº+«»ï&ºd¨¹ä-9o.ye,ycëùå*8 '9mé¹¢bù¨.zgìÊùcìù¢bú/k9/cx '{ï&ù.d:f'úaã9b&zfcy/c¹mé¹¢bùká¹n©»ï#9¢¢¹/cºh¤yênºeí9åfyîæH˜\Üøà ˆŠBˆ\ËœÙ]ÛÜ™Ü˜\
+YJNÈ\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ˜YÚYÙ]
+\ËKKŠBˆ™]\›ˆÂ‚ˆYˆÙ[XİÚ[œİ[Y[
+Ù[‹Ù^JN‚ˆ[™^^È™İZ]\ˆŒ™[XİšX×ÙİZ]\ˆŒK˜˜\ÜÈŒ‹™[\ÈŒËœX[›ÈK™Ù]
+Ù^K
+BˆÙ[‹XœËœÙ]İ\œ™[[™^
+[™^
+Bˆ›ÜˆËˆ[ˆÙ[‹š[œİ[Y[Ø]ÛœËš][\Ê
+N‚ˆ‹œÙ]ÚXÚÙY
+ÏOZÙ^JBˆÙ[‹›XZ[‹˜\WÛ]™WÜ™\Ù]
+Ù^JBˆYˆ\Ø]ŠÙ[‹›XZ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙHŠN‚ˆX\[™Ï^È™İZ]\ˆˆ¹akyî¯ú,,H‹™[XİšX×ÙİZ]\ˆˆ¹akyî¯ú,,H‹˜˜\ÜÈˆº-'y¥«ú,,H‹™[\Èˆºo$ú,,H‹œX[›Èˆºe+¹ææ:,,HŸBˆY\Ù[‹›XZ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙKœØÛÜ™Wİ\K™š[™^
+X\[™ÖÚÙ^WJBˆYˆYL‚ˆÙ[‹›XZ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙKœØÛÜ™Wİ\KœÙ]İ\œ™[[™^
+Y
+BˆÙ[‹›XZ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙKœ™Yœ™\ÚÜØÛÜ™J
+B‚ˆYˆ™Yœ™\ÚÜÙXİ[ÛœÊÙ[ŠN‚ˆÙ[‹œÙXİ[Û—ØÛÛX›Ë˜ÛX\Š
+BˆÙXİ[ÛœÏYÙ]]ŠÙ[‹›XZ[‹œÙXİ[Û—İ[Y[[™H‹×JHÜˆ×Bˆ›ÜˆKÈ[ˆ[[Y\˜]JÙXİ[ÛœÊN‚ˆÙ[‹œÙXİ[Û—ØÛÛX›Ë˜Y][JˆÚJÌ_KˆÜË™Ù]
+	Û˜[YIË	ù«­z$/IÊ_HÜÙ[‹›XZ[‹—Ù›Ü›X]İ[YJË™Ù]
+	ÜÙXÛÛ™ÉË
+J_H‹JB‚ˆYˆ[\İ×ÜÙXİ[ÛŠÙ[ŠN‚ˆY\Ù[‹œÙXİ[Û—ØÛÛX›Ë˜İ\œ™[]J
+BˆÙXİ[ÛœÏYÙ]]ŠÙ[‹›XZ[‹œÙXİ[Û—İ[Y[[™H‹×JHÜˆ×Bˆ\\Ù[‹›XZ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+BˆYˆY\È›Û™HÜˆ›İÙXİ[ÛœÈÜˆ\L‚ˆ™]\›‚ˆÙXÏY›Ø]
+ÙXİ[ÛœÖÚ[
+Y
+WK™Ù]
+œÙXÛÛ™È‹
+JBˆÙ[‹›XZ[‹™[™Ú[™KœÙYZ×Ü˜][ÊÙXËÙ\ŠB‚ˆYˆÙÙÛWÜÙXİ[Û—ÛÛÜ
+Ù[‹ÚXÚÙY
+N‚ˆY\Ù[‹œÙXİ[Û—ØÛÛX›Ë˜İ\œ™[]J
+BˆÙ[‹›ÛÜÜÙXİ[Û—Ú[™^Z[
+Y
+HYˆÚXÚÙY[™Y\È›İ›Û™H[ÙHLB‚ˆYˆ\]WÜ˜XİXÙWÜİ]\ÊÙ[ŠN‚ˆ›İÜÏYÙ]]ŠÙ[‹›XZ[‹˜ÚÜ™İ[Y[[™H‹×JHÜˆ×BˆÜÏ\Ù[‹›XZ[‹™[™Ú[™KœÜÚ][Û—ÜÙXÛÛ™Ê
+Bˆİ\œ™[S›Û™Bˆ›Üˆ›İÈ[ˆ›İÜÎ‚ˆYˆÜÏ\›İË™Ù]
+œÙXÛÛ™È‹
+N‚ˆİ\œ™[\›İÂˆ[ÙN‚ˆœ™XZÂˆYˆİ\œ™[‚ˆÙ[‹˜İ\œ™[Ø˜\‹œÙ]^
+ˆˆ¹odùbc{ï&Øİ\œ™[™Ù]
+	ÜÙXİ[Û‰Ë	ÉÊ_H0­È9ë+Øİ\œ™[™Ù]
+	Ø˜\‰Ë	ËIÊ_H9l#ú" ˆ0­È‚ˆˆÉÈÈ	Ëš›Ú[Šİ\œ™[™Ù]
+	ØÚÜ™ÉÊHÜˆ×J_H‚ˆ
+B‚ˆYˆÙ[‹›ÛÜØÚXÚØ›Şš\ĞÚXÚÙY
+
+H[™Ù[‹›ÛÜÜÙXİ[Û—Ú[™^L‚ˆÙXİ[ÛœÏYÙ]]ŠÙ[‹›XZ[‹œÙXİ[Û—İ[Y[[™H‹×JHÜˆ×BˆO\Ù[‹›ÛÜÜÙXİ[Û—Ú[™^ˆYˆH[ŠÙXİ[ÛœÊN‚ˆİ\Y›Ø]
+ÙXİ[ÛœÖÚWK™Ù]
+œÙXÛÛ™È‹
+JBˆ[™Y›Ø]
+ÙXİ[ÛœÖÚJÌWK™Ù]
+œÙXÛÛ™È‹Ù[‹›XZ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+JJHYˆJÌO[ŠÙXİ[ÛœÊH[ÙHÙ[‹›XZ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+BˆYˆ[™œİ\[™ÜÏY[™LŒN‚ˆ\\Ù[‹›XZ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+BˆYˆ\Œ‚ˆÙ[‹›XZ[‹™[™Ú[™KœÙYZ×Ü˜][Êİ\Ù\ŠB‚ˆYˆ^WİÚ]ØÛİ[[ŠÙ[ŠN‚ˆYˆÙ[‹˜Ûİ[[—ØÚXÚØ›Şš\ĞÚXÚÙY
+
+H[™\Ø]ŠÙ[‹›XZ[‹›]™HŠN‚ˆN‚ˆÙ[‹›XZ[‹›]™Kœİ\ØÛİ[Ú[Š
+Bˆ™]\›‚ˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹›XZ[‹œ^WÜ]\ÙJ
+B‚ˆYˆÜ[—ÜØÛÜ™WÜYÙJÙ[ŠN‚ˆÈ˜]šYØ][ÛˆÜ™\ˆ[\ÜRHÜ]K\œ˜[™ÙH‹ØÛÜ™HÂˆÙ[‹›XZ[‹›˜]‹œÙ]İ\œ™[›İÊ
+BˆÙ[‹›XZ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙKœ™Yœ™\ÚÜØÛÜ™J
+B‚ˆYˆÜ›Ùš[WÙ]JÙ[ŠN‚ˆÙ^OVÈ™İZ]\ˆ‹™[XİšX×ÙİZ]\ˆ‹˜˜\ÜÈ‹™[\È‹œX[›È—VÜÙ[‹XœË˜İ\œ™[[™^
+
+WBˆ]O^Èš[œİ[Y[šÙ^Kœ˜XİXÙWÜÜYYœÙ[‹œ˜XİXÙWÜÜYY˜İ\œ™[^
+
+_BˆYˆÙ^OOH™İZ]\ˆ‚ˆ]K\]JÂˆ™Y™šXİ[HœÙ[‹™İZ]\—ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ[š[™ÈœÙ[‹™İZ]\—İ[š[™Ë˜İ\œ™[^
+
+Kˆ˜Ø\ÈœÙ[‹™İZ]\—ØØ\Ë˜[YJ
+Kˆœİ[HœÙ[‹™İZ]\—Üİ[K˜İ\œ™[^
+
+Kˆ™[œÚ]HœÙ[‹™İZ]\—Ù[œÚ]K˜[YJ
+BˆJBˆ[YˆÙ^OOH™[XİšX×ÙİZ]\ˆ‚ˆ]K\]JÂˆ™Y™šXİ[HœÙ[‹™[XİšX×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ[š[™ÈœÙ[‹™[XİšX×İ[š[™Ë˜İ\œ™[^
+
+Kˆœ›ÛHœÙ[‹™[XİšX×Ü›ÛK˜İ\œ™[^
+
+KˆÛ™HœÙ[‹™[XİšX×İÛ™K˜İ\œ™[^
+
+Kˆ™[œÚ]HœÙ[‹™[XİšX×Ù[œÚ]K˜[YJ
+BˆJBˆ[YˆÙ^OOH˜˜\ÜÈ‚ˆ]K\]JÂˆ™Y™šXİ[HœÙ[‹˜˜\Ü×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆœİš[™ÜÈœÙ[‹˜˜\Ü×Üİš[™ÜË˜İ\œ™[^
+
+Kˆœ]\›ˆœÙ[‹˜˜\Ü×Ü]\›‹˜İ\œ™[^
+
+Kˆ™[œÚ]HœÙ[‹˜˜\Ü×Ù[œÚ]K˜[YJ
+Kˆœ˜[™ÙHœÙ[‹˜˜\Ü×ÛØİ]™K˜İ\œ™[^
+
+BˆJBˆ[YˆÙ^OOH™[\È‚ˆ]K\]JÂˆ™Y™šXİ[HœÙ[‹™[\×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ™Ü›Ûİ™HœÙ[‹™[\×ÙÜ›Ûİ™K˜İ\œ™[^
+
+KˆšZ]œÙ[‹™[\×ÚZ]˜İ\œ™[^
+
+Kˆ™š[œÙ[‹™[\×Ùš[˜İ\œ™[^
+
+Kˆœİ™[™İœÙ[‹™[\×Üİ™[™İ˜[YJ
+BˆJBˆ[ÙN‚ˆ]K\]JÂˆ™Y™šXİ[HœÙ[‹œX[›×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ›YœÙ[‹œX[›×ÛY˜İ\œ™[^
+
+KˆœšYÚœÙ[‹œX[›×ÜšYÚ˜İ\œ™[^
+
+Kˆœİ\İZ[ˆœÙ[‹œX[›×Üİ\İZ[‹˜İ\œ™[^
+
+Kˆ™[œÚ]HœÙ[‹œX[›×Ù[œÚ]K˜[YJ
+BˆJBˆ™]\›ˆ]B‚ˆYˆØ]™WÚ[œİ[Y[Ü›Ùš[JÙ[ŠN‚ˆYˆ›İÙ[‹›XZ[‹œÛÛ™×Ùš[N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9kï9aiy«c9¦ì¸à ˆŠBˆ™]\›‚ˆÛÛ™ÏT]
+Ù[‹›XZ[‹œÛÛ™×Ùš[JKœİ[Bˆ›Û\PTÑWÑT‹Èš[œİ[Y[Ü›Ùš[\È‚ˆ›Û\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ]O\Ù[‹—Ü›Ùš[WÙ]J
+Bˆ]VÈœÛÛ™È—O\Ù[‹›XZ[‹œÛÛ™×Ùš[Bˆ]VÈœØ]™YØ]—O][YK[YJ
+BˆY›Û\‹ÙˆÜÛÛ™ßWŞÙ]VÉÚ[œİ[Y[	×_KšœÛÛˆ‚ˆÜš]Wİ^
+œÛÛ‹™[\Ê]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹/çykf9¢$9b§È‹ˆ¹§+9«c9¦ì¹æ¡9.d9¢bú+¯¹ïk¹mì¹/çykf;ï&—ÜHŠB‚‚‚˜Û\ÜÈ[š]™\œØ[[\ÜYÙJUÚYÙ]
+N‚ˆÕTÔ•QÑVÈHÂˆ‹›\È‹‹Ø]ˆ‹‹™›XÈ‹‹›MH‹‹˜XXÈ‹‹›ÙÙÈ‹‹›Ü\È‹‹ÛXH‹ˆ‹˜ZY™ˆ‹‹˜ZYˆ‹‹˜[XÈ‹‹˜XÌÈ‹‹˜\H‹‹›ZØH‹‹˜ØYˆ‚ˆB‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹œ]Y]YHH×BˆÙ[‹˜Û\›Ø\™İ[Y\ˆH›Û™B‚ˆ^[İ]HU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+¹îçù. :gìù.d9kï9aiy.+yoàÈŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆ[HSX™[
+ˆ¹¥+ù£ y§+9g,9i&¹¨/9o#øà y¢nzaãù¥¡ù.í¸à yb!¹.ªù¥¡ù§+údï¹£©xà ybjº--9§oùkï9aixà ˆ‚ˆ¹kï9aiyd#¹îçù. :/k9..¹ªf9dlùa/úgìù.d9méy/gĞU»ï#9.#y/ë¹¥.yc§ù¥¡ù.í¸à ˆ‚ˆ
+Bˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+[
+B‚ˆXœÈHUX•ÚYÙ]
+
+BˆXœË˜YXŠÙ[‹—ØZ[ÛØØ[İXŠ
+K¹§+9g,È9¢nzaãÈŠBˆXœË˜YXŠÙ[‹—ØZ[Û[š×İXŠ
+K¹b!¹.ªúdï¹£©HŠBˆXœË˜YXŠÙ[‹—ØZ[Ü]Y]YWİXŠ
+K¹kï9aizf'ùb%ÈŠBˆ^[İ]˜YÚYÙ]
+XœËJB‚ˆYˆØZ[ÛØØ[İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTU›Ş^[İ]
+ÊB‚ˆ˜\TR›Ş^[İ]
+
+BˆÛ™OTT\Ú]ÛŠº`"y¢êzgìù.d9¥¡ù.íˆŠBˆX[OTT\Ú]ÛŠ¹¢nzaãú`"y¢êHŠBˆ›Û\TT\Ú]ÛŠ¹kï9aiy¥m9.*¹¥¡ù.í¹i.HŠBˆÛ™K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œXÚ×ÛÛ™JBˆX[K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œXÚ×ÛX[JBˆ›Û\‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œXÚ×Ù›Û\ŠBˆ˜\‹˜YÚYÙ]
+Û™JNÈ˜\‹˜YÚYÙ]
+X[JNÈ˜\‹˜YÚYÙ]
+›Û\ŠNÈ˜\‹˜Yİ™]Ú
+JBˆ˜Y^[İ]
+˜\ŠB‚ˆÙ[‹›ØØ[Û\İTUX›UÚYÙ]
+JBˆÙ[‹›ØØ[Û\İœÙ]Üš^›Û[XY\“X™[ÊÈ¹¥¡ù.íˆ‹¹¨/9o#È‹¹i)ùl#È‹¹â­¹  H‹¹æë¹¨!ùméy/g9¥¡ù.íˆ—JBˆÙ[‹›ØØ[Û\İšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJBˆÙ[‹›ØØ[Û\İ˜Ù[İX›PÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›Ü[—ÛØØ[Ú][JBˆ˜YÚYÙ]
+Ù[‹›ØØ[Û\İ
+B‚ˆÜÏTR›Ş^[İ]
+
+BˆÙ[‹˜]]×ØÛÛ™\TPÚXÚĞ›Ş
+º!ê¹bª:/k9£h¹..ˆĞUˆ9méy/g9¨/9o#ÈŠBˆÙ[‹˜]]×ØÛÛ™\œÙ]ÚXÚÙY
+YJBˆÙ[‹˜]]×Ùš[™Ù\œš[TPÚXÚĞ›Ş
+º!ê¹bª:gìúh¤y£!ùî®yc®úaãHŠBˆÙ[‹˜]]×Ùš[™Ù\œš[œÙ]ÚXÚÙY
+YJBˆÙ[‹˜]]×Ü™X[˜[^™OTPÚXÚĞ›Ş
+¹kï9aiyd#¹b¨9aiH”Kú, ù )úh¡9b!¹§¤ŠBˆÙ[‹˜]]×Ü™X[˜[^™KœÙ]ÚXÚÙY
+YJBˆİ\TT\Ú]ÛŠ¹o 9iâùkï9aiHŠBˆ\WØ]Û—ØXØÙ[
+İ\œš[X\HŠBˆİ\˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ›ØÙ\Ü×ÛØØ[Ü]Y]YJBˆÜË˜YÚYÙ]
+Ù[‹˜]]×ØÛÛ™\
+BˆÜË˜YÚYÙ]
+Ù[‹˜]]×Ùš[™Ù\œš[
+BˆÜË˜YÚYÙ]
+Ù[‹˜]]×Ü™X[˜[^™JBˆÜË˜Yİ™]Ú
+JBˆÜË˜YÚYÙ]
+İ\
+Bˆ˜Y^[İ]
+ÜÊBˆ™]\›ˆÂ‚ˆYˆØZ[Û[š×İXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTU›Ş^[İ]
+ÊB‚ˆÙ[‹œÚ\™Wİ^TTZ[•^Y]
+
+BˆÙ[‹œÚ\™Wİ^œÙ]XÙZÛ\•^
+ˆ¹ì¦:--9§+9.®¹§"y§`ù/oùå*9æ¡9ak9o :gìúh¤yæí:dï»ï#9/¢ùi »ï&—ˆ‚ˆ¹«c9¦ì»ï&–šÎ‹ËÙ^[\K˜ÛÛKØ]Y[Ë›\È‚ˆ
+Bˆ˜YÚYÙ]
+Ù[‹œÚ\™Wİ^
+B‚ˆ˜\TR›Ş^[İ]
+
+Bˆ\İOTT\Ú]ÛŠ¹.ã¹bjº--9§oùì¦:--ŠBˆ\œÙOTT\Ú]ÛŠ¹£ä9cåºdï¹£©HŠBˆİÛ›ØYTT\Ú]ÛŠ¹kï9aiy£¢9§`úgìúh¤HŠBˆ\İK˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ\İWØÛ\›Ø\™
+Bˆ\œÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ\œÙWÜÚ\™Wİ^
+BˆİÛ›ØY˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹™İÛ›ØYÜÙ[XİYÛ[šÊBˆÙ[‹˜Û\İØ]ÚTPÚXÚĞ›Ş
+¹æäyd+9bjº--9§où.+yæ¡:gìù.d:dï¹£©HŠBˆÙ[‹˜Û\İØ]ÚÙÙÛY˜ÛÛ›™Xİ
+Ù[‹ÙÙÛWØÛ\›Ø\™İØ]Ú
+Bˆ˜\‹˜YÚYÙ]
+\İJNÈ˜\‹˜YÚYÙ]
+\œÙJNÈ˜\‹˜YÚYÙ]
+İÛ›ØY
+Bˆ˜\‹˜YÚYÙ]
+Ù[‹˜Û\İØ]Ú
+NÈ˜\‹˜Yİ™]Ú
+JBˆ˜Y^[İ]
+˜\ŠB‚ˆÙ[‹›[š×İX›OTUX›UÚYÙ]
+
+BˆÙ[‹›[š×İX›KœÙ]Üš^›Û[XY\“X™[ÊÈ•T“‹¹ìnùg¢ùb)9¥«H‹¹â­¹  H‹º+í9¦#ˆ—JBˆÙ[‹›[š×İX›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJBˆ˜YÚYÙ]
+Ù[‹›[š×İX›JB‚ˆ›İXÙOTSX™[
+ˆ¹§+:/kù.í¹æë¹bcy.áy/¦ùki¹.h9.#¹è%9êm¹/oùå*;ï#9.#y£ä9/¦ù«c9¦ì¹."ú/oy§#yb¨xà ˆ‚ˆ¹.áycëùkï9aiyå*9¢-ù§+9.®¹§"y§`ù/oùå*9æ¡9§+9g,:gìúh¤y¢%¹ak9o 9æí:dï»ï&È‚ˆ¹.#y/&¹îåz/áÈ“xà y/&¹df8à y.æ:-.xà yænùoezj£:+ày¢%¹nlùcì:+¯úeë¹£©ùb-¸à ˆ‚ˆ
+Bˆ›İXÙKœÙ]ÛÜ™Ü˜\
+YJBˆ›İXÙKœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ˜YÚYÙ]
+›İXÙJBˆ™]\›ˆÂ‚ˆYˆØZ[Ü]Y]YWİXŠÙ[ŠN‚ˆÏTUÚYÙ]
+
+BˆTU›Ş^[İ]
+ÊBˆÙ[‹œ]Y]YWİX›OTUX›UÚYÙ]
+ŠBˆÙ[‹œ]Y]YWİX›KœÙ]Üš^›Û[XY\“X™[ÊÈ¹§iy®¤‹¹¥¡ù.íˆ‹¹£!ùî®H‹º/k9£hˆ‹ºh¡9b!¹§¤‹¹â­¹  H—JBˆÙ[‹œ]Y]YWİX›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJBˆ˜YÚYÙ]
+Ù[‹œ]Y]YWİX›JBˆ™]\›ˆÂ‚ˆYˆØ]Y[×Ùš[\ŠÙ[ŠN‚ˆ™]\›ˆ
+ˆºgìúh¤y¥¡ù.íˆ
+
+‹›\È
+‹Ø]ˆ
+‹™›XÈ
+‹›MH
+‹˜XXÈ
+‹›ÙÙÈ
+‹›Ü\È
+‹ÛXH‚ˆŠ‹˜ZY™ˆ
+‹˜ZYˆ
+‹˜[XÈ
+‹˜XÌÈ
+‹˜\H
+‹›ZØH
+‹˜ØYŠNÎù¢`9§"y¥¡ù.íˆ
+
+‹ŠŠH‚ˆ
+B‚‚ˆYˆÜ[—ÛØØ[Ú][JÙ[‹›İËÛÛ
+N‚ˆØØ[VŞ›Üˆ[ˆÙ[‹œ]Y]YHYˆ™Ù]
+šÚ[™ŠOOH›ØØ[—BˆYˆ›İÏÜˆ›İÏ[[ŠØØ[
+N‚ˆ™]\›‚ˆ][O[ØØ[Ü›İ×Bˆ]Z][K™Ù]
+ÛÜšÚ[™ÈŠHÜˆ][K™Ù]
+œÛİ\˜ÙHŠBˆYˆ][™]
+]
+K™^\İÊ
+N‚ˆÙ[‹›XZ[‹›ØYÚ[\ÜYİÛÜšÚ[™×Ùš[J]
+B‚ˆYˆXÚ×ÛÛ™JÙ[ŠN‚ˆÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJÙ[‹º`"y¢êzgìù.d9¥¡ù.íˆ‹ˆ‹Ù[‹—Ø]Y[×Ùš[\Š
+JBˆYˆˆÙ[‹˜YÛØØ[Ùš[\ÊÜJB‚ˆYˆXÚ×ÛX[JÙ[ŠN‚ˆš[\ËÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[Y\ÊÙ[‹¹¢nzaãú`"y¢êzgìù.d9¥¡ù.íˆ‹ˆ‹Ù[‹—Ø]Y[×Ùš[\Š
+JBˆYˆš[\ÎˆÙ[‹˜YÛØØ[Ùš[\Êš[\ÊB‚ˆYˆXÚ×Ù›Û\ŠÙ[ŠN‚ˆ›Û\TQš[QX[ÙË™Ù]^\İ[™Ñ\™XİÜJÙ[‹º`"y¢êzgìù.d9¥¡ù.í¹i.HŠBˆYˆ›İ›Û\ˆ™]\›‚ˆš[\ÏV×Bˆ›Üˆ[ˆ]
+›Û\ŠKœ™ÛØŠŠˆŠN‚ˆYˆš\×Ùš[J
+H[™œİY™š^›İÙ\Š
+H[ˆÙ[‹”ÕTÔ•QÑVÎ‚ˆš[\Ë˜\[™
+İŠ
+JBˆÙ[‹˜YÛØØ[Ùš[\Êš[\ÊB‚ˆYˆYÛØØ[Ùš[\ÊÙ[‹š[\ÊN‚ˆ^\İ[™Ï^Ş™Ù]
+œÛİ\˜ÙHŠH›Üˆ[ˆÙ[‹œ]Y]Y_Bˆ›Üˆˆ[ˆš[\Î‚ˆT]
+ŠBˆYˆ›İ™^\İÊ
+HÜˆœİY™š^›İÙ\Š
+H›İ[ˆÙ[‹”ÕTÔ•QÑVÎ‚ˆÛÛ[YBˆYˆİŠ
+H[ˆ^\İ[™Î‚ˆÛÛ[YBˆ][O^ÈœÛİ\˜ÙHœİŠ
+KšÚ[™ˆ›ØØ[‹œİ]\Èˆ¹ëbyo¡ykï9aiHŸBˆÙ[‹œ]Y]YK˜\[™
+][JBˆ^\İ[™Ë˜Y
+İŠ
+JBˆÙ[‹œ™Yœ™\ÚİX›\Ê
+B‚ˆYˆÙš[™Ù\œš[
+Ù[‹]
+N‚ˆZ\ÚX‹œÚLMŠ
+BˆÚ]Ü[Š]œ˜ˆŠH\È‚ˆÚ[HYN‚ˆY‹œ™XY
+L
+ŒL
+BˆYˆ›İˆœ™XZÂˆ\]JŠBˆ™]\›ˆš^YÙ\İ
+
+B‚ˆYˆİÛÜšÚ[™×Ù\ŠÙ[ŠN‚ˆYˆ\Ø]ŠÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\HŠN‚ˆ\Ù[‹›XZ[‹›]\ÚX×ÛXœ˜\K›Xœ˜\WÜ]ÖÈ[\—KÈÛÜšÚ[™È‚ˆ[ÙN‚ˆPTÑWÑT‹Èš[\ÜÈ‹ÈÛÜšÚ[™È‚ˆ›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ™]\›ˆ‚ˆYˆÛÜšYÚ[˜[Ù\ŠÙ[ŠN‚ˆYˆ\Ø]ŠÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\HŠN‚ˆ\Ù[‹›XZ[‹›]\ÚX×ÛXœ˜\K›Xœ˜\WÜ]ÖÈ›ÜšYÚ[˜[È—KÈ¹§+9g,9kï9aiH‚ˆ[ÙN‚ˆPTÑWÑT‹Èš[\ÜÈ‹È›ÜšYÚ[˜[È‚ˆ›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ™]\›ˆ‚ˆYˆØÛÛ™\İ×İØ]ŠÙ[‹Ü˜ÊN‚ˆÜ˜ÏT]
+Ü˜ÊBˆN‚ˆš[™Ù\œš[\Ù[‹—Ùš[™Ù\œš[
+Ü˜ÊVÎŒL—Bˆ^Ù\^Ù\[Û‚ˆš[™Ù\œš[Z\ÚX‹œÚLMŠ›Ü›X[^™YÜ]
+Ü˜ÊK™[˜ÛÙJ]‹NŠJKš^YÙ\İ
+
+VÎŒL—Bˆİ]\Ù[‹—İÛÜšÚ[™×Ù\Š
+KÊØY™WÙš[WÜİ[JÜ˜Ëœİ[JJÙˆ—ŞÙš[™Ù\œš[WİÛÜšËØ]ˆŠBˆ™›\YÏ\Ù[‹›XZ[‹—Ùš[™Ù™›\YÊ
+HYˆ\Ø]ŠÙ[‹›XZ[‹—Ùš[™Ù™›\YÈŠH[ÙHˆ‚ˆYˆ›İ™›\YÎ‚ˆÈĞUˆØ[ˆ™H\ÙY\™XİHÚ[ˆ™›\YÈ\Û‰İ]˜Z[X›K‚ˆYˆÜ˜ËœİY™š^›İÙ\Š
+OOH‹Ø]ˆ‚ˆ™]\›ˆİŠÜ˜ÊBˆ˜Z\ÙH[[YQ\œ›ÜŠ¹§*¹¢o¹b,‘›\Yûï#9¥è9¬åy¢¢º+éy¨/9o#ú/k9£h¹¢$9îçù. 9méy/gĞU¸à ˆŠBˆÛYVÂˆ™›\YË‹^H‹‹ZH‹İŠÜ˜ÊKˆ‹]›ˆ‹‹XXÈ‹Œˆ‹‹X\ˆ‹L‹‹XÎ˜H‹œÛWÜÌH‹İŠİ]
+BˆBˆ\İXœ›ØÙ\ÜËœ[ŠÛYØ\\™WÛİ]]UYK^UYK[Y[İ]MŒ
+BˆYˆœ™]\›˜ÛÙHOLÜˆ›İİ]™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ
+œİ\œˆÜˆ‘‘›\YÈ:/k9£h¹i,z-)HŠVËLN—JBˆ™]\›ˆİŠİ]
+B‚ˆYˆ›ØÙ\Ü×ÛØØ[Ü]Y]YJÙ[ŠN‚ˆYˆ›İÙ[‹œ]Y]YN‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹kï9aiH‹¹odùbcy¬¨y§"yo¡ykï9aiy¥¡ù.í¸à ˆŠBˆ™]\›‚‚ˆš[™Ù\œš[ÙPTÑWÑT‹Èš[\ÜÈ‹È™š[™Ù\œš[ËšœÛÛˆ‚ˆš[™Ù\œš[Ù‹œ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆN‚ˆœZœÛÛ‹›ØYÊš[™Ù\œš[Ù‹œ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJHYˆš[™Ù\œš[Ù‹™^\İÊ
+H[ÙHßBˆ^Ù\^Ù\[Û‚ˆœ^ßB‚ˆÛÛ\]YLˆ›ÜˆY][H[ˆ[[Y\˜]JÙ[‹œ]Y]YJN‚ˆYˆ][K™Ù]
+œİ]\ÈŠH[ˆ
+¹mì¹kï9aiH‹¹mì¹c®úaãKùi#yå*ŠN‚ˆÛÛ[YBˆÜ˜ÏZ][VÈœÛİ\˜ÙH—BˆN‚ˆ][VÈœİ]\È—OH¹i!9ä!¹.+H‚ˆÙ[‹œ™Yœ™\ÚİX›\Ê
+BˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+B‚ˆœHˆ‚ˆYˆÙ[‹˜]]×Ùš[™Ù\œš[š\ĞÚXÚÙY
+
+N‚ˆœ\Ù[‹—Ùš[™Ù\œš[
+Ü˜ÊBˆ][VÈ™š[™Ù\œš[—OYœˆYˆœ[ˆœˆ[™]
+œ–ÙœK™Ù]
+ÛÜšÚ[™È‹ˆŠJK™^\İÊ
+N‚ˆ][VÈÛÜšÚ[™È—OYœ–ÙœVÈÛÜšÚ[™È—Bˆ][VÈœİ]\È—OH¹mì¹c®úaãKùi#yå*‚ˆÛÛ\]Y
+ÏLBˆÛÛ[YB‚ˆÈ™\Ù\™HÜšYÚ[˜[ˆÜT]
+Ü˜ÊBˆÜšYÚ[˜[Ùİ\Ù[‹—ÛÜšYÚ[˜[Ù\Š
+KÛÜ›˜[YBˆYˆ›İÜšYÚ[˜[Ùİ™^\İÊ
+N‚ˆN‚ˆÚ][˜ÛÜLŠÜÜšYÚ[˜[Ùİ
+Bˆ^Ù\^Ù\[Û‚ˆÜšYÚ[˜[Ùİ[Ü‚ˆÛÜšÚ[™Ï\İŠÜ
+BˆYˆÙ[‹˜]]×ØÛÛ™\š\ĞÚXÚÙY
+
+N‚ˆÛÜšÚ[™Ï\Ù[‹—ØÛÛ™\İ×İØ]ŠÜ
+Bˆ][VÈÛÜšÚ[™È—O]ÛÜšÚ[™Â‚ˆYˆœ‚ˆœ–ÙœO^ÂˆœÛİ\˜ÙHœİŠÜ
+Kˆ›ÜšYÚ[˜[œİŠÜšYÚ[˜[Ùİ
+KˆÛÜšÚ[™ÈÛÜšÚ[™Ëˆš[\ÜYØ][YK[YJ
+BˆB‚ˆ][VÈœ™X[˜[^™H—OH¹o¡yb!¹§¤ˆYˆÙ[‹˜]]×Ü™X[˜[^™Kš\ĞÚXÚÙY
+
+H[ÙH¹alúeëH‚ˆ][VÈœİ]\È—OH¹mì¹kï9aiH‚ˆÛÛ\]Y
+ÏLBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆ][VÈœİ]\È—OH¹i,z-){ï&ˆŠÜİŠJVÎŒLŒBˆš[˜[N‚ˆÙ[‹œ™Yœ™\ÚİX›\Ê
+BˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+B‚ˆ]ÛZX×İÜš]WÚœÛÛŠš[™Ù\œš[Ù‹œŠBˆYˆ\Ø]ŠÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\HŠN‚ˆÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\KœØØ[—Ú[\ÜÊ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹kï9aiyk£9¢$‹ˆ¹mì¹i!9ä!ˆØÛÛ\]YH9.*ºgìù.d9í(9§d;ï#9nm¹d#9«iyb,:gìù.d9n¤øà ˆŠB‚ˆYˆ\İWØÛ\›Ø\™
+Ù[ŠN‚ˆ^TP\XØ][Û‹˜Û\›Ø\™
+
+K^
+
+BˆYˆ^‚ˆÙ[‹œÚ\™Wİ^œÙ]Z[•^
+^
+BˆÙ[‹œ\œÙWÜÚ\™Wİ^
+
+B‚ˆYˆÙ^˜Xİİ\›ÊÙ[‹^
+N‚ˆ[\Ü™H\ÈÜ™Bˆ\›ÏWÜ™K™š[™[
+‰ÚÏÎ‹ËÖ×—Ïˆ—	×JÉË^ÜˆˆŠBˆÛX[V×Bˆ›ÜˆH[ˆ\›Î‚ˆO]Kœœİš\
+»ï#8à »ï&Îûï"JW_HŠBˆYˆH›İ[ˆÛX[‚ˆÛX[‹˜\[™
+JBˆ™]\›ˆÛX[‚‚ˆYˆØÛ\ÜÚYWİ\›
+Ù[‹\›
+N‚ˆ]]\›X‹œ\œÙK\›\œÙJ\›
+Kœ]›İÙ\Š
+Bˆ^T]
+]
+KœİY™š^›İÙ\Š
+BˆYˆ^[ˆÙ[‹”ÕTÔ•QÑVÎ‚ˆ™]\›ˆ¹æí9£©zgìúh¤zdï¹£©H‹¹cëùl'z+åyæí9£©y."ú/oH‚ˆYˆ^[ˆÈ‹š\‹‹Şˆ‹‹œ˜\ˆŸN‚ˆ™]\›ˆ¹c¢ùï*yc!zdï¹£©H‹¹.#z!ê¹bª:)èùc¢ù..ºgìù.d‚ˆÜİ]\›X‹œ\œÙK\›\œÙJ\›
+K›™]ØË›İÙ\Š
+BˆYˆÜİ‚ˆ™]\›ˆ¹b!¹.ªËùïdzhmzdï¹£©H‹ºg :) ynlùcì9£ä9/¦ùak9o 9cëù."ú/oyj¤¹/dùg,9g`‚ˆ™]\›ˆ¹§*¹çéH‹ˆ‚‚ˆYˆ\œÙWÜÚ\™Wİ^
+Ù[ŠN‚ˆ\›Ï\Ù[‹—Ù^˜Xİİ\›ÊÙ[‹œÚ\™Wİ^ÔZ[•^
+
+JBˆÙ[‹›[š×İX›KœÙ]›İĞÛİ[
+[Š\›ÊJBˆ›Üˆ‹H[ˆ[[Y\˜]J\›ÊN‚ˆÚ[™›İO\Ù[‹—ØÛ\ÜÚYWİ\›
+JBˆ˜[ÏVİKÚ[™¹o¡yi!9ä!ˆ‹›İWBˆ›ÜˆËˆ[ˆ[[Y\˜]J˜[ÊN‚ˆÙ[‹›[š×İX›KœÙ]][J‹ËUX›UÚYÙ]][JŠJB‚ˆYˆÜÙ[XİYİ\›
+Ù[ŠN‚ˆ\Ù[‹›[š×İX›K˜İ\œ™[›İÊ
+BˆYˆ[™Ù[‹›[š×İX›Kœ›İĞÛİ[
+
+OOLN‚ˆLˆYˆˆ™]\›ˆˆ‚ˆ][O\Ù[‹›[š×İX›Kš][J‹
+Bˆ™]\›ˆ][K^
+
+Kœİš\
+
+HYˆ][H[ÙHˆ‚‚ˆYˆİÛ›ØYÜÙ[XİYÛ[šÊÙ[ŠN‚ˆ\›\Ù[‹—ÜÙ[XİYİ\›
+
+BˆYˆ›İ\›‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹ºdï¹£©ykï9aiH‹º+íùab9£ä9cå¹nmº`"y¢êy. 9.*ºdï¹£©xà ˆŠBˆ™]\›‚ˆÚ[™›İO\Ù[‹—ØÛ\ÜÚYWİ\›
+\›
+BˆYˆÚ[™OH¹æí9£©zgìúh¤zdï¹£©H‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹¦ ¹.#yæí9£©y."ú/oH‹ˆº+ézdï¹£©y.#y¦+ù¦#¹èk¹æ¡9ak9o :gìúh¤yæí:dï¸à ——ˆ‚ˆ¹ªf9dlùa/úgìù.d9.#y/&¹îåz/áùænùoexà Q“xà y/&¹df8à y.æ:-.y¢%¹nlùcì:+¯úeë¹£©ùb-¸à ˆ‚ˆ¹i ¹§§9nlùcì: ïy£ä9/¦ùak9o 9."ú/oyg,9g`9¢%¹å*9¢-ú!ê¹mìyæ¡9¥¡ù.í¹æí:dï»ï#9cëùa£yì¦:--:+éyæí:dï¸à ˆ‚ˆ
+Bˆ™]\›‚ˆN‚ˆİÛ›ØYÏJˆÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\K›Xœ˜\WÜ]ÖÈ[\—KÈºdï¹£©ykï9aiH‚ˆYˆ\Ø]ŠÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\HŠBˆ[ÙHTÑWÑT‹Èš[\ÜÈ‹È™İÛ›ØYÈ‚ˆ
+BˆİÛ›ØYË›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ\œÙY]\›X‹œ\œÙK\›\œÙJ\›
+Bˆ˜[YOT]
+\œÙYœ]
+K›˜[YHÜˆ™İÛ›ØYYØ]Y[È‚ˆ\İYİÛ›ØYËÛ˜[YBˆ™\O]\›X‹œ™\]Y\İ”™\]Y\İ
+\›XY\œÏ^È•\Ù\‹PYÙ[ˆ’]ÙZY\‹S]\ÚXËÌËŒËŒŸJBˆÚ]\›X‹œ™\]Y\İ\›Ü[Š™\K[Y[İ]LÌ
+H\È™\ÜÜ[Š\İØˆŠH\È‚ˆİ[Z[
+™\ÜšXY\œË™Ù]
+ÛÛ[S[™İŠHÜˆ
+Bˆ™XYLˆÚ[HYN‚ˆÚ[šÏ\™\Üœ™XY
+MŠŒL
+BˆYˆ›İÚ[šÎˆœ™XZÂˆ‹Üš]JÚ[šÊNÈ™XY
+Ï[[ŠÚ[šÊBˆYˆİ[Œ‚ˆİZ[
+™XYİİ[
+ŒL
+BˆÙ[‹›[š×İX›KœÙ]][JÙ[‹›[š×İX›K˜İ\œ™[›İÊ
+HYˆÙ[‹›[š×İX›K˜İ\œ™[›İÊ
+OL[ÙH‹UX›UÚYÙ]][Jˆ¹."ú/oHÜİIHŠJBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÙ[‹˜YÛØØ[Ùš[\ÊÜİŠ\İ
+WJBˆYˆ\Ø]ŠÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\HŠN‚ˆÙ[‹›XZ[‹›]\ÚX×ÛXœ˜\KœØØ[—Ú[\ÜÊ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹."ú/oyk£9¢$‹ˆ¹mì¹."ú/oynm¹b¨9aiy§+9g,9kï9aizf'ùb%ûï&—Ù\İHŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹ºdï¹£©y."ú/oyi,z-)H‹İŠJJB‚ˆYˆÙÙÛWØÛ\›Ø\™İØ]Ú
+Ù[‹ÚXÚÙY
+N‚ˆYˆÚXÚÙY‚ˆYˆÙ[‹˜Û\›Ø\™İ[Y\ˆ\È›Û™N‚ˆÙ[‹˜Û\›Ø\™İ[Y\TU[Y\ŠÙ[ŠBˆÙ[‹˜Û\›Ø\™İ[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹˜ÚXÚ×ØÛ\›Ø\™
+BˆÙ[‹—Û\İØÛ\›Ø\™Hˆ‚ˆÙ[‹˜Û\›Ø\™İ[Y\‹œİ\
+LŒ
+Bˆ[ÙN‚ˆYˆÙ[‹˜Û\›Ø\™İ[Y\‚ˆÙ[‹˜Û\›Ø\™İ[Y\‹œİÜ
+
+B‚ˆYˆÚXÚ×ØÛ\›Ø\™
+Ù[ŠN‚ˆ^TP\XØ][Û‹˜Û\›Ø\™
+
+K^
+
+Kœİš\
+
+BˆYˆ›İ^Üˆ^OYÙ]]ŠÙ[‹—Û\İØÛ\›Ø\™‹ˆŠN‚ˆ™]\›‚ˆÙ[‹—Û\İØÛ\›Ø\™]^ˆ\›Ï\Ù[‹—Ù^˜Xİİ\›Ê^
+BˆYˆ›İ\›Î‚ˆ™]\›‚ˆ\™XİVİH›ÜˆH[ˆ\›ÈYˆÙ[‹—ØÛ\ÜÚYWİ\›
+JVÌOOH¹æí9£©zgìúh¤zdï¹£©H—BˆYˆ\™Xİ‚ˆÙ[‹œÚ\™Wİ^œÙ]Z[•^
+^
+BˆÙ[‹œ\œÙWÜÚ\™Wİ^
+
+B‚ˆYˆ™Yœ™\ÚİX›\ÊÙ[ŠN‚ˆØØ[VŞ›Üˆ[ˆÙ[‹œ]Y]YHYˆ™Ù]
+šÚ[™ŠOOH›ØØ[—BˆÙ[‹›ØØ[Û\İœÙ]›İĞÛİ[
+[ŠØØ[
+JBˆ›Üˆ‹][H[ˆ[[Y\˜]JØØ[
+N‚ˆT]
+][VÈœÛİ\˜ÙH—JBˆN‚ˆÚ^™OYˆÜœİ]
+
+KœİÜÚ^™KÌLÌL‹ŒYŸHPˆ‚ˆ^Ù\^Ù\[Û‚ˆÚ^™OH‹H‚ˆ˜[ÏVÂˆ›˜[YKœİY™š^›İÙ\Š
+K›İš\
+‹ˆŠK\\Š
+KÚ^™Kˆ][K™Ù]
+œİ]\È‹ˆŠKˆ][K™Ù]
+ÛÜšÚ[™È‹ˆŠBˆBˆ›ÜˆËˆ[ˆ[[Y\˜]J˜[ÊN‚ˆÙ[‹›ØØ[Û\İœÙ]][J‹ËUX›UÚYÙ]][JİŠŠJJB‚ˆÙ[‹œ]Y]YWİX›KœÙ]›İĞÛİ[
+[ŠÙ[‹œ]Y]YJJBˆ›Üˆ‹][H[ˆ[[Y\˜]JÙ[‹œ]Y]YJN‚ˆ˜[ÏVÂˆ][K™Ù]
+šÚ[™‹ˆŠKˆ]
+][K™Ù]
+œÛİ\˜ÙH‹ˆŠJK›˜[YKˆ
+][K™Ù]
+™š[™Ù\œš[‹ˆŠVÎŒL—HYˆ][K™Ù]
+™š[™Ù\œš[ŠH[ÙH‹HŠKˆ
+¹k£9¢$ˆYˆ][K™Ù]
+ÛÜšÚ[™ÈŠH[ÙH¹o¡yi!9ä!ˆŠKˆ][K™Ù]
+œ™X[˜[^™H‹‹HŠKˆ][K™Ù]
+œİ]\È‹ˆŠBˆBˆ›ÜˆËˆ[ˆ[[Y\˜]J˜[ÊN‚ˆÙ[‹œ]Y]YWİX›KœÙ]][J‹ËUX›UÚYÙ]][JİŠŠJJB‚‚‚˜Û\ÜÈ]\ÚXÓXœ˜\TYÙJUÚYÙ]
+N‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹œ™[[İWÜ›İÜÈHßBˆÙ[‹œ™[[İWØ\\İÜ›İÜÈHßBˆÙ[‹—ØØ][Ù×İÛÜšÙ\œÈH×BˆÙ[‹—ØØ][Ù×Ü™\]Y\İÚYHˆÙ[‹˜Ø][Ù×İ™\œÚ[ÛˆHˆÙ[‹˜Ø][Ù×İ^Û›Û^HHÈXœÈˆ\İ
+TĞÓÕ‘T–WÕP”ÊK˜Ø]YÛÜšY\Èˆ\İ
+QUSĞĞUQÓÔ’QTÊ_BˆÙ[‹™\ØÛİ™\WÛ[ÙHH¹.d9n¤È‚ˆÙ[‹œÙ\™\—ÛXœ˜\WÜ›ÛİHˆ‘Î—]ÙZY\“]\ÚXÓXœ˜\WWÓÜšYÚ[˜[×9£"y«c9¢bùb!¹ìnÊTûï"H‚ˆÈÛY[İ]H]\İİ^H[œÚYHH\XØ][Ûˆ]H\™XİÜKˆBˆÈÎˆ]™[Û™ÜÈÈHRHÙ\™\ˆ[™\È™]™\ˆÜ[™YH\È›ØÙ\ÜË‚ˆÛY[Üİ]HHTÑWÑTˆÈ›Xœ˜\HˆÈ˜ÛY[Üİ]H‚ˆÛY[Üİ]K›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÙ[‹›Xœ˜\WÜ]ÈHÂˆ›ÜšYÚ[˜[ÈˆTÑWÑTˆÈš[\ÜÈˆÈ›ØØ[İ\İ‹ˆ[\ˆTÑWÑTˆÈš[\ÜÈˆÈ›ØØ[İ\İ‹ˆ˜Ûİ™\œÈˆÛY[Üİ]HÈ˜Ûİ™\œÈ‹ˆ™]X˜\ÙHˆÛY[Üİ]KˆBˆÙ[‹™—Ü]HÛY[Üİ]HÈ™\ÚİÜÛØØ[İ\İœÜ[]LÈ‚ˆÙ[‹˜Ûİ™\—Ù\ˆHÛY[Üİ]HÈ˜Ûİ™\œÈ‚ˆÙ[‹˜Ûİ™\—Ù\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÙ[‹œØØ[—Ü›Ûİ×Ùš[HHÛY[Üİ]HÈ›YØXŞWÜØØ[—Ü›ÛİËšœÛÛˆ‚ˆÙ[‹˜Ø][Ù×ØØXÚWÙš[HHÛY[Üİ]HÈœÙ\™\—ØØ][Ù×ØØXÚKšœÛÛˆ‚ˆÙ[‹œØØ[—Ü›ÛİÈH×BˆÙ[‹›[š×İÛÜšÙ\ˆH›Û™BˆÙ[‹˜˜]ÚÜ]Y]YHH×BˆÙ[‹˜˜]ÚÚ[™^HLBˆÙ[‹˜˜]ÚİÛÜšÙ\ˆH›Û™BˆÙ[‹˜˜]ÚÜ[›š[™ÈH˜[ÙBˆÙ[‹˜˜]ÚÜ]\ÙYH˜[ÙBˆÙ[‹˜˜]ÚÜ™]WÙ˜Z[YHYBˆÙ[‹˜˜]ÚØÛÛ\]YHˆÙ[‹˜˜]ÚÙ˜Z[YHˆÙ[‹œ\[[™WÚ›ØœÈH×BˆÙ[‹œ\[[™WÜ[›š[™ÈH˜[ÙBˆÙ[‹œ\[[™WÜ]\ÙYH˜[ÙBˆÙ[‹œ\[[™WÚ›Ø—Ú[™^HLBˆÙ[‹œ\[[™WÜİYÙHHˆ‚ˆÙ[‹œ\[[™WØ˜]ÚİÛÜšÙ\ˆH›Û™BˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\ˆH›Û™BˆÙ[‹œ\[[™WÜİYÙWÛÜ™\ˆHÂˆœİ[\È‹˜[˜[\Ú\È‹˜ÚÜ™È‹œØÛÜ™H‹˜\œ˜[™Ù[Y[‹œ™[™\ˆ‹›Xœ˜\H‚ˆBˆÙ[‹œØÚY[\—Ø˜XÚÛÙ™—ÜÙXÛÛ™ÈHMBˆÙ[‹œØÚY[\—Û\İÙÜWÜİ]HHßBˆÙ[‹œØÚY[\—İ[Y\ˆHU[Y\ŠÙ[ŠBˆÙ[‹œØÚY[\—İ[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹—ÜØÚY[\—İXÚÊBˆÙ[‹œØÚY[\—İ[Y\‹œİ\
+L
+BˆÙ[‹˜Ûİ™\—Ù\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÙ[‹—Ù[œİ\™WÙŠ
+B‚ˆ^[İ]TU›Ş^[İ]
+Ù[ŠBˆ]OTSX™[
+¹ªf9dlùa/ù.d9n¤È0­È9§#yb¨yfj:h¡9i!9ä!¹¢$9§§ŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JB‚ˆ[TSX™[
+ˆ¹¦ì¹n¤ùå,y§#yb¨yfj9îçù. 9¥m9ä!¸à y¢nzaãÈRH9i!9ä!¹nm¹cäyn ûï&ù."yêëú+îùcå¹d#9. 9.ïyh§ºaãùí(¹o%{ï#9é®ùî¯ù¥í¹îéùîëy¦/¹é.¹§+9g,9ï$ùkf8à ˆ‚ˆ¹å*9¢-ù¢dùo 9«c9¦ì¹clùcëù/oùå*9«c:+ãxà y.¥9î¯ú,,xà yakyî¯ú,,xà yd£9o)¹.#¹âë9êâù.d9fj:/j8à ˆ‚ˆ
+Bˆ[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ^[İ]˜YÚYÙ]
+[
+B‚ˆÜTR›Ş^[İ]
+
+BˆØØ[TT\Ú]ÛŠ¹ë¨yä!¹df9d#9«iyc§ùâb9«c9¦ìˆŠBˆÚÛÜÙWÜ›ÛİTT\Ú]ÛŠº+¯¹ïk¹§#yb¨yfjŠBˆ[\ÜÛØØ[TT\Ú]ÛŠ¹kï9aiy§+9g,:gìù.dŠBˆ[\ÜÛ[šÏTT\Ú]ÛŠ¹kï9aiy£¢9§`úgìúh¤zdï¹£©HŠBˆ[˜[^™OTT\Ú]ÛŠ¹¢nzaãÈ”HÈ:, ù )ùb!¹§¤ŠBˆİ[\ÏTT\Ú]ÛŠ¹nî¹êâùakz/j
+ùå-yd"y.åºf'ùb%ÈŠBˆ™Yœ™\ÚTT\Ú]ÛŠ¹d#9«iy§ 9¥¬9¦ì¹n¤ÈŠBˆ\WØ]Û—ØXØÙ[
+ØØ[‹œš[X\HŠBˆØØ[‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œØØ[—Ú[\ÜÊBˆÚÛÜÙWÜ›Ûİ˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›Ü[—ÜÙ\™\—ÜÙ][™ÜÊBˆ[\ÜÛØØ[˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹š[\ÜÛØØ[Û]\ÚXÊBˆ[\ÜÛ[šË˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹š[\ÜÜÚ\™WÛ[šÊBˆ[˜[^™K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹˜˜]ÚØ[˜[^™JBˆİ[\Ë˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹™[œ]Y]YWÜİ[\ÊBˆ™Yœ™\Ú˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÛXœ˜\JBˆ›Üˆˆ[ˆÜØØ[‹ÚÛÜÙWÜ›Ûİ[\ÜÛØØ[[\ÜÛ[šË[˜[^™Kİ[\Ë™Yœ™\ÚN‚ˆÜ˜YÚYÙ]
+ŠBˆÜ˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+Ü
+B‚ˆ\ØÛİ™\WÜ›İÏTR›Ş^[İ]
+
+Bˆ\ØÛİ™\WÜ›İË˜YÚYÙ]
+SX™[
+¹cäyã¬ŠJBˆÙ[‹™\ØÛİ™\WØ]ÛœÏ^ßBˆ›ÜˆX—Û˜[YH[ˆTĞÓÕ‘T–WÕP”Î‚ˆ]ÛTT\Ú]ÛŠX—Û˜[YJBˆ]Û‹œÙ]ÚXÚØX›JYJBˆ]Û‹œÙ]ÚXÚÙY
+X—Û˜[YOOH¹.d9n¤ÈŠBˆ]Û‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙK][O]X—Û˜[YNˆÙ[‹—ÜÙ[XİÙ\ØÛİ™\WİXŠ][JJBˆÙ[‹™\ØÛİ™\WØ]ÛœÖİX—Û˜[YWOX]Û‚ˆ\ØÛİ™\WÜ›İË˜YÚYÙ]
+]ÛŠBˆ\ØÛİ™\WÜ›İË˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+\ØÛİ™\WÜ›İÊB‚ˆÙX\˜ÚÜ›İÏTR›Ş^[İ]
+
+BˆÙ[‹›Xœ˜\WÜÙX\˜ÚTS[™QY]
+
+BˆÙ[‹›Xœ˜\WÜÙX\˜ÚœÙ]XÙZÛ\•^
+¹¤'9í(¹«c9¦ì¸à y«c9¢bù¢%¹.$ú/¤HŠBˆÙ[‹›Xœ˜\WØØ]YÛÜOTPÛÛX›Ğ›Ş
+
+BˆÙ[‹›Xœ˜\WØØ]YÛÜK˜Y][\Ê\İ
+QUSĞĞUQÓÔ’QTÊJBˆÙX\˜ÚØ]ÛTT\Ú]ÛŠ¼'å#H9¤'9í(ˆŠBˆÛX\—Ø]ÛTT\Ú]ÛŠ¹®!yênˆŠBˆ\WØ]Û—ØXØÙ[
+ÙX\˜ÚØ]Û‹œš[X\HŠBˆÙ[‹›Xœ˜\WÜÙX\˜Úœ™]\›”™\ÜÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÛXœ˜\JBˆÙ[‹›Xœ˜\WØØ]YÛÜK˜İ\œ™[^Ú[™ÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÛXœ˜\JBˆÙX\˜ÚØ]Û‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÛXœ˜\JBˆÛX\—Ø]Û‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™Nˆ
+Ù[‹›Xœ˜\WÜÙX\˜Ú˜ÛX\Š
+KÙ[‹œ™Yœ™\ÚÛXœ˜\J
+JJBˆÙX\˜ÚÜ›İË˜YÚYÙ]
+Ù[‹›Xœ˜\WÜÙX\˜ÚJBˆÙX\˜ÚÜ›İË˜YÚYÙ]
+Ù[‹›Xœ˜\WØØ]YÛÜJBˆÙX\˜ÚÜ›İË˜YÚYÙ]
+ÙX\˜ÚØ]ÛŠBˆÙX\˜ÚÜ›İË˜YÚYÙ]
+ÛX\—Ø]ÛŠBˆ^[İ]˜Y^[İ]
+ÙX\˜ÚÜ›İÊB‚ˆÙ[‹›Xœ˜\WÚ[š]X[H¹aj:`ê‚ˆÙ[‹›Xœ˜\WÚ[š]X[Ø]ÛœÈHßBˆ[š]X[Ü›İÈHR›Ş^[İ]
+
+Bˆ[š]X[Ü›İË˜YÚYÙ]
+SX™[
+¹«c9¢búi¥¹keù«ãHŠJBˆ›Üˆ˜[YH[ˆÈ¹aj:`ê‹
+›\İ
+PÑQ‘ÒR’ÓS“ÔT”ÕU•ÖVˆŠKˆÈ—N‚ˆ]ÛˆHT\Ú]ÛŠ˜[YJBˆ]Û‹œÙ]ÚXÚØX›JYJBˆ]Û‹œÙ]ÚXÚÙY
+˜[YHOH¹aj:`êŠBˆ]Û‹œÙ]š^YÚY
+LYˆ˜[YHOH¹aj:`êˆ[ÙHÍŠBˆ]Û‹œÙ]İ[TÚY]
+ˆ”T\Ú]ÛÜY[™ÎŒœÜØÛÛÜˆÑ‘‘Œ‘NÙ›Û]ÙZYÚÌßH‚ˆ”T\Ú]Û˜ÚXÚÙYØ˜XÚÙÜ›İ[™ˆÑLNØ›Ü™\‹XÛÛÜˆÑ‘ŒÎØÛÛÜˆÑ‘‘‘‘‘ßH‚ˆ
+Bˆ]Û‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™HÚXÚÙYQ˜[ÙK][O]˜[YNˆÙ[‹—ÜÙ]ÛXœ˜\WÚ[š]X[
+][JJBˆÙ[‹›Xœ˜\WÚ[š]X[Ø]ÛœÖİ˜[YWHH]Û‚ˆ[š]X[Ü›İË˜YÚYÙ]
+]ÛŠBˆ[š]X[Ü›İË˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+[š]X[Ü›İÊB‚ˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ÏTSX™[
+¹§#yb¨yfj9¦ì¹n¤ûï&¹ëbyo¡z/ç¹£©HŠBˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆ^[İ]˜YÚYÙ]
+Ù[‹›Xœ˜\WÜØØ[—Üİ]\ÊB‚ˆXœ˜\WØ›ŞTQÜ›İ\›Ş
+¹ªf9dlùa/úgìù.d9b!¹ìnùn¤ÈÈÈ9ææ9«c9¢bù«c9¦ì¹n¤ûï"9«c9¢búnæ:+©9¢¦9cè;ï#9leyo 9d#¹£"zg 9¦/¹é.¹«c9¦ì»ï"HŠBˆXœ˜\WÛ^[İ]TR›Ş^[İ]
+Xœ˜\WØ›Ş
+BˆÙ[‹™YOTU™YUÚYÙ]
+
+BˆÙ[‹™YKœÙ]XY\“X™[ÊÈ¹«c9¢bùb!¹ìnÈÈ9«c9¦ìˆ‹¹¥l:aãÈ0­È9b!¹ìnÈ0­È9.$ú/¤H0­È:gìú-*—JBˆÙ[‹™YKœÙ]Z[š[][RZYÚ
+ÌÌ
+BˆÙ[‹™YKš][TÙ[Xİ[ÛÚ[™ÙY˜ÛÛ›™Xİ
+Ù[‹œÚİ×ÜÙ[XİY
+BˆÙ[‹™YKš][QİX›PÛXÚÙY˜ÛÛ›™Xİ
+[X™H][KÛÛˆÙ[‹›ØYÜÙ[XİYİ×İÛÜšÜÜXÙJ
+JBˆÙ[‹™YKš][Q^[™Y˜ÛÛ›™Xİ
+Ù[‹—ÜÜ[]WØ\\İØÚ[™[ŠBˆXœ˜\WÛ^[İ]˜YÚYÙ]
+Ù[‹™YKŠB‚ˆšYÚTU›Ş^[İ]
+
+BˆÙ[‹˜Ûİ™\TSX™[
+¹¥è9l zghˆŠBˆÙ[‹˜Ûİ™\‹œÙ]š^YÚ^™JNN
+BˆÙ[‹˜Ûİ™\‹œÙ][YÛ›Y[
+][YÛÙ[\ŠBˆÙ[‹˜Ûİ™\‹œÙ]İ[TÚY]
+˜›Ü™\Œ\ÛÛYÌLÎMMÎØ›Ü™\‹\˜Y]\ÎŒLœØ˜XÚÙÜ›İ[™ˆÌÌMÈŠBˆšYÚ˜YÚYÙ]
+Ù[‹˜Ûİ™\ŠB‚ˆÙ[‹™]Z[TSX™[
+º+íú`"y¢êy«c9¦ìˆŠBˆÙ[‹™]Z[œÙ]ÛÜ™Ü˜\
+YJBˆšYÚ˜YÚYÙ]
+Ù[‹™]Z[
+B‚ˆÙ[‹\Ú×İX›OTUX›UÚYÙ]
+ŠBˆÙ[‹\Ú×İX›KœÙ]Üš^›Û[XY\“X™[ÊÈ¹n£ùcíÈ‹¹«c9¦ìˆ‹º+¯¹i!È‹¹â­¹  H‹º/æùn©ˆ‹¹i,z-)yc§ùfè—JBˆÙ[‹\Ú×İX›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJBˆšYÚ˜YÚYÙ]
+SX™[
+¹¢nzaãù.îùb¨HŠJBˆšYÚ˜YÚYÙ]
+Ù[‹\Ú×İX›KJBˆXœ˜\WÛ^[İ]˜Y^[İ]
+šYÚJBˆ^[İ]˜YÚYÙ]
+Xœ˜\WØ›ŞŠB‚ˆ˜]ÚØ›ŞTQÜ›İ\›Ş
+¹¢nzaãÈRH9i!9ä!¹fjŠBˆ™ÛTQÜšY^[İ]
+˜]ÚØ›Ş
+B‚ˆÙ[‹™]šXÙWÛ[ÙOTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™]šXÙWÛ[ÙK˜Y][\ÊÈº!ê¹bªÔKĞÔH‹¹/&9ab•’QPHÔH‹¹.áHÔH—JBˆÙ[‹˜Y\—Ø[˜[\Ú\ÏTPÚXÚĞ›Ş
+¹b!º/j9k£9¢$9d#º!ê¹bª”Kú, ù )ùb!¹§¤ŠBˆÙ[‹˜Y\—Ø[˜[\Ú\ËœÙ]ÚXÚÙY
+YJBˆÙ[‹˜Y\—ÜØÛÜ™OTPÚXÚĞ›Ş
+¹b!º/j9k£9¢$9d#¹¨!ú+¬9..¹o¡yaîº,,HŠBˆÙ[‹˜Y\—ÜØÛÜ™KœÙ]ÚXÚÙY
+YJBˆÙ[‹œ™]WÙ˜Z[YTPÚXÚĞ›Ş
+¹i,z-)y.îùb¨z!ê¹bª:aãz+åHH9«(HŠBˆÙ[‹œ™]WÙ˜Z[YœÙ]ÚXÚÙY
+YJB‚ˆÙ[‹˜—Ø˜]ÚÜİ\TT\Ú]ÛŠ¸¥­ˆ9o 9iâù¢nyi!9ä!ˆŠBˆÙ[‹˜—Ø˜]ÚÜ]\ÙOTT\Ú]ÛŠ¸£î9¦ ¹`gŠBˆÙ[‹˜—Ø˜]ÚÜ™]OTT\Ú]ÛŠ¸¡®È:aãz+åyi,z-)HŠBˆ\WØ]Û—ØXØÙ[
+Ù[‹˜—Ø˜]ÚÜİ\œİXØÙ\ÜÈŠBˆÙ[‹˜—Ø˜]ÚÜİ\˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œİ\Ø˜]ÚÜ›ØÙ\ÜÚ[™ÊBˆÙ[‹˜—Ø˜]ÚÜ]\ÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹ÙÙÛWØ˜]ÚÜ]\ÙJBˆÙ[‹˜—Ø˜]ÚÜ™]K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™]WÙ˜Z[Yİ\ÚÜÊB‚ˆÙ[‹˜˜]ÚÜİ]\ÏTSX™[
+¹¢nyi!9ä!»ï&¹o¡y§.ˆŠBˆÙ[‹˜˜]ÚÜİ]\ËœÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠBˆÙ[‹İ[Ü›ÙÜ™\ÜÏTT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹İ[Ü›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹İ[Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹˜İ\œ™[Ü›ÙÜ™\ÜÏTT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹˜İ\œ™[Ü›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹˜İ\œ™[Ü›ÙÜ™\ÜËœÙ]˜[YJ
+B‚ˆ™Û˜YÚYÙ]
+SX™[
+º/ä9ë¥ùª(yo#ÈŠK
+Bˆ™Û˜YÚYÙ]
+Ù[‹™]šXÙWÛ[ÙKJBˆ™Û˜YÚYÙ]
+Ù[‹˜Y\—Ø[˜[\Ú\ËŠBˆ™Û˜YÚYÙ]
+Ù[‹˜Y\—ÜØÛÜ™KÊBˆ™Û˜YÚYÙ]
+Ù[‹œ™]WÙ˜Z[Y
+Bˆ™Û˜YÚYÙ]
+Ù[‹˜—Ø˜]ÚÜİ\K
+Bˆ™Û˜YÚYÙ]
+Ù[‹˜—Ø˜]ÚÜ]\ÙKKJBˆ™Û˜YÚYÙ]
+Ù[‹˜—Ø˜]ÚÜ™]KKŠBˆ™Û˜YÚYÙ]
+Ù[‹˜˜]ÚÜİ]\ËKËKŠBˆ™Û˜YÚYÙ]
+SX™[
+¹odùbcy«c9¦ìˆŠK‹
+Bˆ™Û˜YÚYÙ]
+Ù[‹˜İ\œ™[Ü›ÙÜ™\ÜË‹KK
+Bˆ™Û˜YÚYÙ]
+SX™[
+¹ .ú/æùn©ˆŠKË
+Bˆ™Û˜YÚYÙ]
+Ù[‹İ[Ü›ÙÜ™\ÜËËKK
+Bˆ^[İ]˜YÚYÙ]
+˜]ÚØ›Ş
+B‚ˆ\[[™WØ›ŞTQÜ›İ\›Ş
+¹§#yb¨yfj9¢nzaãùå'ù.©ù.+yoàÈŠBˆÛTQÜšY^[İ]
+\[[™WØ›Ş
+B‚ˆÙ[‹œ\[[™WÙ^Xİ]ÜTPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ\[[™WÙ^Xİ]Ü‹˜Y][\ÊÈ¹§#yb¨yfj9¢iú(c9fj;ï"9£ª:#d;ï"H‹¹§+9g,9­bú+åy¢iú(c9fj—JBˆÙ[‹œ\[[™WÛİ]]TPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ\[[™WÛİ]]˜Y][\ÊÈ•ĞUˆ‹•ĞUˆ
+ÈTÈ—JB‚ˆÙ[‹œ\WÜİ[\ÏTPÚXÚĞ›Ş
+¹akz/j
+ùå-yd"y.åˆŠBˆÙ[‹œ\WØ[˜[\Ú\ÏTPÚXÚĞ›Ş
+”Kú, ù )ÈŠBˆÙ[‹œ\WØÚÜ™ÏTPÚXÚĞ›Ş
+¹d£9o)‹ù«­z$/HŠBˆÙ[‹œ\WÜØÛÜ™OTPÚXÚĞ›Ş
+¹.d:,,HŠBˆÙ[‹œ\WØ\œ˜[™ÙOTPÚXÚĞ›Ş
+¹¦nº ïyï%ºacHŠBˆÙ[‹œ\WÜ™[™\TPÚXÚĞ›Ş
+¹®,¹§äÈŠBˆ›ÜˆØˆ[ˆÜÙ[‹œ\WÜİ[\ËÙ[‹œ\WØ[˜[\Ú\ËÙ[‹œ\WØÚÜ™ËÙ[‹œ\WÜØÛÜ™KÙ[‹œ\WØ\œ˜[™ÙKÙ[‹œ\WÜ™[™\—N‚ˆØ‹œÙ]ÚXÚÙY
+YJB‚ˆÙ[‹œ\WÜİ\TT\Ú]ÛŠ¹o 9iâú!ê¹bª9­`y¬-9î¯ÈŠBˆÙ[‹œ\WÜ]\ÙOTT\Ú]ÛŠ¹¦ ¹`g9­`y¬-9î¯ÈŠBˆÙ[‹œ\WÜ™\İ[YWÙ˜Z[YTT\Ú]ÛŠ¹îéùîëyi,z-)y.îùb¨HŠBˆÙ[‹œ\WÙ[]WÜÙ[XİYTT\Ú]ÛŠ¹b(:fi9¢`:`"z+¬9oeHŠBˆÙ[‹œ\WØÛX\—Ùš[š\ÚYTT\Ú]ÛŠ¹®!yä!¹¢$9b§Ëùi,z-)HŠBˆ\WØ]Û—ØXØÙ[
+Ù[‹œ\WÜİ\œš[X\HŠBˆÙ[‹œ\WÜİ\˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œİ\Ø]]×Ü\[[™JBˆÙ[‹œ\WÜ]\ÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹ÙÙÛWÜ\[[™WÜ]\ÙJBˆÙ[‹œ\WÜ™\İ[YWÙ˜Z[Y˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™\İ[YWÙ˜Z[YÜ\[[™WÚ›ØœÊBˆÙ[‹œ\WÙ[]WÜÙ[XİY˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹™[]WÜÙ[XİYÜ\[[™WÚ›ØŠBˆÙ[‹œ\WØÛX\—Ùš[š\ÚY˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹˜ÛX\—Ùš[š\ÚYÜ\[[™WÚ›ØœÊB‚ˆÙ[‹œ\[[™WÜİ]\ÏTSX™[
+¹­`y¬-9î¯ûï&¹o¡y§.ˆŠBˆÙ[‹œ\[[™WÜİ]\ËœÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠBˆÙ[‹œ\[[™WÜ›ÙÜ™\ÜÏTT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹œ\[[™WÜ›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹œ\[[™WÜ›ÙÜ™\ÜËœÙ]˜[YJ
+B‚ˆÙ[‹œ\[[™WİX›OTUX›UÚYÙ]
+L
+BˆÙ[‹œ\[[™WİX›KœÙ]Üš^›Û[XY\“X™[ÊˆÈ¹/&9ab9î©È‹¹«c9¦ìˆ‹¹akz/j
+ùå-yd"y.åˆ‹¹b!¹§¤‹¹d£9o)ˆ‹¹.d:,,H‹¹¥.yï%ˆ‹¹®,¹§äÈ‹¹aiyn¤È‹¹â­¹  H—Bˆ
+BˆÙ[‹œ\[[™WİX›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJB‚ˆÛ˜YÚYÙ]
+SX™[
+¹¢iú(c9fjŠK
+BˆÛ˜YÚYÙ]
+Ù[‹œ\[[™WÙ^Xİ]Ü‹JBˆÛ˜YÚYÙ]
+SX™[
+º/¤ùaîˆŠKŠBˆÛ˜YÚYÙ]
+Ù[‹œ\[[™WÛİ]]ÊB‚ˆÛ˜YÚYÙ]
+Ù[‹œ\WÜİ[\ËK
+BˆÛ˜YÚYÙ]
+Ù[‹œ\WØ[˜[\Ú\ËKJBˆÛ˜YÚYÙ]
+Ù[‹œ\WØÚÜ™ËKŠBˆÛ˜YÚYÙ]
+Ù[‹œ\WÜØÛÜ™KKÊBˆÛ˜YÚYÙ]
+Ù[‹œ\WØ\œ˜[™ÙKK
+BˆÛ˜YÚYÙ]
+Ù[‹œ\WÜ™[™\‹KJB‚ˆÛ˜YÚYÙ]
+Ù[‹œ\WÜİ\‹
+BˆÛ˜YÚYÙ]
+Ù[‹œ\WÜ]\ÙK‹JBˆÛ˜YÚYÙ]
+Ù[‹œ\WÜ™\İ[YWÙ˜Z[Y‹ŠBˆÛ˜YÚYÙ]
+Ù[‹œ\WÙ[]WÜÙ[XİY‹ÊBˆÛ˜YÚYÙ]
+Ù[‹œ\WØÛX\—Ùš[š\ÚY‹
+BˆÛ˜YÚYÙ]
+Ù[‹œ\[[™WÜİ]\Ë‹JBˆÛ˜YÚYÙ]
+Ù[‹œ\[[™WÜ›ÙÜ™\ÜËËKŠBˆÛ˜YÚYÙ]
+Ù[‹œ\[[™WİX›KKŠB‚ˆ^[İ]˜YÚYÙ]
+\[[™WØ›Ş
+B‚ˆØÚY[\—Ø›ŞTQÜ›İ\›Ş
+¹.$ù.&¹.îùb¨z, ùn©ˆŠBˆÙÛTQÜšY^[İ]
+ØÚY[\—Ø›Ş
+B‚ˆÙ[‹™ÜWÜÙ[XİÜTPÛÛX›Ğ›Ş
+
+BˆÙ[‹œ™Yœ™\ÚÙÜWØTT\Ú]ÛŠ¹b-ù¥¬ÔHŠBˆÙ[‹œ™Yœ™\ÚÙÜWØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÙÜWÛ\İ
+BˆÙ[‹™ÜWÛY[[ÜWÛ[Z]TTÜ[›Ş
+
+BˆÙ[‹™ÜWÛY[[ÜWÛ[Z]œÙ]˜[™ÙJL
+BˆÙ[‹™ÜWÛY[[ÜWÛ[Z]œÙ]˜[YJJBˆÙ[‹™ÜWÛY[[ÜWÛ[Z]œÙ]İY™š^
+‰HŠBˆÙ[‹™ÜWİ[\Û[Z]TTÜ[›Ş
+
+BˆÙ[‹™ÜWİ[\Û[Z]œÙ]˜[™ÙJLMJBˆÙ[‹™ÜWİ[\Û[Z]œÙ]˜[YJŠBˆÙ[‹™ÜWİ[\Û[Z]œÙ]İY™š^
+ˆ0¬ÈŠB‚ˆÙ[‹›šYÚÛ[ÙOTPÚXÚĞ›Ş
+¹d+ùå*9i':eí9¢nyi!9ä!ˆŠBˆÙ[‹›šYÚÜİ\TPÛÛX›Ğ›Ş
+
+BˆÙ[‹›šYÚÙ[™TPÛÛX›Ğ›Ş
+
+Bˆ›Üˆ[ˆ˜[™ÙJ
+N‚ˆÙ[‹›šYÚÜİ\˜Y][JˆÚŒ™NŒ‹
+BˆÙ[‹›šYÚÙ[™˜Y][JˆÚŒ™NŒ‹
+BˆÙ[‹›šYÚÜİ\œÙ]İ\œ™[[™^
+ŒÊBˆÙ[‹›šYÚÙ[™œÙ]İ\œ™[[™^
+ÊB‚ˆÙ[‹™Y˜][Üš[Üš]OTPÛÛX›Ğ›Ş
+
+BˆÙ[‹™Y˜][Üš[Üš]K˜Y][\ÊÈºjæ‹¹¦kº`&ˆ‹¹/cˆ—JBˆÙ[‹™Y˜][Üš[Üš]KœÙ]İ\œ™[^
+¹¦kº`&ˆŠB‚ˆÙ[‹œØÚY[\—Üİ]\ÏTSX™[
+º, ùn©¹fj;ï&¹o¡y§.ˆŠBˆÙ[‹œØÚY[\—Üİ]\ËœÙ]Øš™Xİ˜[YJ”İ]\ÑÛÛÙŠB‚ˆÙ[‹œ]Y]YWÜÛÜØTT\Ú]ÛŠ¹£"y/&9ab9î©úaãy£¤ˆŠBˆÙ[‹œ]Y]YWÜÛÜØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œÛÜÜ\[[™WØWÜš[Üš]JBˆÙ[‹œ™Yœ™\ÚÙÜWÛ\İ
+
+B‚ˆÙÛ˜YÚYÙ]
+SX™[
+‘ÔHŠK
+BˆÙÛ˜YÚYÙ]
+Ù[‹™ÜWÜÙ[XİÜ‹JBˆÙÛ˜YÚYÙ]
+Ù[‹œ™Yœ™\ÚÙÜWØ‹ŠBˆÙÛ˜YÚYÙ]
+SX™[
+¹§ 9i)ù¦/¹kf9ch9å*ŠKÊBˆÙÛ˜YÚYÙ]
+Ù[‹™ÜWÛY[[ÜWÛ[Z]
+BˆÙÛ˜YÚYÙ]
+SX™[
+¹®*yn©¹."ºfdŠKJBˆÙÛ˜YÚYÙ]
+Ù[‹™ÜWİ[\Û[Z]ŠB‚ˆÙÛ˜YÚYÙ]
+Ù[‹›šYÚÛ[ÙKK
+BˆÙÛ˜YÚYÙ]
+SX™[
+¹o 9iâÈŠKKJBˆÙÛ˜YÚYÙ]
+Ù[‹›šYÚÜİ\KŠBˆÙÛ˜YÚYÙ]
+SX™[
+¹îäù§gÈŠKKÊBˆÙÛ˜YÚYÙ]
+Ù[‹›šYÚÙ[™K
+BˆÙÛ˜YÚYÙ]
+SX™[
+ºnæ:+©9/&9ab9î©ÈŠKKJBˆÙÛ˜YÚYÙ]
+Ù[‹™Y˜][Üš[Üš]KKŠB‚ˆÙÛ˜YÚYÙ]
+Ù[‹œ]Y]YWÜÛÜØ‹‹
+BˆÙÛ˜YÚYÙ]
+Ù[‹œØÚY[\—Üİ]\Ë‹KKŠB‚ˆ^[İ]˜YÚYÙ]
+ØÚY[\—Ø›Ş
+B‚ˆÙ[‹œ›ÙÜ™\ÜÏTT›ÙÜ™\ÜĞ˜\Š
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJ
+Bˆ^[İ]˜YÚYÙ]
+Ù[‹œ›ÙÜ™\ÜÊB‚ˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+¹§#yb¨yfj9¦ì¹n¤ûï&¹ab9¦/¹é.¹§+9g,9ï$ùkf;ï#9a£yd#¹cì9d#9«iyh§ºaãùí(¹o%x )ˆŠBˆU[Y\‹œÚ[™ÛTÚİ
+Ù[‹œ™Yœ™\ÚÛXœ˜\JBˆÙ[‹—ÛØYØ˜]ÚÜ]Y]YJ
+BˆÙ[‹œ™Yœ™\Úİ\Ú×İX›J
+BˆÙ[‹—ÛØYÜ\[[™WÚ›ØœÊ
+BˆÙ[‹œ™Yœ™\ÚÜ\[[™WİX›J
+B‚ˆYˆÜÙ\™\—ØÛY[
+Ù[‹[Y[İ]LÌ
+N‚ˆÛÛ™šYÈHØYÙ\ÚİÜÜÙ\™\—ØÛÛ™šYÊTÒÕÔÔÑT•‘T—ĞÓÓ‘’QÊBˆÙ][™ÜÈHÙ]]ŠÙ[‹›XZ[‹œÙ][™Ü×ÜYÙH‹›Û™JBˆYˆÙ][™ÜÈ\È›İ›Û™N‚ˆÛÛ™šYÖÈœÙ\™\ˆ—HHÙ][™ÜËœÙ\™\—ÙY]^
+
+Kœİš\
+
+Kœœİš\
+‹ÈŠHÜˆÛÛ™šYÖÈœÙ\™\ˆ—BˆÛÛ™šYÖÈÚÙ[ˆ—HHÙ][™ÜËœÙ\™\—İÚÙ[—ÙY]^
+
+Kœİš\
+
+Bˆ™]\›ˆÙ\™\“Xœ˜\PÛY[
+ÛÛ™šYÖÈœÙ\™\ˆ—KÛÛ™šYÖÈÚÙ[ˆ—K[Y[İ]][Y[İ]
+B‚ˆYˆÜ[—ÜÙ\™\—ÜÙ][™ÜÊÙ[ŠN‚ˆYˆ\Ø]ŠÙ[‹›XZ[‹›˜]ˆŠN‚ˆÙ[‹›XZ[‹›˜]‹œÙ]İ\œ™[›İÊLŠBˆÙ[‹›XZ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJº+íúacyïk¹§#yb¨yfjTH9g,9g`;ï&ù«i:hmzgh¹.#y/&¹¢jù£ãùk¨¹¢-ùêëÈÈ9ææŠB‚ˆYˆÛØYÜØØ[—Ü›ÛİÊÙ[ŠN‚ˆY˜][ÏVÜÙ[‹›Xœ˜\WÜ]ÖÈ›ÜšYÚ[˜[È—KÙ[‹›Xœ˜\WÜ]ÖÈ[\—KÈºdï¹£©ykï9aiH—BˆN‚ˆ›İÜÏZœÛÛ‹›ØYÊÙ[‹œØØ[—Ü›Ûİ×Ùš[Kœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆØ]™YVÔ]
+›İÊH›Üˆ›İÈ[ˆ›İÜÈYˆİŠ›İÊKœİš\
+
+WBˆ^Ù\^Ù\[Û‚ˆØ]™YV×Bˆ™\İ[V×BˆYØXŞWİ[\[›Ü›X[^™YÜ]
+Ù[‹›Xœ˜\WÜ]ÖÈ[\—JBˆ›Üˆ][ˆÊ™Y˜][Ë
+œØ]™YN‚ˆYˆ›Ü›X[^™YÜ]
+]
+OO[YØXŞWİ[\‚ˆÛÛ[YBˆÙ^O[›Ü›X[^™YÜ]
+]
+BˆYˆÙ^H›İ[ˆÛ›Ü›X[^™YÜ]
+][JH›Üˆ][H[ˆ™\İ[N‚ˆ™\İ[˜\[™
+]
+]
+JBˆ™]\›ˆ™\İ[‚ˆYˆÜØ]™WÜØØ[—Ü›ÛİÊÙ[ŠN‚ˆ]ÛZX×İÜš]WÚœÛÛŠÙ[‹œØØ[—Ü›Ûİ×Ùš[KÜİŠ]
+H›Üˆ][ˆÙ[‹œØØ[—Ü›Ûİ×JB‚ˆYˆÚÛÜÙWÜØØ[—Ù›Û\ŠÙ[ŠN‚ˆÙ[XİYTQš[QX[ÙË™Ù]^\İ[™Ñ\™XİÜJˆÙ[‹º`"y¢êyc!yd*ù«c9¢bùb!¹ìnùæ¡:gìù.d9æë¹oeH‹İŠÙ[‹›Xœ˜\WÜ]ÖÈ›ÜšYÚ[˜[È—JBˆ
+BˆYˆ›İÙ[XİY‚ˆ™]\›‚ˆ]T]
+Ù[XİY
+BˆYˆ›Ü›X[^™YÜ]
+]
+H›İ[ˆÛ›Ü›X[^™YÜ]
+][JH›Üˆ][H[ˆÙ[‹œØØ[—Ü›ÛİßN‚ˆÙ[‹œØØ[—Ü›ÛİË˜\[™
+]
+BˆÙ[‹—ÜØ]™WÜØØ[—Ü›ÛİÊ
+BˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+¹¢jù£ãùæë¹oe{ï&ˆŠÈ»ï&È‹š›Ú[ŠİŠ][JH›Üˆ][H[ˆÙ[‹œØØ[—Ü›ÛİÊJBˆÙ[‹œØØ[—Ú[\ÜÊ
+B‚ˆYˆ[\ÜÛØØ[Û]\ÚXÊÙ[ŠN‚ˆš[\ËÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[Y\ÊˆÙ[‹¹kï9aiy§+9g,:gìù.d‹ˆ‹ˆºgìúh¤y¥¡ù.íˆ
+
+‹›\È
+‹Ø]ˆ
+‹™›XÈ
+‹›MH
+‹˜XXÈ
+‹›ÙÙÈ
+‹›Ü\È
+‹ÛXH
+‹˜ZY™ˆ
+‹˜ZYˆ
+‹˜[XÊH‚ˆ
+BˆYˆ›İš[\Î‚ˆ™]\›‚ˆÈHØØ[[\Ü\ÈHÛ™K\ÛÛ™È\İ[œ]Û›Kˆ™]™\ˆÛÜH]ÈBˆÈÛY[Îˆ]ÜˆZ^][ÈHÙ\™\‹[İÛ™YØ][ÙË‚ˆ\™Ù]PTÑWÑT‹Èš[\ÜÈ‹È›ØØ[İ\İ‚ˆ\™Ù]›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÛÜYYLˆ[\ÜYÜ]ÏV×Bˆ›Üˆ˜]È[ˆš[\Î‚ˆÛİ\˜ÙOT]
+˜]ÊBˆ\İ[˜][Û]\™Ù]ÜÛİ\˜ÙK›˜[YBˆYˆ\İ[˜][Û‹™^\İÊ
+H[™Ûİ\˜ÙKœ™\ÛÛ™J
+HOY\İ[˜][Û‹œ™\ÛÛ™J
+N‚ˆ\İ[˜][Û]\™Ù]ÙˆÜØY™WÙš[WÜİ[JÛİ\˜ÙKœİ[J_WŞÚ[
+[YK[YJ
+JŒL
+_^ÜÛİ\˜ÙKœİY™š^H‚ˆYˆÛİ\˜ÙKœ™\ÛÛ™J
+HOY\İ[˜][Û‹œ™\ÛÛ™J
+N‚ˆÚ][˜ÛÜLŠÛİ\˜ÙK\İ[˜][ÛŠBˆÛÜYY
+ÏLBˆ[\ÜYÜ]Ë˜\[™
+\İ[˜][ÛŠBˆš\œİH[\ÜYÜ]ÖÌBˆYˆš\œİ™^\İÊ
+N‚ˆÙ[‹›XZ[‹›ØYÚ[\ÜYİÛÜšÚ[™×Ùš[Jš\œİ
+BˆÙ[‹›XZ[‹œÙ[XİYÛXœ˜\WÜÛİ\˜ÙHH›ØØ[İ\İ‚ˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+ˆˆ¹§+9g,9­bú+åykï9aiyk£9¢$;ï&ØÛÜYYH:i¥ˆ0­È9§*¹b¨9aiy§#yb¨yfjÈ9ææ9¦ì¹n¤È‚ˆ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹§+9g,9­bú+åzgìù.d‹ˆ¹§+9g,9«c9¦ì¹cê¹/g9..¹odùbcyå-z!$yæ¡9cey¦ì¹­bú+åz/¤ùai{ï#9.#y/&¹b¨9aiy¢%¹¦ïù.èù§#yb¨yfjÈ9ææ9¦ì¹n¤øà ˆ‹ˆ
+B‚ˆYˆ[\ÜÜÚ\™WÛ[šÊÙ[ŠN‚ˆ˜[YKÚÏTR[œ]X[ÙË™Ù]][S[™U^
+ˆÙ[‹¹kï9aiy£¢9§`úgìúh¤zdï¹£©H‹ˆ¹§+:/kù.í¹æë¹bcy.áy/¦ùki¹.h9.#¹è%9êm¹/oùå*;ï#9.#y£ä9/¦ù«c9¦ì¹."ú/oy§#yb¨xà —¹.áyì¦:--9§+9.®¹§"y§`ù/oùå*9æ¡9ak9o :gìúh¤yæí:dï¸à ˆ‹ˆP\XØ][Û‹˜Û\›Ø\™
+
+K^
+
+Kœİš\
+
+Kˆ
+BˆYˆ›İÚÈÜˆ›İ˜[YKœİš\
+
+N‚ˆ™]\›‚ˆX]Ú\™KœÙX\˜Ú
+ˆšÏÎ‹ËÖ×—Ï—‰×JÈ‹˜[YJBˆYˆ›İX]Ú‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹b!¹.ªúdï¹£©H‹¹¬¨y§"z+á¹b*ùb,ÚÈ:dï¹£©xà ˆŠBˆ™]\›‚ˆ\›[X]Ú™Ü›İ\
+
+Kœœİš\
+»ï#8à »ï&Îûï"JW_HŠBˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆN‚ˆ™\İ[HÙ[‹—ÜÙ\™\—ØÛY[
+[Y[İ]NL
+Kš[\ÜÛ[šÊ\›
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹œ™Yœ™\ÚÛXœ˜\J
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹§#yb¨yfj9.-9¥í¹¦ì¹n¤È‹ˆˆ¹mì¹å,y§#yb¨yfj9kï9ai{ï&Ü™\İ[™Ù]
+	Ùš[WÛ˜[YIË	úgìúh¤IÊ_H‹ˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹ºdï¹£©ykï9aiyi,z-)H‹İŠ^ÊJB‚ˆYˆÛ[š×Ü›ÙÜ™\ÜÊÙ[‹˜[YK^
+N‚ˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJX^
+Z[ŠL[
+˜[YJJJJBˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+^
+B‚ˆYˆÛ[š×ÙÛ™JÙ[‹]
+N‚ˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+ˆ¹b!¹.ªù«c9¦ì¹mì¹."ú/oyb,9.-9¥í¹«c9¦ì¹n¤ûï&Ü]HŠBˆÙ[‹œØØ[—Ú[\ÜÊ
+B‚ˆYˆÛ[š×Ù˜Z[Y
+Ù[‹\œ›ÜŠN‚ˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+¹b!¹.ªúdï¹£©ykï9aiyi,z-)HŠBˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹b!¹.ªúdï¹£©ykï9aiyi,z-)H‹İŠ\œ›ÜŠJB‚ˆYˆÙŠÙ[ŠN‚ˆ™]\›ˆÛÛ›™XİØØ][ÙÊÙ[‹™—Ü]
+B‚ˆYˆÙ[œİ\™WÙŠÙ[ŠN‚ˆÙ[‹™—Ü]œ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]\ØÜš\
+ˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ˜XÚÜÊˆYS•QÑTˆ’SPT–HÑVHUUÒSÔ‘SQS•ˆš[™Ù\œš[VS’TUQKˆÛİ\˜ÙWÜ]VˆÛÜšÚ[™×Ü]Vˆ]HVˆ\\İVˆ[[HVˆYX\ˆVˆ\˜][Ûˆ‘PSQUSˆš]˜]HS•QÑTˆQUSˆØ[\\˜]HS•QÑTˆQUSˆÚ[›™[ÈS•QÑTˆQUSˆ›Ü›X]Vˆ]X[]HVˆÛİ™\—Ü]VˆœH‘PSˆ]\ÚXØ[ÚÙ^HVˆ[˜[\Ú\×Üİ]\ÈVQUS	ù§*¹b!¹§¤	Ëˆİ[\×Üİ]\ÈVQUS	ù§*¹b!º/j	Ëˆ[\ÜYØ]‘PSˆ
+NÂˆÔ‘PUHS‘VQˆ“ÕVTÕÈYİ˜XÚÜ×Ø\\İØ[[HÓˆ˜XÚÜÊ\\İ[[JNÂˆˆˆŠBˆÈYÚÙZYÚZYÜ˜][ÛœÈ›ÜˆŒˆ\[[™Hİ]K‚ˆÛÛÏ^Ü›İÖÈ›˜[YH—H›Üˆ›İÈ[ˆÛÛ‹™^Xİ]J”QÓPHX›WÚ[™›Ê˜XÚÜÊHŠK™™]Ú[
+
+_Bˆ›ÜˆÛÛ[ˆÂˆ˜ÚÜ™×Üİ]\Èˆ•VQUS	ù§*¹i!9ä!‰È‹ˆœØÛÜ™WÜİ]\Èˆ•VQUS	ù§*¹i!9ä!‰È‹ˆ˜\œ˜[™Ù[Y[Üİ]\Èˆ•VQUS	ù§*¹i!9ä!‰È‹ˆœ™[™\—Üİ]\Èˆ•VQUS	ù§*¹i!9ä!‰È‹ˆ™š[˜[Ø]Y[×Ü]ˆ•VQUS	ÉÈ‚ˆKš][\Ê
+N‚ˆYˆÛÛ›İ[ˆÛÛÎ‚ˆÛÛ‹™^Xİ]JˆSTˆP“H˜XÚÜÈQÓÓSSˆØÛÛHÙHŠBˆÛÛ‹˜ÛÛ[Z]
+
+BˆÛÛ‹˜ÛÜÙJ
+B‚ˆYˆİY×Ùš\œİ
+Ù[‹YÜËÙ^\ËY˜][HˆŠN‚ˆYˆ›İYÜÎ‚ˆ™]\›ˆY˜][ˆ›ÜˆÈ[ˆÙ^\Î‚ˆN‚ˆ]YÜË™Ù]
+ÊBˆYˆ‚ˆYˆ\Ú[œİ[˜ÙJ‹
+\İ\JJN‚ˆ]–ÌBˆ™]\›ˆ™\Z\—İ^
+‹Y˜][
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆ™]\›ˆ™\Z\—İ^
+Y˜][Y˜][
+B‚ˆYˆÙ^˜XİÛY]Y]JÙ[‹]
+N‚ˆT]
+]
+Bˆ]O^Âˆ]Hœ™\Z\—İ^
+œİ[Kœİ[JK˜\\İˆ¹§*¹çéy«c9¢bÈ‹˜[[Hˆ¹§*¹b!¹ìnù.$ú/¤H‹YX\ˆˆˆ‹ˆ™\˜][ÛˆŒŒ˜š]˜]HŒœØ[\\˜]HŒ˜Ú[›™[ÈŒˆ™›Ü›X]œœİY™š^›İÙ\Š
+K›İš\
+‹ˆŠK\\Š
+K˜Ûİ™\—Ü]ˆˆ‚ˆBˆN‚ˆ[\Ü]]YÙ[‚ˆ]Y[Ï[]]YÙ[‹‘š[JİŠ
+KX\ŞOQ˜[ÙJBˆYˆ]Y[È\È›İ›Û™N‚ˆ[™›ÏYÙ]]Š]Y[Ëš[™›È‹›Û™JBˆYˆ[™›Î‚ˆ]VÈ™\˜][Ûˆ—OY›Ø]
+Ù]]Š[™›Ë›[™İ‹
+HÜˆ
+Bˆ]VÈ˜š]˜]H—OZ[
+Ù]]Š[™›Ë˜š]˜]H‹
+HÜˆ
+Bˆ]VÈœØ[\\˜]H—OZ[
+Ù]]Š[™›ËœØ[\WÜ˜]H‹Ù]]Š[™›ËœØ[\\˜]H‹
+JHÜˆ
+Bˆ]VÈ˜Ú[›™[È—OZ[
+Ù]]Š[™›Ë˜Ú[›™[È‹
+HÜˆ
+B‚ˆYÜÏYÙ]]Š]Y[ËYÜÈ‹›Û™JBˆYˆYÜÎ‚ˆN‚ˆYˆ•Uˆˆ[ˆYÜÎˆ]VÈ]H—O\™\Z\—İ^
+YÜÖÈ•Uˆ—Kœİ[JBˆYˆ•LHˆ[ˆYÜÎˆ]VÈ˜\\İ—O\™\Z\—İ^
+YÜÖÈ•LH—K¹§*¹çéy«c9¢bÈŠBˆYˆ•Sˆˆ[ˆYÜÎˆ]VÈ˜[[H—O\™\Z\—İ^
+YÜÖÈ•Sˆ—K¹§*¹b!¹ìnù.$ú/¤HŠBˆYˆ•Èˆ[ˆYÜÎˆ]VÈYX\ˆ—O\™\Z\—İ^
+YÜÖÈ•È—KˆŠBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆ]VÈ]H—O\Ù[‹—İY×Ùš\œİ
+YÜËÈ]H‹•UH—K]VÈ]H—JBˆ]VÈ˜\\İ—O\Ù[‹—İY×Ùš\œİ
+YÜËÈ˜\\İ‹T•TÕ—K]VÈ˜\\İ—JBˆ]VÈ˜[[H—O\Ù[‹—İY×Ùš\œİ
+YÜËÈ˜[[H‹S•SH—K]VÈ˜[[H—JBˆ]VÈYX\ˆ—O\Ù[‹—İY×Ùš\œİ
+YÜËÈ™]H‹YX\ˆ‹‘UH—K]VÈYX\ˆ—JB‚ˆÛİ™\—Ø]\ÏS›Û™BˆN‚ˆ›ÜˆÙ^H[ˆYÜËšÙ^\Ê
+N‚ˆØš]YÜÖÚÙ^WBˆYˆİŠÙ^JKœİ\İÚ]
+TPÈŠN‚ˆÛİ™\—Ø]\ÏYÙ]]ŠØš‹™]H‹›Û™JBˆYˆÛİ™\—Ø]\Î‚ˆœ™XZÂˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆN‚ˆXÜÏYÙ]]Š]Y[ËœXİ\™\È‹×JBˆYˆXÜÈ[™›İÛİ™\—Ø]\Î‚ˆÛİ™\—Ø]\Ï\XÜÖÌK™]Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆN‚ˆÛİœ]YÜË™Ù]
+˜ÛİœˆŠHYˆ\Ø]ŠYÜË™Ù]ŠH[ÙH›Û™BˆYˆÛİœˆ[™›İÛİ™\—Ø]\Î‚ˆÛİ™\—Ø]\ÏX]\ÊÛİœ–ÌJBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆÛİ™\—Ø]\Î‚ˆ[\Ü\ÚXˆ\ÈÚ\ÚX‚ˆÜ\Ù[‹˜Ûİ™\—Ù\‹ÊÚ\ÚX‹›YJİŠ
+K™[˜ÛÙJ]‹NŠJKš^YÙ\İ
+
+JÈ‹šœÈŠBˆÜÜš]WØ]\ÊÛİ™\—Ø]\ÊBˆ]VÈ˜Ûİ™\—Ü]—O\İŠÜ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆœY]VÈ˜š]˜]H—BˆÜY]VÈœØ[\\˜]H—Bˆ^\œİY™š^›İÙ\Š
+BˆYˆ^[ˆ
+‹Ø]ˆ‹‹™›XÈ‹‹˜ZY™ˆ‹‹˜ZYˆ‹‹˜[XÈŠN‚ˆOH¹¥è9£gËÔÓH‚ˆ[YˆœLÌŒ‚ˆOHºjæ9è yã¡È‚ˆ[YˆœLNLŒ‚ˆOH¹¨!ùaáˆ‚ˆ[YˆœŒ‚ˆOHº/ ù/c¹è yã¡È‚ˆ[ÙN‚ˆOH¹o¡y¨à9­bÈ‚ˆYˆÜˆ[™ÜÌŒ‚ˆJÏHˆ0­È9/cºaáù¨-ùã¡È‚ˆ]VÈœ]X[]H—O\Bˆ™]\›ˆ]B‚ˆYˆÙš[™Ù\œš[
+Ù[‹]
+N‚ˆZ\ÚX‹œÚLMŠ
+BˆÚ]Ü[Š]œ˜ˆŠH\È‚ˆÚ[HYN‚ˆY‹œ™XY
+L
+ŒL
+BˆYˆ›İ‚ˆœ™XZÂˆ\]JŠBˆ™]\›ˆš^YÙ\İ
+
+B‚ˆYˆØØ[—Ú[\ÜÊÙ[ŠN‚ˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJŠBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+¹«hùg*:+íù¬`¹§#yb¨yfj9ë¨yä!¹df9d#9«iyc§ùâb9«c9¦ì¹æë¹oex )ˆŠBˆN‚ˆ™\İ[HÙ[‹—ÜÙ\™\—ØÛY[
+[Y[İ]LÌ
+KœØØ[Š
+BˆÙ[‹œÙ\™\—ÛXœ˜\WÜ›ÛİHİŠ™\İ[™Ù]
+œ›ÛİŠHÜˆÙ[‹œÙ\™\—ÛXœ˜\WÜ›Ûİ
+BˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹œ™Yœ™\ÚÛXœ˜\J
+BˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+ˆˆ¹§#yb¨yfj9¢jù£ãùk£9¢$;ï&ÜÙ[‹œÙ\™\—ÛXœ˜\WÜ›ÛİH0­È‚ˆˆ¹cäyã¬Ü™\İ[™Ù]
+	İİ[	Ë
+_H:i¥»ï#9¥¬9h§ˆÜ™\İ[™Ù]
+	ØYY	Ë
+_xà H‚ˆˆ¹¦í9¥¬Ü™\İ[™Ù]
+	İ\]Y	Ë
+_xà ymì¹§"HÜ™\İ[™Ù]
+	ÜÚÚ\Y	Ë
+_xà H‚ˆˆ¹i,z-)HÜ™\İ[™Ù]
+	Ù˜Z[Y	Ë
+_xà ˆ‚ˆ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹§#yb¨yfj9c§ùâb9«c9¦ì¹d#9«iyk£9¢$‹ˆˆ¹¢jù£ãù/cyïk»ï"9§#yb¨yfj;ï"{ï&—ÜÙ[‹œÙ\™\—ÛXœ˜\WÜ›ÛİW—ˆ‚ˆˆ¹cäyã¬Ü™\İ[™Ù]
+	İİ[	Ë
+_H9.*¹k£9¥m:gìúh¤y¥¡ù.í¸à —ˆ‚ˆ¹§+9«(y§*º+îùcå¸à y§*¹¢jù£ãùk¨¹¢-ùêëÈÈ9ææ8à ˆ‹ˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆİY™š^H»ï&ù.ãy¦/¹é.¹."¹«(yï$ùkfˆYˆÙ[‹œ™[[İWÜ›İÜÈ[ÙHˆ‚ˆÙ[‹›Xœ˜\WÜØØ[—Üİ]\ËœÙ]^
+ˆ¹§#yb¨yfj9d#9«iyi,z-){ï&Ù^ß^ÜİY™š^HŠBˆSY\ÜØYÙP›Ş˜Üš]XØ[
+ˆÙ[‹¹§#yb¨yfj9¦ì¹n¤ùd#9«iyi,z-)H‹ˆˆÙ^ßW—º+íùg*8 &:+¯¹ïk¸ &y¨à9§éHRH9§#yb¨yfj9g,9g`8à —ˆ‚ˆ¹..º`oùacy­íùaiyk¨¹¢-ùêëù«c9¦ì»ï#:/kù.í¹.#y/&¹fçº` 9¢jù£ãùk¨¹¢-ùêëÈÈ9ææ8à ˆ‹ˆ
+Bˆ™]\›‚ˆØ[™Y]\ÏV×Bˆœš[OPTÑWÑT‹Èš[\ÜÈ‹È™š[™Ù\œš[ËšœÛÛˆ‚ˆYˆœš[K™^\İÊ
+N‚ˆN‚ˆœZœÛÛ‹›ØYÊœš[Kœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆÛÜšÙ\PTÑWÑT‹Èš[\ÜÈ‹ÈÛÜšÚ[™È‚ˆØ[™Y]\Ï][š\]YWÚ[\ÜØØ[™Y]\Êˆœ‹ˆÛÜšÙ\‹™ÛØŠŠ‹Ø]ˆŠHYˆÛÜšÙ\‹™^\İÊ
+H[ÙH×KˆÙ[‹—Ùš[™Ù\œš[ˆ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆ[ÙN‚ˆÛÜšÙ\PTÑWÑT‹Èš[\ÜÈ‹ÈÛÜšÚ[™È‚ˆYˆÛÜšÙ\‹™^\İÊ
+N‚ˆØ[™Y]\Ï][š\]YWÚ[\ÜØØ[™Y]\ÊßKÛÜšÙ\‹™ÛØŠŠ‹Ø]ˆŠKÙ[‹—Ùš[™Ù\œš[
+B‚ˆİ[[X^
+K[ŠØ[™Y]\ÊJBˆÛÛ\Ù[‹—ÙŠ
+BˆYYLˆÈÛX[ˆYØXŞH\XØ]\ÈÜ™X]YÚ[ˆHÛÛ™\YÛÜšÈĞUˆØ\ÈØØ[›™YˆÈÛ˜ÙH\È[ˆÜšYÚ[˜[Ûİ\˜ÙH[™Û˜ÙH\ÈHÙ[™\˜]YÛÜšÈš[K‚ˆ^\İ[™×Ü›İÜÏXÛõçü¶‰Ëkºwµç\Y˜XİÈ—VÈœİ[\È—O\İ[WÙ\‚ˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]J•TUH˜XÚÜÈÑUİ[\×Üİ]\ÏIùk£9¢$	ÈÒT‘HYOÈ‹
+›Ø–È˜XÚ×ÚY—K
+JBˆÛÛ‹˜ÛÛ[Z]
+
+NÈÛÛ‹˜ÛÜÙJ
+BˆÙ[‹—Ü\[[™WØÛÛ\]WÜİYÙJ›Ø‹œİ[\ÈŠB‚ˆYˆÜ\[[™WÜ[—ÜŞ[˜×ÜİYÙJÙ[‹İYÙK›ØŠN‚ˆN‚ˆYˆİYÙOOHœ™[™\ˆ‚ˆN‚ˆ›Ø–Èœ™[™\—ÜÛİ[™›Û—O\Ù[‹›XZ[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]^
+
+Kœİš\
+
+Bˆ^Ù\^Ù\[Û‚ˆ›Ø–Èœ™[™\—ÜÛİ[™›Û—OHˆ‚ˆ›Ø–Èœ™[™\—Ûİ]]—O\Ù[‹œ\[[™WÛİ]]˜İ\œ™[^
+
+BˆÜ\˜][ÛœÏ^Âˆ˜[˜[\Ú\È›[X™NœÙ[‹—Ü\[[™WÜİYÙWØ[˜[\Ú\Ê›ØŠKˆ˜ÚÜ™È›[X™NœÙ[‹—Ü\[[™WÜİYÙWØÚÜ™Ê›ØŠKˆœØÛÜ™H›[X™NœÙ[‹—Ü\[[™WÜİYÙWÜØÛÜ™J›ØŠKˆ˜\œ˜[™Ù[Y[›[X™NœÙ[‹—Ü\[[™WÜİYÙWØ\œ˜[™Ù[Y[
+›ØŠKˆœ™[™\ˆ›[X™NœÙ[‹—Ü\[[™WÜİYÙWÜ™[™\Š›ØŠKˆ›Xœ˜\H›[X™NœÙ[‹—Ü\[[™WÜİYÙWÛXœ˜\J›ØŠKˆBˆÜ\˜][Û[Ü\˜][ÛœË™Ù]
+İYÙJBˆYˆÜ\˜][Ûˆ\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ¹§*¹çéy­`y¬-9î¯úf-¹«­{ï&ÜİYÙ_HŠBˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\T\[[™TİYÙUÛÜšÙ\ŠÜ\˜][ÛŠBˆXİ]™WİÛÜšÙ\\Ù[‹œ\[[™WÜİYÙWİÛÜšÙ\‚ˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\‹œİXØÙYYY˜ÛÛ›™Xİ
+ˆ[X™NœÙ[‹—Ü\[[™WØÛÛ\]WÜİYÙJ›Ø‹İYÙJBˆ
+BˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\‹™˜Z[Y˜ÛÛ›™Xİ
+ˆ[X™H\œ›ÜœÙ[‹—Ü\[[™WÙ˜Z[
+›Ø‹İYÙK\œ›ÜŠBˆ
+BˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\‹™š[š\ÚY˜ÛÛ›™Xİ
+ˆ[X™HÏXXİ]™WİÛÜšÙ\œÙ[‹—Ü™[X\ÙWÜ\[[™WÜİYÙWİÛÜšÙ\ŠÊBˆ
+BˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\‹œİ\
+
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹—Ü\[[™WÙ˜Z[
+›Ø‹İYÙKJB‚ˆYˆÜ™[X\ÙWÜ\[[™WÜİYÙWİÛÜšÙ\ŠÙ[‹ÛÜšÙ\ŠN‚ˆYˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\ˆ\ÈÛÜšÙ\‚ˆÙ[‹œ\[[™WÜİYÙWİÛÜšÙ\S›Û™BˆYˆÙ[‹œ\[[™WÜ[›š[™È[™›İÙ[‹œ\[[™WÜ]\ÙY‚ˆU[Y\‹œÚ[™ÛTÚİ
+Ù[‹—Üİ\Û™^Ü\[[™WÚ›ØŠB‚ˆYˆÜ\[[™WÜİYÙWØ[˜[\Ú\ÊÙ[‹›ØŠN‚ˆ[\ÜXœ›ÜØBˆKÜ[Xœ›ÜØK›ØY
+›Ø–Èœ]—KÜLŒŒL[Û›ÏUYK\˜][ÛL
+Bˆ[\ËÏ[Xœ›ÜØK˜™X]˜™X]İ˜XÚÊO^KÜ\ÜŠBˆœOY›Ø]
+œ˜\Ø\œ˜^J[\ÊKœ™\Ú\JLJVÌJBˆÚ›ÛXO[Xœ›ÜØK™™X]\™K˜Ú›ÛXWØÜ]
+O^KÜ\ÜŠBˆ˜[Y\ÏVÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆ—BˆÙ^O[˜[Y\ÖÚ[
+œ˜\™ÛX^
+œ›YX[ŠÚ›ÛXK^\ÏLJJJWBˆ›Ø–È˜\Y˜XİÈ—VÈ˜[˜[\Ú\È—O^È˜œHœ›İ[™
+œKJKšÙ^HšÙ^_BˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]Jˆ•TUH˜XÚÜÈÑUœOOË]\ÚXØ[ÚÙ^OOË[˜[\Ú\×Üİ]\ÏIùk£9¢$	ÈÒT‘HYOÈ‹ˆ
+›İ[™
+œKJKÙ^K›Ø–È˜XÚ×ÚY—JBˆ
+BˆÛÛ‹˜ÛÛ[Z]
+
+NÈÛÛ‹˜ÛÜÙJ
+B‚ˆYˆÜ\[[™WÜİYÙWØÚÜ™ÊÙ[‹›ØŠN‚ˆ[\ÜXœ›ÜØBˆKÜ[Xœ›ÜØK›ØY
+›Ø–Èœ]—KÜLŒŒL[Û›ÏUYJBˆ[\Ë™X]Ùœ˜[Y\Ï[Xœ›ÜØK˜™X]˜™X]İ˜XÚÊO^KÜ\ÜŠBˆ™X]İ[Y\Ï[Xœ›ÜØK™œ˜[Y\×İ×İ[YJ™X]Ùœ˜[Y\ËÜ\ÜŠBˆÚ›ÛXO[Xœ›ÜØK™™X]\™K˜Ú›ÛXWØÜ]
+O^KÜ\ÜŠBˆ™X]ØÚ›ÛXO[Xœ›ÜØK][œŞ[˜ÊÚ›ÛXK™X]Ùœ˜[Y\ËYÙÜ™YØ]O[œ›YYX[ŠB‚ˆ˜[Y\ÏVÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆ—Bˆ[\]\ÏV×Bˆ›Üˆ›Ûİ[ˆ˜[™ÙJLŠN‚ˆ›ÜˆİY™š^[È[ˆÊˆ‹Ì×JK
+›H‹ÌË×JK
+È‹ÌËLJK
+›XZÈ‹ÌËLWJK
+›MÈ‹ÌËËLJWN‚ˆ[œ™\›ÜÊL‹›Ø]
+Bˆ›ÜˆÈ[ˆ[ÎÊ›Ûİ
+ÚÊILL—OLKŒˆ[\]\Ë˜\[™
+
+˜[Y\ÖÜ›ÛİJÜİY™š^Êœ›[˜[Ë››Ü›J
+JÌYKNJJJB‚ˆÚÜ™ÏV×Bˆ›ÜˆH[ˆ˜[™ÙJ™X]ØÚ›ÛXKœÚ\VÌWJN‚ˆX™X]ØÚ›ÛXVÎ‹WK˜\İ\J›Ø]
+Bˆ]‹Êœ›[˜[Ë››Ü›JŠJÌYKNJBˆ™\İ[X^
+
+
+›Ø]
+œ™İ
+‹
+JK˜[YJH›Üˆ˜[YK[ˆ[\]\ÊKÙ^O[[X™HÌJBˆÚÜ™Ë˜\[™
+™\İÌWJB‚ˆ›İÜÏV×Bˆ›Üˆİ\[ˆ˜[™ÙJZ[Š[ŠÚÜ™ÊK[Š™X]İ[Y\ÊJK
+N‚ˆÙ\OXÚÜ™ÖÜİ\œİ\
+ÍBˆÛÛ\XİV×Bˆ›ÜˆÈ[ˆÙ\N‚ˆYˆ›İÛÛ\XİÜˆÛÛ\XİËLWHOXÎ˜ÛÛ\Xİ˜\[™
+ÊBˆ›İÜË˜\[™
+Âˆ˜˜\ˆ›[Š›İÜÊJÌKˆœÙXÛÛ™È™›Ø]
+™X]İ[Y\ÖÜİ\JKˆ˜ÚÜ™È˜ÛÛ\XİˆœÙXİ[Ûˆ™ˆ¹«­z$/HÛ[Š›İÜÊKËÎ
+Ì_H‚ˆJB‚ˆİ]PTÑWÑT‹Èœ\[[™H‹È˜ÚÜ™È‚ˆİ]›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ[İ]ÙˆÚ›Ø–Éİ˜XÚ×ÚY	×_WØÚÜ™ËšœÛÛˆ‚ˆÜš]Wİ^
+œÛÛ‹™[\Ê›İÜË[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆ›Ø–È˜\Y˜XİÈ—VÈ˜ÚÜ™È—O\İŠ
+Bˆ›Ø–È˜\Y˜XİÈ—VÈ˜ÚÜ™İ[Y[[™H—O\›İÜÂ‚ˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]J•TUH˜XÚÜÈÑUÚÜ™×Üİ]\ÏIùk£9¢$	ÈÒT‘HYOÈ‹
+›Ø–È˜XÚ×ÚY—K
+JBˆÛÛ‹˜ÛÛ[Z]
+
+NÈÛÛ‹˜ÛÜÙJ
+B‚ˆYˆÜ\[[™WÜİYÙWÜØÛÜ™JÙ[‹›ØŠN‚ˆ›İÜÏZ›Ø–È˜\Y˜XİÈ—K™Ù]
+˜ÚÜ™İ[Y[[™HŠBˆYˆ›İ›İÜÎ‚ˆÜZ›Ø–È˜\Y˜XİÈ—K™Ù]
+˜ÚÜ™È‹ˆŠBˆYˆÜ[™]
+Ü
+K™^\İÊ
+N‚ˆ›İÜÏZœÛÛ‹›ØYÊ]
+Ü
+Kœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆYˆ›İ›İÜÎ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹¬¨y§"yd£9o)¹¥íºeí9î¯ûï#9¥è9¬åyaîº,,HŠB‚ˆİ]\PTÑWÑT‹Èœ\[[™H‹ÈœØÛÜ™\È‚ˆİ]\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ[İ]\‹ÙˆÚ›Ø–Éİ˜XÚ×ÚY	×_WÛXYÜÚY]š[‚ˆœÏV×Bˆ›Üˆ›İÈ[ˆ›İÜÎ‚ˆœË˜\[™
+ˆˆÜ›İÖÉØ˜\‰×_OİÜÙ[‹›XZ[‹—Ù›Ü›X]İ[YJ›İÖÉÜÙXÛÛ™É×J_Oİˆ‚ˆˆÚ[™\ØØ\J›İÖÉÜÙXİ[Û‰×J_OİÚ[™\ØØ\J	ÈÈ	Ëš›Ú[Š›İÖÉØÚÜ™É×JJ_Oİİˆ‚ˆ
+BˆYÙOYˆˆˆYØİ\H[Y]HÚ\œÙ]Iİ]‹N	Ïİ[O‚ˆ›Ù^ŞÙ›ÛY˜[Z[N‰ÓZXÜ›ÜÛÙXRZHRIÎØ˜XÚÙÜ›İ[™ˆÌLLLYØÛÛÜˆÙYŒÙ™ÜY[™ÎŒÌ_BˆX›^ŞİÚYŒL	NØ›Ü™\‹XÛÛ\ÙN˜ÛÛ\Ù__]ŞÜY[™Î\Ø›Ü™\‹X›İÛNŒ\ÛÛYÌLÍL__BˆÜİ[OOÚ[™\ØØ\J›Ø–Éİ]I×J_OÚO‚ˆX›O¹l#ú" İ¹¥íºeíİ¹«­z$/Oİ¹d£9o)İİÉÉËš›Ú[ŠœÊ_OİX›Oˆˆˆ‚ˆÜš]Wİ^
+YÙK[˜ÛÙ[™ÏH]‹NŠBˆ›Ø–È˜\Y˜XİÈ—VÈœØÛÜ™H—O\İŠ
+BˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]J•TUH˜XÚÜÈÑUØÛÜ™WÜİ]\ÏIùk£9¢$	ÈÒT‘HYOÈ‹
+›Ø–È˜XÚ×ÚY—K
+JBˆÛÛ‹˜ÛÛ[Z]
+
+NÈÛÛ‹˜ÛÜÙJ
+B‚ˆYˆÜ\[[™WÜİYÙWØ\œ˜[™Ù[Y[
+Ù[‹›ØŠN‚ˆ›İÜÏZ›Ø–È˜\Y˜XİÈ—K™Ù]
+˜ÚÜ™İ[Y[[™HŠBˆYˆ›İ›İÜÎ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹ï.¹l$yd£9o)¹¥íºeí9î¯ÈŠB‚ˆœ›ÛHZYÈ[\ÜZYQš[KZYU˜XÚËY\ÜØYÙKY]SY\ÜØYÙKœL[\Âˆ[˜[\Ú\ÏZ›Ø–È˜\Y˜XİÈ—K™Ù]
+˜[˜[\Ú\È‹ßJBˆœOY›Ø]
+[˜[\Ú\Ë™Ù]
+˜œH‹LŒ
+HÜˆLŒ
+B‚ˆZYSZYQš[JXÚÜ×Ü\—Ø™X]M
+BˆY]OSZYU˜XÚÊ
+NÛZY˜XÚÜË˜\[™
+Y]JBˆY]K˜\[™
+Y]SY\ÜØYÙJ	ÜÙ]İ[\ÉË[\ÏXœL[\ÊœJK[YOL
+JBˆY]K˜\[™
+Y]SY\ÜØYÙJ	İ[YWÜÚYÛ˜]\™IË[Y\˜]ÜM[›ÛZ[˜]ÜM[YOL
+JB‚ˆİZ]\SZYU˜XÚÊ
+NÛZY˜XÚÜË˜\[™
+İZ]\ŠBˆ˜\ÜÏSZYU˜XÚÊ
+NÛZY˜XÚÜË˜\[™
+˜\ÜÊBˆX[›ÏSZYU˜XÚÊ
+NÛZY˜XÚÜË˜\[™
+X[›ÊBˆ[\ÏSZYU˜XÚÊ
+NÛZY˜XÚÜË˜\[™
+[\ÊB‚ˆ›İWÛX\^ÈÈŒÈÈŒK‘Œ‹‘ÈŒË‘H‘ˆK‘ˆÈ‹‘ÈË‘ÈÈHKHÈÌˆÌ_Bˆİ[[X^
+K[Š›İÜÊJBˆ›ÜˆK›İÈ[ˆ[[Y\˜]J›İÜÊN‚ˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆO\™K›X]Ú
+ˆ—ŠĞKQ×JÎˆÊOÊJOÊH‹ÚÜ™
+Bˆ›Ûİ[›İWÛX\™Ù]
+K™Ü›İ\
+JHYˆH[ÙHÈ‹Œ
+BˆZ[›ÜX›ÛÛ
+H[™K™Ü›İ\
+ŠOOH›HŠBˆÚÜ™Û›İ\ÏVÜ›Ûİ›Ûİ
+ÊÈYˆZ[›Üˆ[ÙH
+K›Ûİ
+Í×B‚ˆÈ]\ÚXØ[[[YÙ[˜ÙK\İ[H›ÛH\İ[X]H˜\ÙYÛˆX˜\ˆ›ØÚÜË‚ˆ›ØÚÏZKËÎˆÜÏZKÛX^
+Kİ[LJBˆYˆÜÏŒL‚ˆ›ÛOHš[›È‚ˆ[YˆÜÏN‚ˆ›ÛOH™\œÙH‚ˆ[YˆÜÏ‚ˆ›ÛOH˜ÚÜ\È‚ˆ[YˆÜÏN‚ˆ›ÛOH˜œšYÙH‚ˆ[ÙN‚ˆ›ÛOH›İ]›È‚‚ˆİ˜]YŞO^Âˆš[›ÈˆÈ™ÈŒL‹˜ˆŒK™ŒŒÍKœŒ™š[‘˜[Ù_Kˆ™\œÙHˆÈ™ÈŒŒ‹˜ˆŒN™ŒMKœŒN™š[‘˜[Ù_Kˆ˜ÚÜ\ÈÈ™ÈŒL˜ˆŒ™ŒMKœŒ™š[•Y_Kˆ˜œšYÙHÈ™ÈŒ˜ˆŒL™ŒœŒÍK™š[‘˜[Ù_Kˆ›İ]›ÈˆÈ™ÈŒ˜ˆŒK™ŒŒÍKœŒŒ‹™š[‘˜[Ù_KˆVÜ›ÛWB‚ˆÈİZ]\‚ˆİ™[Z[
+ŠÍJœİ˜]YŞVÈ™È—JBˆÜİ\ÏNYˆ›ÛOOH˜ÚÜ\Èˆ[ÙHˆÙ\LYˆÜİ\ÏON[ÙHˆ›Üˆİ\[ˆ˜[™ÙJÜİ\ÊN‚ˆYˆ›ÛH[ˆ
+š[›È‹˜œšYÙHŠH[™İ\	LOLN‚ˆXÚÜ™Û›İ\ÖÜİ\	[[ŠÚÜ™Û›İ\ÊWBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[‹™[ØÚ]OYİ™[[YOLÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[‹™[ØÚ]OL[YOYÙ\‹Ú[›™[L
+JBˆ[ÙN‚ˆ›Üˆˆ[ˆÚÜ™Û›İ\Î‚ˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[‹™[ØÚ]OYİ™[[YOLÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İOXÚÜ™Û›İ\ÖÌK™[ØÚ]OL[YOZ[
+Ù\Š‹ŠKÚ[›™[L
+JBˆ›Üˆˆ[ˆÚÜ™Û›İ\ÖÌN—N‚ˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[‹™[ØÚ]OL[YOLÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO\›Ûİ™[ØÚ]OLK[YO[X^
+K[
+Ù\Š‹ŒN
+JKÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO\›Ûİ™[ØÚ]OL[YOLÚ[›™[L
+JB‚ˆÈ˜\ÜÂˆ™[Z[
+MJÌÍJœİ˜]YŞVÈ˜ˆ—JBˆ˜\Ü×Ü]\›VÜ›ÛİL›ÛİLMË›ÛİL›ÛİLL—HYˆ›ÛOOH˜ÚÜ\Èˆ[ÙHÜ›ÛİL›ÛİLMË›ÛİL›ÛİLM×Bˆ›Üˆ›ˆ[ˆ˜\Ü×Ü]\›‚ˆ›[X^
+Z[ŠÌ‹›ŠJBˆ˜\ÜË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İOX›‹™[ØÚ]OX™[[YOLÚ[›™[LJJBˆ˜\ÜË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İOX›‹™[ØÚ]OL[YOMÚ[›™[LJJB‚ˆÈX[›Îˆ[Ü™Hİ\İZ[™Y[ˆœšYÙKÚ[›ÈÈ]›ÚYİZ]\ˆX\ÚÚ[™Ë‚ˆ™[Z[
+ŠÌÌ
+œİ˜]YŞVÈœ—JBˆYˆ›ÛH[ˆ
+š[›È‹˜œšYÙH‹›İ]›ÈŠN‚ˆ›Üˆˆ[ˆÚÜ™Û›İ\Î‚ˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[ŠÌL‹™[ØÚ]O\™[[YOLÚ[›™[LŠJBˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İOXÚÜ™Û›İ\ÖÌJÌL‹™[ØÚ]OL[YOLNLŒÚ[›™[LŠJBˆ›Üˆˆ[ˆÚÜ™Û›İ\ÖÌN—N‚ˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[ŠÌL‹™[ØÚ]OL[YOLÚ[›™[LŠJBˆ[ÙN‚ˆ›Üˆ™X][ˆ˜[™ÙJ
+N‚ˆXÚÜ™Û›İ\ÖØ™X]	[[ŠÚÜ™Û›İ\ÊWJÌL‚ˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[‹™[ØÚ]O\™[[YOLÚ[›™[LŠJBˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[‹™[ØÚ]OL[YOMÚ[›™[LŠJB‚ˆÈ[\Âˆ™[Z[
+JÍL
+œİ˜]YŞVÈ™—JBˆ›ÜˆH[ˆ˜[™ÙJ
+N‚ˆ]™[ÏVÊ‹X^
+ÍK™[LJJWBˆYˆH[ˆ
+
+N™]™[Ë˜\[™
+
+Í‹™[
+JBˆYˆH[ˆ
+‹ŠN™]™[Ë˜\[™
+
+Î™[
+JBˆYˆ›ÛOOH˜ÚÜ\Èˆ[™H[ˆ
+ËÊN™]™[Ë˜\[™
+
+Í‹X^
+K™[MJJBˆ
+Bˆ›Üˆ‹ˆ[ˆ]™[Î‚ˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[‹™[ØÚ]O[Z[ŠLŒŠK[YOLÚ[›™[NJJBˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İOM‹™[ØÚ]OL[YOLÚ[›™[NJJBˆ›Üˆ‹È[ˆ]™[ÖÌN—N‚ˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[‹™[ØÚ]OL[YOLÚ[›™[NJJB‚ˆYˆİ˜]YŞVÈ™š[—H[™
+JÌJINOL‚ˆ›Üˆ›İH[ˆÍKËLÎN‚ˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[›İK™[ØÚ]O[Z[ŠLŒ™[
+ÌL
+K[YOLÚ[›™[NJJBˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[›İK™[ØÚ]OL[YOLLŒÚ[›™[NJJB‚ˆİ]\PTÑWÑT‹Èœ\[[™H‹È˜\œ˜[™Ù[Y[È‚ˆİ]\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ[İ]\‹ÙˆÚ›Ø–Éİ˜XÚ×ÚY	×_WØ\œ˜[™Ù[Y[›ZY‚ˆZYœØ]™JİŠ
+JBˆ›Ø–È˜\Y˜XİÈ—VÈ˜\œ˜[™Ù[Y[ÛZYH—O\İŠ
+Bˆ›Ø–È˜\Y˜XİÈ—VÈ˜\œ˜[™Ù[Y[Ù[™Ú[™H—OH“]\ÚXØ[[[YÙ[˜ÙH\[[™HŒ‹ŒH‚ˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]J•TUH˜XÚÜÈÑU\œ˜[™Ù[Y[Üİ]\ÏIùk£9¢$	ÈÒT‘HYOÈ‹
+›Ø–È˜XÚ×ÚY—K
+JBˆÛÛ‹˜ÛÛ[Z]
+
+NØÛÛ‹˜ÛÜÙJ
+B‚ˆYˆÜ\[[™WÜİYÙWÜ™[™\ŠÙ[‹›ØŠN‚ˆZYOZ›Ø–È˜\Y˜XİÈ—K™Ù]
+˜\œ˜[™Ù[Y[ÛZYH‹ˆŠBˆYˆ›İZYHÜˆ›İ]
+ZYJK™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹¬¨y§"yï%ºacHRQHŠB‚ˆÙ—Ü]\İŠ›Ø‹™Ù]
+œ™[™\—ÜÛİ[™›Û‹ˆŠHÜˆˆŠB‚ˆYˆ›İÙ—Ü]Üˆ›İ]
+Ù—Ü]
+K™^\İÊ
+N‚ˆÈRQH9ï%ºacymì¹îãù¦+ùcëù.©9.æ9¢$9§§8à ”Ûİ[™›Û9¦+ùcëú`"yæ¡9§+9g,:gìú"l¹n¤ûï#ˆÈ9§*ºacyïk¹¥íº-ìú/áúgìúh¤y®,¹§äûï#9.#ya£z+ªy¥m9§hHRH9­`y¬-9î¯ùi,z-)xà ‚ˆ›Ø–È˜\Y˜XİÈ—VÈœ™[™\—Û›İXÙH—HH¹§*ºacyïkˆÛİ[™›Û;ï#9mì¹/çyåfHRQH9nmº-ìú/áúgìúh¤y®,¹§äÈ‚ˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]Jˆ•TUH˜XÚÜÈÑU™[™\—Üİ]\ÏIùmìº-ìú/áûï"9§*ºacyïkˆÛİ[™›Û;ï"IÈÒT‘HYOÈ‹ˆ
+›Ø–È˜XÚ×ÚY—K
+Kˆ
+BˆÛÛ‹˜ÛÛ[Z]
+
+NØÛÛ‹˜ÛÜÙJ
+Bˆ™]\›‚‚ˆ›ZYŞ[\Ù[‹›XZ[‹—Ùš[™Ù›ZYŞ[
+
+BˆYˆ›İ›ZYŞ[‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹§*¹¢o¹b,›ZYŞ[ŠB‚ˆİ]\PTÑWÑT‹Èœ\[[™H‹Èœ™[™\™Y‚ˆİ]\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆØ][İ]\‹ÙˆÚ›Ø–Éİ˜XÚ×ÚY	×_WÙš[˜[Ø]ˆ‚ˆ\İXœ›ØÙ\ÜËœ[ŠˆÙ›ZYŞ[‹[šH‹Ù—Ü]ZYK‹Qˆ‹İŠØ]ŠK‹\ˆ‹L—KˆØ\\™WÛİ]]UYK^UYK[Y[İ]MŒˆ
+BˆYˆœ™]\›˜ÛÙHOLÜˆ›İØ]‹™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ
+œİ\œˆÜˆœİİ]Üˆ¹®,¹§äùi,z-)HŠVËLML—JBˆ›Ø–È˜\Y˜XİÈ—VÈ™š[˜[İØ]ˆ—O\İŠØ]ŠB‚ˆYˆ›Ø‹™Ù]
+œ™[™\—Ûİ]]ŠOOH•ĞUˆ
+ÈTÈ‚ˆ™›\YÏ\Ù[‹›XZ[‹—Ùš[™Ù™›\YÊ
+BˆYˆ›İ™›\YÎ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠºg :) HTûï#9/a¹§*¹¢o¹b,‘›\YÈŠBˆ\Ï[İ]\‹ÙˆÚ›Ø–Éİ˜XÚ×ÚY	×_WÙš[˜[›\È‚ˆ\İXœ›ØÙ\ÜËœ[ŠˆÙ™›\YË‹^H‹‹ZH‹İŠØ]ŠK‹XÛÙXÎ˜H‹›X›\Û[YH‹‹X˜H‹ŒÌŒÈ‹İŠ\ÊWKˆØ\\™WÛİ]]UYK^UYK[Y[İ]LÌˆ
+BˆYˆ‹œ™]\›˜ÛÙHOLÜˆ›İ\Ë™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ“TÈ9ï%¹è yi,z-)HŠBˆ›Ø–È˜\Y˜XİÈ—VÈ™š[˜[Û\È—O\İŠ\ÊB‚ˆÛÛ\Ù[‹—ÙŠ
+BˆÛÛ‹™^Xİ]Jˆ•TUH˜XÚÜÈÑU™[™\—Üİ]\ÏIùk£9¢$	Ëš[˜[Ø]Y[×Ü]OÈÒT‘HYOÈ‹ˆ
+İŠØ]ŠK›Ø–È˜XÚ×ÚY—JBˆ
+BˆÛÛ‹˜ÛÛ[Z]
+
+NØÛÛ‹˜ÛÜÙJ
+B‚ˆYˆÜ\[[™WÜİYÙWÛXœ˜\JÙ[‹›ØŠN‚ˆÈš[˜[ÛÛœÚ\İ[˜ŞHÚXÚÜÚ[‚ˆÛÛ\Ù[‹—ÙŠ
+Bˆ›İÏXÛÛ‹™^Xİ]J”ÑSPÕY”“ÓH˜XÚÜÈÒT‘HYOÈ‹
+›Ø–È˜XÚ×ÚY—K
+JK™™]ÚÛ™J
+BˆYˆ›İ›İÎ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠºgìù.d9n¤ù.+y¢o¹.#yb,9«c9¦ìº+¬9oeHŠBˆÛÛ‹˜ÛÛ[Z]
+
+NØÛÛ‹˜ÛÜÙJ
+Bˆ›Ø–È˜\Y˜XİÈ—VÈ›Xœ˜\Wİ\]Y—OUYB‚‚ˆYˆØYÜÙ[XİYİ×İÛÜšÜÜXÙJÙ[ŠN‚ˆY\Ù[‹—ÜÙ[XİYİ˜XÚ×ÚY
+
+BˆYˆ›İY‚ˆ™]\›‚ˆ›İÏ\Ù[‹œ™[[İWÜ›İÜË™Ù]
+Y
+BˆYˆ›İ›İÎ‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹§#yb¨yfj9¦ì¹n¤È‹º+íùab9b-ù¥¬9§#yb¨yfj9¦ì¹n¤øà ˆŠBˆ™]\›‚ˆÙ[‹›XZ[‹›ØYÜÙ\™\—ÛXœ˜\Wİ˜XÚÊY›İÊB‚‚˜Û\ÜÈÛÜšÜĞÙ[\”YÙJUÚYÙ]
+N‚ˆˆˆœ›İÜÙK™[Ü[ˆ[™\˜Ú]™HØ]™Y]ÙZY\ˆ›Ú™XİËˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆ“Ò‘PÕ×ÑT‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ^[İ]HU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+¹/g9dày.+yoàÈŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ^[İ]˜YÚYÙ]
+]JBˆ[HSX™[
+ºfá¹.+yë¨yä!¹mì¹/çykf9méyê"øà Tİ[xà z,,zgh¸à SRQH9d£9kï9aî¹­íúgìøà ˆŠBˆ[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+[
+BˆXİ[ÛœÈHR›Ş^[İ]
+
+Bˆ™Yœ™\ÚHT\Ú]ÛŠ¹b-ù¥¬9/g9dàHŠBˆÜ[—Ü›Ú™XİHT\Ú]ÛŠ¹¢dùo 9méyê"ÈŠBˆXÚØYÙHHT\Ú]ÛŠ¹¢dùc!y¢`:`"y/g9dàHŠBˆ™]™X[HT\Ú]ÛŠ¹¢dùo 9/g9dàyæë¹oeHŠBˆ™[[İ™HHT\Ú]ÛŠ¹éîùb,9fç¹¥-¹êæHŠBˆ\WØ]Û—ØXØÙ[
+Ü[—Ü›Ú™Xİœš[X\HŠBˆ™Yœ™\Ú˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\Ú
+BˆÜ[—Ü›Ú™Xİ˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›Ü[—ÜÙ[XİY
+BˆXÚØYÙK˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œXÚØYÙWÜÙ[XİY
+Bˆ™]™X[˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™]™X[Ù›Û\ŠBˆ™[[İ™K˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™[[İ™WÜÙ[XİY
+Bˆ›Üˆ]Ûˆ[ˆ
+™Yœ™\ÚÜ[—Ü›Ú™XİXÚØYÙK™]™X[™[[İ™JNˆXİ[ÛœË˜YÚYÙ]
+]ÛŠBˆXİ[ÛœË˜Yİ™]Ú
+JBˆ^[İ]˜Y^[İ]
+Xİ[ÛœÊBˆÙ[‹X›HHUX›UÚYÙ]
+ŠBˆÙ[‹X›KœÙ]Üš^›Û[XY\“X™[ÊÈ¹/g9dàH‹¹®¤9«c9¦ìˆ‹¹b!º/j‹¹âb9§+‹¹/ë¹¥.y¥íºeí‹¹méyê"ù¥¡ù.íˆ—JBˆÙ[‹X›KšÜš^›Û[XY\Š
+KœÙ]İ™]Ú\İÙXİ[ÛŠYJBˆÙ[‹X›K™İX›PÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›Ü[—ÜÙ[XİY
+Bˆ^[İ]˜YÚYÙ]
+Ù[‹X›KJBˆÙ[‹œİ]\ÈHSX™[
+ˆŠBˆÙ[‹œİ]\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ^[İ]˜YÚYÙ]
+Ù[‹œİ]\ÊBˆÙ[‹œ™Yœ™\Ú
+
+B‚ˆYˆÜ›Ú™XİÊÙ[ŠN‚ˆ›İÜÈH×Bˆ›Üˆ][ˆÛÜY
+“Ò‘PÕ×ÑT‹™ÛØŠŠ‹šœÛÛˆŠKÙ^O[[X™Hˆœİ]
+
+KœİÛ][YK™]™\œÙOUYJN‚ˆN‚ˆ]HHœÛÛ‹›ØYÊ]œ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆ^Ù\^Ù\[Û‚ˆ]HHßBˆ›İÜË˜\[™
+
+]]JJBˆ™]\›ˆ›İÜÂ‚ˆYˆ™Yœ™\Ú
+Ù[ŠN‚ˆ›İÜÈHÙ[‹—Ü›Ú™XİÊ
+BˆÙ[‹X›KœÙ]›İĞÛİ[
+[Š›İÜÊJBˆ›Üˆ›İË
+]]JH[ˆ[[Y\˜]J›İÜÊN‚ˆÛİ\˜ÙHHİŠ]K™Ù]
+œÛİ\˜ÙWÜÛÛ™ÈŠHÜˆˆŠBˆİ[WÙ\ˆHİŠ]K™Ù]
+œİ[WÙ\ˆŠHÜˆˆŠBˆ˜[Y\ÈHÜ]œİ[Kœ™\XÙJ‹››İœšXH‹ˆŠK]
+Ûİ\˜ÙJK›˜[YHYˆÛİ\˜ÙH[ÙH‹H‹ˆ¹mì¹å'ù¢$ˆYˆİ[WÙ\ˆ[™]
+İ[WÙ\ŠKš\×Ù\Š
+H[ÙH¹§*¹å'ù¢$‹ˆİŠ]K™Ù]
+™\œÚ[ÛˆŠHÜˆ‹HŠKˆ[YKœİ™[YJ‰VKI[KIY	R‰SH‹[YK›ØØ[[YJ]œİ]
+
+KœİÛ][YJJKİŠ]
+WBˆ›ÜˆÛÛ˜[YH[ˆ[[Y\˜]J˜[Y\ÊNˆÙ[‹X›KœÙ]][J›İËÛÛUX›UÚYÙ]][J˜[YJJBˆÙ[‹œİ]\ËœÙ]^
+ˆ¹alHÛ[Š›İÜÊ_H9.*¹méyê"ûï#9æë¹oe{ï&Ô“Ò‘PÕ×ÑTŸHŠB‚ˆYˆÜÙ[XİYÜ]
+Ù[ŠN‚ˆ›İÈHÙ[‹X›K˜İ\œ™[›İÊ
+BˆYˆ›İÈˆ™]\›ˆ›Û™Bˆ][HHÙ[‹X›Kš][J›İËJBˆ™]\›ˆ]
+][K^
+
+JHYˆ][H[ÙH›Û™B‚ˆYˆÜ[—ÜÙ[XİY
+Ù[ŠN‚ˆ]HÙ[‹—ÜÙ[XİYÜ]
+
+BˆYˆ›İ]ˆ™]\›‚ˆÙ[‹›XZ[‹›ØYÜ›Ú™XİÙš[J]
+B‚ˆYˆXÚØYÙWÜÙ[XİY
+Ù[ŠN‚ˆ›Ú™XİHÙ[‹—ÜÙ[XİYÜ]
+
+BˆYˆ›İ›Ú™Xİˆ™]\›‚ˆ\™Ù]ÈHQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹¹¢dùc!y/g9dàH‹İŠVÔ•×ÑTˆÈˆÜ›Ú™Xİœİ[_Kš\ŠK–’T
+
+‹š\
+HŠBˆYˆ›İ\™Ù]ˆ™]\›‚ˆ]HHœÛÛ‹›ØYÊ›Ú™Xİœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆØ[™Y]\ÈHÜ›Ú™Xİ]
+İŠ]K™Ù]
+œÛİ\˜ÙWÜÛÛ™ÈŠHÜˆˆŠJWBˆİ[WÙ\ˆH]
+İŠ]K™Ù]
+œİ[WÙ\ˆŠHÜˆˆŠJBˆYˆİ[WÙ\‹š\×Ù\Š
+NˆØ[™Y]\Ë™^[™
+›Üˆ[ˆİ[WÙ\‹œ™ÛØŠŠˆŠHYˆš\×Ùš[J
+JBˆÚ]š\š[K–š\š[J\™Ù]È‹š\š[K–’TÑQ“UQ
+H\È\˜Ú]™N‚ˆÙY[ˆHÙ]
+
+Bˆ›Üˆ][ˆØ[™Y]\Î‚ˆYˆ]š\×Ùš[J
+H[™İŠ]œ™\ÛÛ™J
+JH›İ[ˆÙY[‚ˆÙY[‹˜Y
+İŠ]œ™\ÛÛ™J
+JJBˆ\˜Ú]™KÜš]J]ˆÜ]œ\™[›˜[Y_KŞÜ]›˜[Y_HŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹/g9dày¢dùc!H‹ˆ¹mì¹å'ù¢$;ï&—İ\™Ù]HŠB‚ˆYˆ™]™X[Ù›Û\ŠÙ[ŠN‚ˆNˆÜËœİ\š[JİŠ“Ò‘PÕ×ÑTŠJBˆ^Ù\^Ù\[ÛˆÙX˜œ›İÜÙ\‹›Ü[Š“Ò‘PÕ×ÑT‹˜\×İ\šJ
+JB‚ˆYˆ™[[İ™WÜÙ[XİY
+Ù[ŠN‚ˆ]HÙ[‹—ÜÙ[XİYÜ]
+
+BˆYˆ›İ]ˆ™]\›‚ˆYˆSY\ÜØYÙP›Şœ]Y\İ[ÛŠÙ[‹¹éîúfi9méyê"È‹ˆ¹èk¹k¦¹éîúfi9méyê"ûï'×Ü]›˜[Y_HŠHOHSY\ÜØYÙP›Ş–Y\Îˆ™]\›‚ˆ˜\ÚH“Ò‘PÕ×ÑTˆÈ‹˜\Ú‚ˆ˜\Ú›ZÙ\Š^\İÛÚÏUYJBˆ\İ[˜][ÛˆH˜\ÚÈˆÚ[
+[YK[YJ
+J_WŞÜ]›˜[Y_H‚ˆÚ][›[İ™JİŠ]
+KİŠ\İ[˜][ÛŠJBˆÙ[‹œ™Yœ™\Ú
+
+B‚‚˜Û\ÜÈÛÛ[][š]TYÙJUÚYÙ]
+N‚ˆˆˆ‘\ÚİÜXØÛİ[[™™]HÛÛ[][š]HÛY[˜XÚÙYH[Øš[WØ\KœKˆˆˆ‚‚ˆÓÓ‘’Q×Ñ’SHHTÑWÑTˆÈ˜ÛÛ™šYÈˆÈ˜ÛÛ[][š]KšœÛÛˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹XZ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›XZ[ˆHXZ[‚ˆÙ[‹ÚÙ[ˆHˆ‚ˆÙ[‹\Ù\›˜[YHHˆ‚ˆÙ[‹›šXÚÛ˜[YHHˆ‚‚ˆ›ÛİHU›Ş^[İ]
+Ù[ŠBˆ]HHSX™[
+º-)¹cíÈÈ9a¡y­bùï©: bˆŠBˆ]KœÙ]Øš™Xİ˜[YJ”YÙU]HŠBˆ›Ûİ˜YÚYÙ]
+]JBˆ[HSX™[
+•Ú[™İÜøà P[™›ÚY9.#ˆSÔÈ9/oùå*9d#9. :-)¹cíùd£9ï©: b»ï&ù§#yb¨yfj9cëùhjùa¦yå-z!$yl`9gçùïdyg,9g`9¢%ˆÛİY›\™HÈ9gçùd#xà ˆŠBˆ[œÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ›Ûİ˜YÚYÙ]
+[
+B‚ˆXØÛİ[Ø›ŞHQÜ›İ\›Ş
+¹ªf9dlùa/ú-)¹cíÈŠBˆ›Ü›HHQÜšY^[İ]
+XØÛİ[Ø›Ş
+BˆÙ[‹œÙ\™\—ÙY]HS[™QY]
+š‹ËÌNL‹ŒMŒKŒLŠBˆÙ[‹œÙ\™\—ÙY]œÙ]XÙZÛ\•^
+¹/¢ùi ˆ‹Ëùå-z!$RT9¢%ˆÎ‹ËØ\K™^[\K˜ÛÛHŠBˆÙ[‹\Ù\—ÙY]HS[™QY]
+
+BˆÙ[‹\Ù\—ÙY]œÙ]XÙZÛ\•^
+º-)¹cíûï":!ìùl$HÈ9/c{ï"HŠBˆÙ[‹œ\ÜİÛÜ™ÙY]HS[™QY]
+
+BˆÙ[‹œ\ÜİÛÜ™ÙY]œÙ]XÚÓ[ÙJS[™QY]”\ÜİÛÜ™
+BˆÙ[‹œ\ÜİÛÜ™ÙY]œÙ]XÙZÛ\•^
+¹ká¹è {ï":!ìùl$Hˆ9/c{ï"HŠBˆÙ[‹›šXÚÛ˜[YWÙY]HS[™QY]
+
+BˆÙ[‹›šXÚÛ˜[YWÙY]œÙ]XÙZÛ\•^
+¹¦-yéì;ï"9¬ê9a£9¥í¹cëú`"{ï"HŠBˆÙÚ[—ØˆHT\Ú]ÛŠ¹ænùoeHŠBˆ™YÚ\İ\—ØˆHT\Ú]ÛŠ¹¬ê9a£ŠBˆ\WØ]Û—ØXØÙ[
+ÙÚ[—Ø‹œš[X\HŠBˆÙÚ[—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆÙ[‹˜]][XØ]J˜[ÙJJBˆ™YÚ\İ\—Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+[X™NˆÙ[‹˜]][XØ]JYJJBˆÙ[‹›ÙÛİ]ØˆHT\Ú]ÛŠº` 9aî¹ænùoeHŠBˆÙ[‹›ÙÛİ]Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›ÙÛİ]
+BˆÙ[‹˜XØÛİ[Üİ]\ÈHSX™[
+¹§*¹ænùoeHŠBˆÙ[‹˜XØÛİ[Üİ]\ËœÙ]Øš™Xİ˜[YJ”ÙXİ[Û’[ŠBˆ›Ü›K˜YÚYÙ]
+SX™[
+RH9§#yb¨yfjŠK
+Bˆ›Ü›K˜YÚYÙ]
+Ù[‹œÙ\™\—ÙY]KK
+Bˆ›Ü›K˜YÚYÙ]
+SX™[
+º-)¹cíÈŠKK
+Bˆ›Ü›K˜YÚYÙ]
+Ù[‹\Ù\—ÙY]KJBˆ›Ü›K˜YÚYÙ]
+SX™[
+¹ká¹è HŠKKŠBˆ›Ü›K˜YÚYÙ]
+Ù[‹œ\ÜİÛÜ™ÙY]KÊBˆ›Ü›K˜YÚYÙ]
+SX™[
+¹¦-yéìŠK‹
+Bˆ›Ü›K˜YÚYÙ]
+Ù[‹›šXÚÛ˜[YWÙY]‹JBˆ›Ü›K˜YÚYÙ]
+ÙÚ[—Ø‹‹ŠBˆ›Ü›K˜YÚYÙ]
+™YÚ\İ\—Ø‹‹ÊBˆ›Ü›K˜YÚYÙ]
+Ù[‹›ÙÛİ]Ø‹‹
+Bˆ›Ü›K˜YÚYÙ]
+Ù[‹˜XØÛİ[Üİ]\ËËKJBˆ›Ûİ˜YÚYÙ]
+XØÛİ[Ø›Ş
+B‚ˆÚ]Ø›ŞHQÜ›İ\›Ş
+ŒËŒ9a¡y­bùï©: bˆŠBˆÚ]Û^[İ]HU›Ş^[İ]
+Ú]Ø›Ş
+BˆÙ[‹›Y\ÜØYÙ\ÈHU^œ›İÜÙ\Š
+BˆÙ[‹›Y\ÜØYÙ\ËœÙ]XÙZÛ\•^
+¹ænùoeyd#¹cëù.#¹."yêëùa¡y­bùå*9¢-ù.©9­`xà ˆŠBˆÚ]Û^[İ]˜YÚYÙ]
+Ù[‹›Y\ÜØYÙ\ËJBˆÙ[™Ü›İÈHR›Ş^[İ]
+
+BˆÙ[‹›Y\ÜØYÙWÙY]HS[™QY]
+
+BˆÙ[‹›Y\ÜØYÙWÙY]œÙ]XÙZÛ\•^
+º/¤ùaiy­¢9 kûï#9§ 9i&ˆL9keÈŠBˆÙ[‹›Y\ÜØYÙWÙY]œ™]\›”™\ÜÙY˜ÛÛ›™Xİ
+Ù[‹œÙ[™ÛY\ÜØYÙJBˆ™Yœ™\ÚØˆHT\Ú]ÛŠ¹b-ù¥¬ŠBˆÙ[™ØˆHT\Ú]ÛŠ¹cäz` HŠBˆ\WØ]Û—ØXØÙ[
+Ù[™Ø‹œš[X\HŠBˆ™Yœ™\ÚØ‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œ™Yœ™\ÚÛY\ÜØYÙ\ÊBˆÙ[™Ø‹˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹œÙ[™ÛY\ÜØYÙJBˆÙ[™Ü›İË˜YÚYÙ]
+Ù[‹›Y\ÜØYÙWÙY]JBˆÙ[™Ü›İË˜YÚYÙ]
+™Yœ™\ÚØŠBˆÙ[™Ü›İË˜YÚYÙ]
+Ù[™ØŠBˆÚ]Û^[İ]˜Y^[İ]
+Ù[™Ü›İÊBˆ›Ûİ˜YÚYÙ]
+Ú]Ø›ŞJBˆÙ[‹—ÛØYØÛÛ™šYÊ
+B‚ˆYˆØ˜\ÙWİ\›
+Ù[ŠN‚ˆ™]\›ˆÙ[‹œÙ\™\—ÙY]^
+
+Kœİš\
+
+Kœœİš\
+‹ÈŠB‚ˆYˆÜ™\]Y\İ
+Ù[‹Y]Ù]^[ØYS›Û™JN‚ˆ˜\ÙHHÙ[‹—Ø˜\ÙWİ\›
+
+BˆYˆ›İ˜\ÙKœİ\İÚ]
+
+š‹ËÈ‹šÎ‹ËÈŠJN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹§#yb¨yfj9g,9g`9oázhnù.éH‹ËÈ9¢%ˆÎ‹ËÈ9o 9i-ŠBˆXY\œÈHÈXØÙ\ˆ˜\XØ][Û‹ÚœÛÛˆŸBˆYˆÙ[‹ÚÙ[‚ˆXY\œÖÈ]]Üš^˜][Ûˆ—HHˆ™X\™\ˆÜÙ[‹ÚÙ[ŸH‚ˆ]HH›Û™BˆYˆ^[ØY\È›İ›Û™N‚ˆ]HHœÛÛ‹™[\Ê^[ØY[œİ\™WØ\ØÚZOQ˜[ÙJK™[˜ÛÙJ]‹NŠBˆXY\œÖÈÛÛ[U\H—HH˜\XØ][Û‹ÚœÛÛÈÚ\œÙ]]]‹N‚ˆ™\]Y\İH\›X‹œ™\]Y\İ”™\]Y\İ
+˜\ÙH
+È]]OY]KXY\œÏZXY\œËY]Ù[Y]Ù
+BˆN‚ˆÚ]\›X‹œ™\]Y\İ\›Ü[Š™\]Y\İ[Y[İ]LMJH\È™\ÜÛœÙN‚ˆ™]\›ˆœÛÛ‹›ØYÊ™\ÜÛœÙKœ™XY
+
+K™XÛÙJ]‹NŠJBˆ^Ù\\›X‹™\œ›Ü‹’\œ›Üˆ\È^Î‚ˆN‚ˆ]Z[HœÛÛ‹›ØYÊ^Ëœ™XY
+
+K™XÛÙJ]‹NŠJK™Ù]
+™]Z[‹İŠ^ÊJBˆ^Ù\^Ù\[Û‚ˆ]Z[HİŠ^ÊBˆ˜Z\ÙH[[YQ\œ›ÜŠ]Z[
+Hœ›ÛH^Âˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ¹¥è9¬åz/ç¹£©y§#yb¨yfj;ï&Ù^ßHŠHœ›ÛH^Â‚ˆYˆÛØYØÛÛ™šYÊÙ[ŠN‚ˆN‚ˆ]HHœÛÛ‹›ØYÊÙ[‹ÓÓ‘’Q×Ñ’SKœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆ^Ù\^Ù\[Û‚ˆ]HHßBˆÙ[‹œÙ\™\—ÙY]œÙ]^
+İŠ]K™Ù]
+œÙ\™\ˆ‹Ù[‹œÙ\™\—ÙY]^
+
+JJJBˆÙ[‹ÚÙ[ˆHİŠ]K™Ù]
+ÚÙ[ˆ‹ˆŠJBˆÙ[‹\Ù\›˜[YHHİŠ]K™Ù]
+\Ù\›˜[YH‹ˆŠJBˆÙ[‹›šXÚÛ˜[YHHİŠ]K™Ù]
+›šXÚÛ˜[YH‹ˆŠJBˆÙ[‹\Ù\—ÙY]œÙ]^
+Ù[‹\Ù\›˜[YJBˆÙ[‹—İ\]WÜİ]\Ê
+BˆYˆÙ[‹ÚÙ[‚ˆU[Y\‹œÚ[™ÛTÚİ
+ÌÙ[‹œ™Yœ™\ÚÛY\ÜØYÙ\ÊB‚ˆYˆÜØ]™WØÛÛ™šYÊÙ[ŠN‚ˆÙ[‹ÓÓ‘’Q×Ñ’SKœ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ]ÛZX×İÜš]WÚœÛÛŠÙ[‹ÓÓ‘’Q×Ñ’SKÂˆœÙ\™\ˆˆÙ[‹—Ø˜\ÙWİ\›
+
+KÚÙ[ˆˆÙ[‹ÚÙ[‹ˆ\Ù\›˜[YHˆÙ[‹\Ù\›˜[YK›šXÚÛ˜[YHˆÙ[‹›šXÚÛ˜[YKˆJB‚ˆYˆİ\]WÜİ]\ÊÙ[ŠN‚ˆ^Hˆ¹mì¹ænùoe{ï&ÜÙ[‹›šXÚÛ˜[YHÜˆÙ[‹\Ù\›˜[Y_{ï"ÜÙ[‹\Ù\›˜[Y_{ï"HˆYˆÙ[‹ÚÙ[ˆ[ÙH¹§*¹ænùoeH‚ˆÙ[‹˜XØÛİ[Üİ]\ËœÙ]^
+^
+BˆÙ[‹›ÙÛİ]Ø‹œÙ][˜X›Y
+›ÛÛ
+Ù[‹ÚÙ[ŠJB‚ˆYˆ]][XØ]JÙ[‹™YÚ\İ\ŠN‚ˆ^[ØYHÂˆ\Ù\›˜[YHˆÙ[‹\Ù\—ÙY]^
+
+Kœİš\
+
+Kˆœ\ÜİÛÜ™ˆÙ[‹œ\ÜİÛÜ™ÙY]^
+
+Kˆ›šXÚÛ˜[YHˆÙ[‹›šXÚÛ˜[YWÙY]^
+
+Kœİš\
+
+KˆBˆN‚ˆ]HHÙ[‹—Ü™\]Y\İ
+”ÔÕ‹‹Ø\KİŒKØ]]Ü™YÚ\İ\ˆˆYˆ™YÚ\İ\ˆ[ÙH‹Ø\KİŒKØ]]ÛÙÚ[ˆ‹^[ØY
+BˆÙ[‹ÚÙ[ˆHİŠ]K™Ù]
+ÚÙ[ˆ‹ˆŠJBˆÙ[‹\Ù\›˜[YHHİŠ]K™Ù]
+\Ù\›˜[YH‹^[ØYÈ\Ù\›˜[YH—JJBˆÙ[‹›šXÚÛ˜[YHHİŠ]K™Ù]
+›šXÚÛ˜[YH‹Ù[‹\Ù\›˜[YJJBˆÙ[‹œ\ÜİÛÜ™ÙY]˜ÛX\Š
+BˆÙ[‹—ÜØ]™WØÛÛ™šYÊ
+BˆÙ[‹—İ\]WÜİ]\Ê
+BˆÙ[‹œ™Yœ™\ÚÛY\ÜØYÙ\Ê
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹º-)¹cíù¤ãy/g9i,z-)H‹İŠ^ÊJB‚ˆYˆÙÛİ]
+Ù[ŠN‚ˆÙ[‹ÚÙ[ˆHˆ‚ˆÙ[‹—ÜØ]™WØÛÛ™šYÊ
+BˆÙ[‹—İ\]WÜİ]\Ê
+BˆÙ[‹›Y\ÜØYÙ\Ë˜ÛX\Š
+B‚ˆYˆ™Yœ™\ÚÛY\ÜØYÙ\ÊÙ[ŠN‚ˆYˆ›İÙ[‹ÚÙ[‚ˆ™]\›‚ˆN‚ˆ]HHÙ[‹—Ü™\]Y\İ
+‘ÑU‹‹Ø\KİŒKØÛÛ[][š]KÛY\ÜØYÙ\ÏÛ[Z]LLŠBˆ›İÜÈH×Bˆ›Üˆ][H[ˆ]K™Ù]
+›Y\ÜØYÙ\È‹×JN‚ˆİ[\H[YKœİ™[YJ‰[KIY	R‰SH‹[YK›ØØ[[YJ›Ø]
+][K™Ù]
+˜Ü™X]YØ]‹
+JJJBˆ˜[YHH[™\ØØ\JİŠ][K™Ù]
+›šXÚÛ˜[YHŠHÜˆ][K™Ù]
+\Ù\›˜[YHŠHÜˆ¹å*9¢-ÈŠJBˆÛÛ[H[™\ØØ\JİŠ][K™Ù]
+˜ÛÛ[‹ˆŠJJKœ™\XÙJ—ˆ‹œˆŠBˆ›İÜË˜\[™
+ˆˆİ[OIØÛÛÜˆÑ‘LIÏÛ˜[Y_OØˆÜ[ˆİ[OIØÛÛÜˆĞNNMPM‰ÏÜİ[\OÜÜ[œØÛÛ[OÜˆŠBˆÙ[‹›Y\ÜØYÙ\ËœÙ][
+ˆ‹š›Ú[Š›İÜÊHÜˆ¹ï©:aã:/æ9¬¨y§"y­¢9 kûï#9§iycäyë+9. 9§hyd)øà ÜˆŠBˆ˜\ˆHÙ[‹›Y\ÜØYÙ\Ë™\XØ[ØÜ›Û˜\Š
+Bˆ˜\‹œÙ]˜[YJ˜\‹›X^[][J
+JBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹˜XØÛİ[Üİ]\ËœÙ]^
+ˆ¹ï©: b¹b-ù¥¬9i,z-){ï&Ù^ßHŠB‚ˆYˆÙ[™ÛY\ÜØYÙJÙ[ŠN‚ˆÛÛ[HÙ[‹›Y\ÜØYÙWÙY]^
+
+Kœİš\
+
+BˆYˆ›İÙ[‹ÚÙ[‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹£ä9é.ˆ‹º+íùab9ænùoez-)¹cíøà ˆŠBˆ™]\›‚ˆYˆ›İÛÛ[‚ˆ™]\›‚ˆN‚ˆÙ[‹—Ü™\]Y\İ
+”ÔÕ‹‹Ø\KİŒKØÛÛ[][š]KÛY\ÜØYÙ\È‹È˜ÛÛ[ˆÛÛ[ÎL_JBˆÙ[‹›Y\ÜØYÙWÙY]˜ÛX\Š
+BˆÙ[‹œ™Yœ™\ÚÛY\ÜØYÙ\Ê
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹cäz` yi,z-)H‹İŠ^ÊJB‚‚˜Û\ÜÈXZ[•Ú[™İÊSXZ[•Ú[™İÊN‚ˆYˆ×Ú[š]×ÊÙ[ŠN‚ˆİ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹œÙ]Ú[™İÕ]JˆĞTÓSQ_H0­ÈÕ‘T”ÒSÓŸHŠBˆÙ[‹œÙ]Ú[™İÒXÛÛŠRXÛÛŠ\ÜÙ]Ü]
+››İœšXWØ\ÚXÛÛ‹šXÛÈŠJJBˆÙ[‹œ™\Ú^™JML
+BˆÙ[‹œÙ]Z[š[][TÚ^™JLNÍŒ
+BˆÙ[‹œÛÛ™×Ùš[HH›Û™BˆÙ[‹œÙ[XİYÛXœ˜\Wİ˜XÚ×ÚYH›Û™BˆÙ[‹œÙ[XİYÛXœ˜\WÜÛİ\˜ÙHH››Û™H‚ˆÙ[‹œİ[WÙ\ˆH›Û™BˆÙ[‹˜˜\ÙWÜİ[WÙ\ˆH›Û™BˆÙ[‹›X\šÙ\œÈH×BˆÙ[‹˜[˜[\Ú\×Ü™\İ[HßBˆÙ[‹˜ÚÜ™İ[Y[[™HH×BˆÙ[‹œÙXİ[Û—İ[Y[[™HH×BˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[HßBˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÈHßBˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[ÈHÈHˆßKˆˆß_BˆÙ[‹˜\šX[Ø]Y[ÈHÈHˆˆ‹ˆˆˆŸBˆÙ[‹˜Xİ]™Wİ˜\šX[Hˆ‚ˆÙ[‹˜\œ˜[™Ù[Y[Ú\İÜHH×BˆÙ[‹[™×ÜİXÚÈH×BˆÙ[‹œ™Y×ÜİXÚÈH×BˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\ˆH›Û™BˆÙ[‹˜X—Üİ™X[HH›Û™BˆÙ[‹˜X—Ùš[\ÈHßBˆÙ[‹˜X—Øİ\œ™[İ˜\šX[HH‚ˆÙ[‹˜X—ÙØZ[ˆHÈHŒKŒˆŒKŒBˆÙ[‹˜X—Ùœ˜[YHHˆÙ[‹œÛİ[™›ÛÜ]Hˆ‚ˆÙ[‹›Y[ÙWÜ™Y™\™[˜ÙHH×BˆÙ[‹›\šX×Ü™Y™\™[˜ÙHH×BˆÙ[‹ÛÜšÙ\ˆH›Û™BˆÙ[‹™[™Ú[™HH][Tİ[Q[™Ú[™J
+BˆÙ[‹›Y]›Û›ÛYWÙ[™Ú[™HHY]›Û›ÛYQ[™Ú[™J
+BˆÙ[‹›ZYWİÛÜšÙ\ˆH›Û™BˆÙ[‹—Ø]]×Û™^Ùš\™YH˜[ÙBˆÙ[‹š\×Ü^Z[™×İZHH˜[ÙBˆÙ[‹—İ[Y[[™WÙ˜YÙÚ[™ÈH˜[ÙB‚ˆÙ[˜[HUÚYÙ]
+
+Bˆ›ÛİHR›Ş^[İ]
+Ù[˜[
+Bˆ›ÛİœÙ]ÛÛ[ÓX\™Ú[œÊMMMM
+Bˆ›ÛİœÙ]ÜXÚ[™ÊM
+B‚ˆÚYX˜\ˆHUÚYÙ]
+
+BˆÚYX˜\‹œÙ]š^YÚY
+Œ
+BˆÚYHHU›Ş^[İ]
+ÚYX˜\ŠBˆÚYKœÙ]ÛÛ[ÓX\™Ú[œÊ
+BˆÚYKœÙ]ÜXÚ[™ÊL
+B‚ˆœ˜[™HQÜ›İ\›Ş
+
+Bˆœ˜[™ÛHU›Ş^[İ]
+œ˜[™
+Bˆœ˜[™ÛœÙ]ÛÛ[ÓX\™Ú[œÊMMMM
+Bˆœ˜[™İÜHR›Ş^[İ]
+
+Bˆœ˜[™ÚXÛÛˆHSX™[
+
+Bˆ^HT^X\
+\ÜÙ]Ü]
+š]ÙZY\—Øœ˜[™ÛX\š×İŒÌŒ‹œ™ÈŠJBˆœ˜[™ÚXÛÛ‹œÙ]^X\
+^œØØ[Y
+NN]’ÙY\\ÜXİ˜][Ë]”Û[Ûİ˜[œÙ›Ü›X][ÛŠJBˆœ˜[™İ^HU›Ş^[İ]
+
+BˆHSX™[
+TÓSQJBˆœÙ]Øš™Xİ˜[YJœ˜[™]HŠBˆœÈHSX™[
+RH:gìù.d9méy/g9êæHŠBˆœËœÙ]Øš™Xİ˜[YJœ˜[™İXˆŠBˆœ˜[™İ^˜YÚYÙ]
+
+Bˆœ˜[™İ^˜YÚYÙ]
+œÊBˆœ˜[™İÜ˜YÚYÙ]
+œ˜[™ÚXÛÛŠBˆœ˜[™İÜ˜Y^[İ]
+œ˜[™İ^
+Bˆœ˜[™Û˜Y^[İ]
+œ˜[™İÜ
+Bˆ™\ˆHSX™[
+ˆ”\™›Ü›X[˜ÙH0­ÈÕ‘T”ÒSÓŸHŠBˆ™\‹œÙ]Øš™Xİ˜[YJœ˜[™İXˆŠBˆœ˜[™Û˜YÚYÙ]
+™\ŠBˆÚYK˜YÚYÙ]
+œ˜[™
+B‚ˆÙ[‹›˜]ˆHS\İÚYÙ]
+
+BˆÙ[‹›˜]‹œÙ]Øš™Xİ˜[YJ“˜]“\İŠBˆÙ[‹›˜]‹œÙ]XÛÛ”Ú^™JTÚ^™JÌÌ
+JBˆ˜]—Ú][\ÈHÂˆ
+¹îçù. :gìù.d9kï9aiH‹š[\ÜŠKˆ
+ºgìù.d9n¤È‹œ›Ú™XİÈŠKˆ
+RH9akz/j
+ùå-yd"y.åˆ‹œÜ]ŠKˆ
+RH9¥.yï%ˆÈ9.d:,,H‹˜\œ˜[™ÙHŠKˆ
+¹¯%9aîº,,zghˆ‹˜\œ˜[™ÙHŠKˆ
+¹.d9¢bù¯%9icù.+yoàÈ‹›]™HŠKˆ
+¹ã¬9g.¹¯%9aîˆ‹›]™HŠKˆ
+”Ù]\İ9«c9ceH‹œÙ]\İŠKˆ
+RH9«c:+ãH‹›ÚXÙHŠKˆ
+RH9«c9hì‹›ÚXÙHŠKˆ
+¹/g9dày.+yoàÈ‹œ›Ú™XİÈŠKˆ
+º-)¹cíÈÈ9a¡y­bùï©: bˆ‹œ›Ú™XİÈŠKˆ
+º+¯¹ïkˆ‹œÙ][™ÜÈŠKˆBˆ›Üˆ^XÛÈ[ˆ˜]—Ú][\Î‚ˆS\İÚYÙ]][JRXÛÛŠXÛÛ—Ü]
+XÛÊJK^Ù[‹›˜]ŠBˆÙ[‹›˜]‹œÙ]İ\œ™[›İÊŠBˆÚYK˜YÚYÙ]
+Ù[‹›˜]‹JB‚ˆÛÛ™×ØÛÛ^TQÜ›İ\›Ş
+¹aj9l`È9ææ9«c9¦ìˆŠBˆÛÛ™×ØÛÛ^Û^[İ]TU›Ş^[İ]
+ÛÛ™×ØÛÛ^
+BˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[TSX™[
+¹l&¹§*º`"y¢êy«c9¦ìˆŠBˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]Øš™Xİ˜[YJœ˜[™İXˆŠBˆÚÛÜÙWÛXœ˜\WÜÛÛ™ÏTT\Ú]ÛŠ¹.ã¹«c9¦ì¹n¤ú`"y¢êHŠBˆ\WØ]Û—ØXØÙ[
+ÚÛÜÙWÛXœ˜\WÜÛÛ™Ëœš[X\HŠBˆÚÛÜÙWÛXœ˜\WÜÛÛ™Ë˜ÛXÚÙY˜ÛÛ›™Xİ
+Ù[‹›Ü[—Ù×Ùš]™WÛXœ˜\JBˆÛÛ™×ØÛÛ^Û^[İ]˜YÚYÙ]
+Ù[‹˜İ\œ™[ÜÛÛ™×ÛX™[
+BˆÛÛ™×ØÛÛ^Û^[İ]˜YÚYÙ]
+ÚÛÜÙWÛXœ˜\WÜÛÛ™ÊBˆÚYK˜YÚYÙ]
+ÛÛ™×ØÛÛ^
+B‚ˆ›Ûİ\ˆHSX™[
+º+ªzgìù.d9b&ù/g9.#¹¯%9aî¹¦í:!ê¹å,HŠBˆ›Ûİ\‹œÙ][YÛ›Y[
+][YÛÙ[\ŠBˆ›Ûİ\‹œÙ]Øš™Xİ˜[YJœ˜[™İXˆŠBˆÚYK˜YÚYÙ]
+›Ûİ\ŠB‚ˆÙ[‹œİXÚÈHTİXÚÙYÚYÙ]
+
+BˆÙ[‹[š]™\œØ[Ú[\ÜH[š]™\œØ[[\ÜYÙJÙ[ŠBˆÙ[‹›]\ÚX×ÛXœ˜\HH]\ÚXÓXœ˜\TYÙJÙ[ŠBˆÙ[‹œİY[ÈHİY[ÔYÙJÙ[ŠBˆÙ[‹˜\œ˜[™Ù[Y[H\œ˜[™Ù[Y[ØÛÜ™TYÙJÙ[ŠBˆÙ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙHHØÛÜ™T\™›Ü›X[˜ÙTYÙJÙ[ŠBˆÙ[‹š[œİ[Y[Ù^\šY[˜ÙHH[œİ[Y[^\šY[˜ÙTYÙJÙ[ŠBˆÙ[‹›]™HH]™TYÙJÙ[ŠBˆÙ[‹›]™WÜ›ÈH]™T›ÔYÙJÙ[ŠBˆÙ[‹œÙ]\İHÙ]\İYÙJÙ[ŠBˆÙ[‹›\šXÜ×ÜİY[ÈH\šXÜÔİY[ÔYÙJÙ[ŠBˆÙ[‹›ÚXÙWÛXˆH›ÚXÙSX”YÙJÙ[ŠBˆÙ[‹ÛÜšÜ×ØÙ[\ˆHÛÜšÜĞÙ[\”YÙJÙ[ŠBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹[š]™\œØ[Ú[\Ü
+BˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹›]\ÚX×ÛXœ˜\JBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹œİY[ÊBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹˜\œ˜[™Ù[Y[
+BˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹œØÛÜ™WÜ\™›Ü›X[˜ÙJBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹š[œİ[Y[Ù^\šY[˜ÙJBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹›]™WÜ›ÊBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹œÙ]\İ
+BˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹›\šXÜ×ÜİY[ÊBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹›ÚXÙWÛXŠBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹ÛÜšÜ×ØÙ[\ŠBˆÙ[‹˜ÛÛ[][š]HHÛÛ[][š]TYÙJÙ[ŠBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹˜ÛÛ[][š]JBˆÙ[‹œÙ][™Ü×ÜYÙHHÙ][™ÜÔYÙJÙ[ŠBˆÙ[‹œİXÚË˜YÚYÙ]
+Ù[‹œÙ][™Ü×ÜYÙJBˆÙ[‹›˜]‹˜İ\œ™[›İĞÚ[™ÙY˜ÛÛ›™Xİ
+Ù[‹—ÛÛ—Û˜]—ØÚ[™ÙY
+BˆÙ[‹—ÛÛ—Û˜]—ØÚ[™ÙY
+Ù[‹›˜]‹˜İ\œ™[›İÊ
+JB‚ˆ›Ûİ˜YÚYÙ]
+ÚYX˜\ŠBˆ›Ûİ˜YÚYÙ]
+Ù[‹œİXÚËJBˆÙ[‹œÙ]Ù[˜[ÚYÙ]
+Ù[˜[
+BˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹l,yîêˆ0­ÈĞTÓSQ_HÕ‘T”ÒSÓŸHŠBˆU[Y\‹œÚ[™ÛTÚİ
+ÌÙ[‹œ™\İÜ™WÛ]™WÜÙ\ÜÚ[ÛŠBˆU[Y\‹œÚ[™ÛTÚİ
+LÙ[‹œ™Yœ™\ÚÜÛX\Ø\œ˜[™Ù\—Üİ[[X\JB‚ˆÙ[‹[Y\ˆHU[Y\ŠÙ[ŠBˆÙ[‹[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹\]Wİ[Y[[™JBˆÙ[‹[Y\‹œİ\
+Œ
+B‚ˆÙ[‹œÙ\ÜÚ[Û—İ[Y\ˆHU[Y\ŠÙ[ŠBˆÙ[‹œÙ\ÜÚ[Û—İ[Y\‹[Y[İ]˜ÛÛ›™Xİ
+Ù[‹œØ]™WÛ]™WÜÙ\ÜÚ[ÛŠBˆÙ[‹œÙ\ÜÚ[Û—İ[Y\‹œİ\
+L
+B‚ˆN‚ˆÙ[‹œÙ]İ[TÚY]
+]
+\ÜÙ]Ü]
+[YKœ\ÜÈŠJKœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚‚ˆYˆÛÛ—Û˜]—ØÚ[™ÙY
+Ù[‹[™^
+N‚ˆÙ[‹œİXÚËœÙ]İ\œ™[[™^
+[™^
+BˆYˆ[™^[ˆÌ‹ËK‹ËKLH[™›İÙ[‹œÛÛ™×Ùš[N‚ˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJº+íùab9à®yaîùmé¹/©ø &9.ã¹«c9¦ì¹n¤ú`"y¢êx &{ï#:`"y¢êHÈ9ææ9«c9¦ìˆŠB‚ˆYˆÜ[—Ù×Ùš]™WÛXœ˜\JÙ[ŠN‚ˆÙ[‹›˜]‹œÙ]İ\œ™[›İÊJBˆÙ[‹›]\ÚX×ÛXœ˜\K™YKœÙ]›Øİ\Ê
+BˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJº+íù£"y«c9¢bùleyo 9«c9¦ì»ï#9cã9aîù«c9¦ì¹d#¹clùcëù/¦ùmé¹/©ù¢`9§"yb§ú ïyalyd#9i!9ä!ˆŠB‚ˆYˆØYÛXœ˜\Wİ˜XÚÊÙ[‹˜XÚ×ÚY
+N‚ˆÛÛ\Ù[‹›]\ÚX×ÛXœ˜\K—ÙŠ
+Bˆ›İÏXÛÛ‹™^Xİ]J”ÑSPÕ
+ˆ”“ÓH˜XÚÜÈÒT‘HYOÈ‹
+[
+˜XÚ×ÚY
+K
+JK™™]ÚÛ™J
+BˆÛÛ‹˜ÛÜÙJ
+BˆYˆ›İ›İÎ‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹«c9¦ì¹n¤È‹¹¢o¹.#yb,:/æzi¥¹«c9¦ì»ï#:+íúaãy¥¬9¢jù£ãÈÈ9ææ9«c9¦ì¹n¤øà ˆŠBˆ™]\›‚ˆ]T]
+›İÖÈÛÜšÚ[™×Ü]—HÜˆ›İÖÈœÛİ\˜ÙWÜ]—HÜˆˆŠBˆYˆ›İ]™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹«c9¦ì¹n¤È‹ˆ¹«c9¦ì¹¥¡ù.í¹.#ykf9g*;ï&—Ü]HŠBˆ™]\›‚ˆÙ[‹›ØYÚ[\ÜYİÛÜšÚ[™×Ùš[J]Xœ˜\Wİ˜XÚ×ÚYZ[
+˜XÚ×ÚY
+JBˆ\\İXØ][Ù×Ø\\İÛ˜[YJXİ
+›İÊJBˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]^
+ˆØ\\İWÜ›İÖÉİ]I×_HŠBˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹odùbcHÈ9ææ9«c9¦ì»ï&Ø\\İHHÜ›İÖÉİ]I×_HŠB‚ˆYˆØYÜÙ\™\—ÛXœ˜\Wİ˜XÚÊÙ[‹˜XÚ×ÚY›İÏS›Û™JN‚ˆ›İÈHXİ
+›İÈÜˆÙ[‹›]\ÚX×ÛXœ˜\Kœ™[[İWÜ›İÜË™Ù]
+[
+˜XÚ×ÚY
+JHÜˆßJBˆYˆ›İ›İÎ‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹§#yb¨yfj9¦ì¹n¤È‹¹¢o¹.#yb,:/æzi¥¹§#yb¨yfj9«c9¦ì»ï#:+íùb-ù¥¬9¦ì¹n¤øà ˆŠBˆ™]\›‚ˆ]Y[×İ\›HİŠ›İË™Ù]
+˜]Y[×İ\›ŠHÜˆˆŠBˆYˆ›İ]Y[×İ\›‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹§#yb¨yfj9¦ì¹n¤È‹¹§#yb¨yfj9§*º/å9fç¹«c9¦ìºgìúh¤yg,9g`8à ˆŠBˆ™]\›‚ˆ›Ü›X]Û˜[YHHİŠ›İË™Ù]
+™›Ü›X]ŠHÜˆ›\ÈŠK›İÙ\Š
+K›İš\
+‹ˆŠBˆYˆ›Ü›X]Û˜[YH›İ[ˆÈ›\È‹Ø]ˆ‹™›XÈ‹›MH‹˜XXÈ‹›ÙÙÈ‹›Ü\È‹ÛXH‹˜ZY™ˆ‹˜ZYˆ‹˜[XÈŸN‚ˆ›Ü›X]Û˜[YHH›\È‚ˆ\\İHİŠ›İË™Ù]
+˜\\İŠHÜˆ¹§*¹çéy«c9¢bÈŠBˆ]HHİŠ›İË™Ù]
+]HŠHÜˆˆ¹§#yb¨yfj9«c9¦ì—Şİ˜XÚ×ÚYHŠBˆØXÚWÙ\ˆHTÑWÑTˆÈ›Xœ˜\HˆÈœÙ\™\—ØØXÚH‚ˆØXÚWÜ]HØXÚWÙ\ˆÈˆÚ[
+˜XÚ×ÚY
+_WŞÜØY™WÙš[WÜİ[J\\İ
+_WŞÜØY™WÙš[WÜİ[J]J_KÙ›Ü›X]Û˜[Y_H‚ˆN‚ˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹«hùg*9.ã¹§#yb¨yfj9b¨:/o{ï&Ø\\İHHİ]_HŠBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆYˆ›İØXÚWÜ]š\×Ùš[J
+HÜˆØXÚWÜ]œİ]
+
+KœİÜÚ^™HOH‚ˆÙ[‹›]\ÚX×ÛXœ˜\K—ÜÙ\™\—ØÛY[
+[Y[İ]LLŒ
+K™İÛ›ØY
+]Y[×İ\›ØXÚWÜ]
+Bˆ\šXÜ×İ\›HİŠ›İË™Ù]
+›\šXÜ×İ\›ŠHÜˆˆŠBˆ\šXÜ×Ü]HØXÚWÜ]Ú]ÜİY™š^
+‹›˜ÈŠBˆYˆ\šXÜ×İ\›[™
+›İ\šXÜ×Ü]š\×Ùš[J
+HÜˆ\šXÜ×Ü]œİ]
+
+KœİÜÚ^™HOH
+N‚ˆÙ[‹›]\ÚX×ÛXœ˜\K—ÜÙ\™\—ØÛY[
+[Y[İ]MŒ
+K™İÛ›ØY
+\šXÜ×İ\›\šXÜ×Ü]
+BˆÙ[‹›ØYÚ[\ÜYİÛÜšÚ[™×Ùš[JØXÚWÜ]Xœ˜\Wİ˜XÚ×ÚYZ[
+˜XÚ×ÚY
+JBˆÙ[‹œÙ[XİYÛXœ˜\WÜÛİ\˜ÙHHœÙ\™\ˆ‚ˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]^
+ˆ¹§#yb¨yfj0­ÈØ\\İWİ]_HŠBˆ\Y˜Xİİ\›ÏYXİ
+›İË™Ù]
+˜\Y˜XİÈŠHÜˆßJBˆÙ[‹œÙ[XİYÜÙ\™\—Ø\Y˜XİÏX\Y˜Xİİ\›ÂˆYˆ\Y˜Xİİ\›Î‚ˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹«c9¦ì¹mì¹¢dùo ;ï#9«hùg*9d#¹cì9ï$ùkfRH9¢$9§§;ï&Ø\\İHHİ]_HŠBˆÛÜšÙ\TÙ\™\\Y˜XİØXÚUÛÜšÙ\ŠˆÙ[‹›]\ÚX×ÛXœ˜\K—ÜÙ\™\—ØÛY[
+[Y[İ]LN
+K\Y˜Xİİ\›ËˆØXÚWÙ\‹ÙˆÚ[
+˜XÚ×ÚY
+_WØ\Y˜XİÈ‹ˆ
+BˆYˆ›İ\Ø]ŠÙ[‹œÙ\™\—Ø\Y˜XİİÛÜšÙ\œÈŠN‚ˆÙ[‹œÙ\™\—Ø\Y˜XİİÛÜšÙ\œÏV×BˆÙ[‹œÙ\™\—Ø\Y˜XİİÛÜšÙ\œË˜\[™
+ÛÜšÙ\ŠBˆÛÜšÙ\‹™Û™K˜ÛÛ›™Xİ
+[X™Hš[\Ë›Û\XØXÚWÙ\‹ÙˆÚ[
+˜XÚ×ÚY
+_WØ\Y˜XİÈˆÙ[‹—ÜÙ\™\—Ø\Y˜Xİ×Ü™XYJ›Û\‹š[\ÊJBˆÛÜšÙ\‹™˜Z[Y˜ÛÛ›™Xİ
+[X™H\œ›ÜˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹«c9¦ì¹cëù¤«y¥/»ï#RH9¢$9§§9d#¹cì9ï$ùkf9i,z-){ï&Ù\œ›ÜŸHŠJBˆÛÜšÙ\‹™š[š\ÚY˜ÛÛ›™Xİ
+[X™Hİ\œ™[]ÛÜšÙ\ˆÙ[‹—Ü™[X\ÙWÜÙ\™\—Ø\Y˜XİİÛÜšÙ\Šİ\œ™[
+JBˆÛÜšÙ\‹œİ\
+
+Bˆ[ÙN‚ˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹odùbcy§#yb¨yfj9«c9¦ì»ï&Ø\\İHHİ]_H0­È9ëbyo¡HRH:h¡9i!9ä!ˆŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹§#yb¨yfj9«c9¦ì¹b¨:/oyi,z-)H‹İŠ^ÊJB‚ˆYˆÜÙ\™\—Ø\Y˜Xİ×Ü™XYJÙ[‹›Û\‹š[\ÊN‚ˆ›Û\T]
+›Û\ŠBˆÙ[‹œÙ[XİYÜÙ\™\—Ø\Y˜XİÏYXİ
+š[\ÈÜˆßJBˆYˆ[
+
+›Û\‹ÙˆÛ˜[Y_KØ]ˆŠKš\×Ùš[J
+H›Üˆ˜[YH[ˆ
+ˆ›ØØ[È‹™[\È‹˜˜\ÜÈ‹™İZ]\ˆ‹™[XİšX×ÙİZ]\ˆ‹œX[›È‹›İ\ˆ‚ˆ
+JN‚ˆÙ[‹œİ[WÙ\Y›Û\‚ˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJ¹§#yb¨yfjRH9¢$9§§9mì¹ï$ùkf;ï&¹. ú/j8à y«c:+ãyd£9.d:,,ycëù.éyæí9£©y/oùå*ŠB‚ˆYˆÜ™[X\ÙWÜÙ\™\—Ø\Y˜XİİÛÜšÙ\ŠÙ[‹ÛÜšÙ\ŠN‚ˆYˆÛÜšÙ\ˆ[ˆÙ]]ŠÙ[‹œÙ\™\—Ø\Y˜XİİÛÜšÙ\œÈ‹×JN‚ˆÙ[‹œÙ\™\—Ø\Y˜XİİÛÜšÙ\œËœ™[[İ™JÛÜšÙ\ŠBˆÛÜšÙ\‹™[]S]\Š
+B‚ˆYˆØYÚ[\ÜYİÛÜšÚ[™×Ùš[JÙ[‹]Xœ˜\Wİ˜XÚ×ÚYS›Û™JN‚ˆT]
+]
+BˆYˆ›İ™^\İÊ
+N‚ˆ™]\›‚ˆÙ[‹œÛÛ™×Ùš[O\İŠ
+BˆÙ[‹œÙ[XİYÛXœ˜\Wİ˜XÚ×ÚY[Xœ˜\Wİ˜XÚ×ÚYˆYˆXœ˜\Wİ˜XÚ×ÚY\È›Û™N‚ˆÙ[‹œÙ[XİYÛXœ˜\WÜÛİ\˜ÙOH›ØØ[İ\İ‚ˆÙ[‹œİ[WÙ\S›Û™BˆÙ[‹™[™Ú[™K˜ÛÜÙJ
+BˆÙ[‹œİY[Ë™š[WÛX™[œÙ]^
+›˜[YJBˆYˆ\Ø]ŠÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[ŠH[™Xœ˜\Wİ˜XÚ×ÚY\È›Û™N‚ˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]^
+›˜[YJBˆÙ[‹—ÛØYÜÛÛ™×Û\šXÜÊ
+BˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[œÛÛ™×ÛX™[œÙ]^
+›˜[YJBˆÙ[‹˜\œ˜[™Ù[Y[˜[˜[\Ú\×Üİ]\ËœÙ]^
+¹mì¹.ã¹îçù. 9kï9aiy.+yoàú/oyai{ï#9ëbyo¡yb!¹§¤ŠBˆÙ[‹›ØYÛ]™WÜ™\Ù]Ùš[J
+BˆÙ[‹›˜]‹œÙ]İ\œ™[›İÊŠB‚ˆYˆ[\ÜÜÛÛ™ÊÙ[ŠN‚ˆÈHQš[QX[ÙË™Ù]Ü[‘š[S˜[YJˆÙ[‹¹kï9aiy«c9¦ìˆ‹ˆ‹ºgìúh¤H
+
+‹›\È
+‹Ø]ˆ
+‹™›XÈ
+‹›MH
+‹˜XXÊH‚ˆ
+BˆYˆ›İ‚ˆ™]\›‚ˆÙ[‹œÛÛ™×Ùš[HHˆÙ[‹œÙ[XİYÛXœ˜\Wİ˜XÚ×ÚYH›Û™BˆÙ[‹œÙ[XİYÛXœ˜\WÜÛİ\˜ÙHH›ØØ[İ\İ‚ˆYˆ\Ø]ŠÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[ŠN‚ˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]^
+]
+
+K›˜[YJBˆÙ[‹œİ[WÙ\ˆH›Û™BˆÙ[‹œİÜİ˜\šX[Ü™]šY]Ê
+BˆÙ[‹œİÜØX—Ú[œİ[Ü™]šY]Ê
+BˆÙ[‹›Y]›Û›ÛYWÙ[™Ú[™KœİÜ
+
+BˆYˆÙ[‹›ZYWİÛÜšÙ\‚ˆÙ[‹›ZYWİÛÜšÙ\‹œİÜ
+
+BˆÙ[‹›ZYWİÛÜšÙ\‹ØZ]
+Ì
+BˆÙ[‹™[™Ú[™K˜ÛÜÙJ
+BˆÙ[‹œİY[Ë™š[WÛX™[œÙ]^
+]
+
+K›˜[YJBˆÙ[‹—ÛØYÜÛÛ™×Û\šXÜÊ]
+
+JBˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[œÛÛ™×ÛX™[œÙ]^
+]
+
+K›˜[YJBˆÙ[‹˜\œ˜[™Ù[Y[˜[˜[\Ú\×Üİ]\ËœÙ]^
+¹mì¹kï9aiy«c9¦ì»ï#9ëbyo¡yd£9o)‹ù.d:,,yb!¹§¤ŠBˆÙ[‹›ØYÛ]™WÜ™\Ù]Ùš[J
+BˆÙ[‹œİY[Ë›ÙËœÙ]^
+¹«c9¦ì¹mì¹kï9aixà ¹à®yaîø 'RH9akz/j9b!¹é®È
+È9å-yd"y.å¹.£9«(yb!¹é®ø 'xà ˆŠBˆÙ[‹œİY[Ë›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œİY[ËœÜ]Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œİY[Ë›[Ù[Üİ]\ËœÙ]^
+¹ëbyo¡y¨à9­bÈRH9ª(yg¢ÈŠBˆÙ[‹œİY[ËœÜ]Üİ]\ËœÙ]^
+¹ëbyo¡yo 9iâÈŠB‚ˆYˆİ\ÜÙ\\˜][ÛŠÙ[ŠN‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9kï9aiy«c9¦ì¸à ˆŠBˆ™]\›‚ˆYˆÙ[‹ÛÜšÙ\ˆ[™Ù[‹ÛÜšÙ\‹š\Ô[›š[™Ê
+N‚ˆ™]\›‚ˆÙ[‹œİÜ
+
+BˆÙ[‹œİY[Ë˜—ÜÜ]œÙ][˜X›Y
+˜[ÙJBˆÙ[‹œİY[Ë›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹œİY[ËœÜ]Ü›ÙÜ™\ÜËœÙ]˜[™ÙJL
+BˆÙ[‹œİY[Ë›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œİY[ËœÜ]Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œİY[Ë›ÙËœÙ]^
+¹«hùg*9aá¹i!ÈRH9akz/j9ª(yg¢ù.#¹å-yd"y.å¹.£9«(yb!¹é®Ë‹‹ˆŠBˆÙ[‹ÛÜšÙ\ˆHÙ\\˜][Û•ÛÜšÙ\ŠÙ[‹œÛÛ™×Ùš[JBˆÙ[‹ÛÜšÙ\‹›ÙË˜ÛÛ›™Xİ
+Ù[‹›Û—ÜÜ]ÛÙÊBˆÙ[‹ÛÜšÙ\‹›[Ù[Ü›ÙÜ™\ÜË˜ÛÛ›™Xİ
+Ù[‹›Û—Û[Ù[Ü›ÙÜ™\ÜÊBˆÙ[‹ÛÜšÙ\‹œÙ\\˜][Û—Ü›ÙÜ™\ÜË˜ÛÛ›™Xİ
+Ù[‹›Û—ÜÙ\\˜][Û—Ü›ÙÜ™\ÜÊBˆÙ[‹ÛÜšÙ\‹™Û™K˜ÛÛ›™Xİ
+Ù[‹›Û—ÜÜ]ÙÛ™JBˆÙ[‹ÛÜšÙ\‹™˜Z[Y˜ÛÛ›™Xİ
+Ù[‹›Û—ÜÜ]Ù˜Z[Y
+BˆÙ[‹ÛÜšÙ\‹œİ\
+
+B‚ˆYˆÛ—Û[Ù[Ü›ÙÜ™\ÜÊÙ[‹˜[YK^
+N‚ˆÙ[‹œİY[Ë›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[YJX^
+Z[ŠL[
+˜[YJJJJBˆÙ[‹œİY[Ë›[Ù[Üİ]\ËœÙ]^
+^
+B‚ˆYˆÛ—ÜÙ\\˜][Û—Ü›ÙÜ™\ÜÊÙ[‹˜[YK^
+N‚ˆÙ[‹œİY[ËœÜ]Ü›ÙÜ™\ÜËœÙ]˜[YJX^
+Z[ŠL[
+˜[YJJJJBˆÙ[‹œİY[ËœÜ]Üİ]\ËœÙ]^
+^
+B‚ˆYˆÛ—ÜÜ]ÛÙÊÙ[‹^
+N‚ˆÙ[‹œİY[Ë›ÙËœÙ]^
+^ËML—JB‚ˆYˆÛ—ÜÜ]ÙÛ™JÙ[‹İ[WÙ\ŠN‚ˆÙ[‹œİY[Ë›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹œİY[ËœÜ]Ü›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹œİY[ËœÜ]Üİ]\ËœÙ]^
+¹gî¹è`9akz/j9k£9¢$0­È9å-yd"y.åº/j9£"z+á¹b*ùîäù§§:/oyaiHŠBˆÙ[‹œİY[Ë˜—ÜÜ]œÙ][˜X›Y
+YJBˆÙ[‹œİ[WÙ\ˆH]
+İ[WÙ\ŠBˆÙ[‹˜˜\ÙWÜİ[WÙ\ˆH]
+İ[WÙ\ŠBˆN‚ˆÙ[‹™[™Ú[™K›ØY
+Ù[‹œİ[WÙ\ŠBˆÙ[‹›ØYİØ]™Y›Ü›WÚY—Ü™XYJ
+BˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+Bˆ[XİšXÈHÙ[‹œİ[WÙ\ˆÈ™[XİšX×ÙİZ]\‹Ø]ˆ‚ˆÙ[‹œİY[Ë›ÙËœÙ]^
+ˆˆ¹b!º/j9k£9¢$;ï&ÜÙ[‹œİ[WÙ\ŸWˆ‚ˆ
+È
+¹mìº/oyaiyâë9êâùå-yd"y.åº/j8à ˆˆYˆ[XİšXË™^\İÊ
+H[ÙH¹å-yd"y.åº/j9ëbyo¡y.£9«(z+á¹b*ûï#9§*¹/*º`(9ênºgìúh¤xà ˆŠBˆ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹k£9¢$‹RH9b!º/j9k£9¢$;ï#9cëù.éz/æú(c9i&º/j]]KÔÛÛÈ9d£9ã¬9g.¹¤«y¥/¸à ˆŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹b¨:/oyi,z-)H‹İŠJJB‚ˆYˆÛ—ÜÜ]Ù˜Z[Y
+Ù[‹^
+N‚ˆÙ[‹œİY[Ë›[Ù[Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œİY[ËœÜ]Ü›ÙÜ™\ÜËœÙ]˜[YJ
+BˆÙ[‹œİY[Ë›[Ù[Üİ]\ËœÙ]^
+¹ëbyo¡y¨à9­bÈRH9ª(yg¢ÈŠBˆÙ[‹œİY[ËœÜ]Üİ]\ËœÙ]^
+¹ëbyo¡yo 9iâÈŠBˆÙ[‹œİY[Ë˜—ÜÜ]œÙ][˜X›Y
+YJBˆÙ[‹œİY[Ë›ÙËœÙ]^
+¹b!º/j9i,z-)xà ˆŠBˆSY\ÜØYÙP›Ş˜Üš]XØ[
+ˆÙ[‹RH9b!º/j9i,z-)H‹ˆ^
+È——¹i ¹§§9¦+ùª(yg¢ù."ú/oyi,z-){ï#:+íù¨à9§éyïdyîç9d#ºaãz+å{ï&ùmì¹îãù."ú/oy¢$9b§ùæ¡9ª(yg¢ù/&º!ê¹bª9ï$ùkf;ï#9.#y/&ºaãyi#y."ú/oxà ˆ‚ˆ
+B‚ˆYˆŞ[˜×ÛZ^ØÛÛ›ÛÊÙ[ŠN‚ˆ›ÜˆÙ^K›İÈ[ˆÙ[‹œİY[Ëœ›İÜËš][\Ê
+N‚ˆÙ[‹™[™Ú[™K›]]VÚÙ^WHH›İË›]]Kš\ĞÚXÚÙY
+
+BˆÙ[‹™[™Ú[™KœÛÛÖÚÙ^WHH›İËœÛÛËš\ĞÚXÚÙY
+
+BˆÙ[‹™[™Ú[™K›Û[YVÚÙ^WHH›İË›Û[YK˜[YJ
+HÈLŒ‚ˆYˆ^WÜ]\ÙJÙ[ŠN‚ˆYˆ›İÙ[‹™[™Ú[™K™š[\Î‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9k£9¢$RH9akz/j9b!¹é®øà ˆŠBˆ™]\›‚ˆN‚ˆYˆÙ[‹š\×Ü^Z[™×İZH[™›İÙ[‹™[™Ú[™Kœ]\ÙY‚ˆÙ[‹™[™Ú[™Kœ]\ÙJ
+BˆÙ[‹š\×Ü^Z[™×İZHH˜[ÙBˆÙ[‹œİY[Ëœ^WØ‹œÙ]^
+¹¤«y¥/ˆŠBˆ[ÙN‚ˆÙ[‹—Ø]]×Û™^Ùš\™YH˜[ÙBˆÙ[‹™[™Ú[™Kœ™\İ[YJ
+BˆÙ[‹š\×Ü^Z[™×İZHHYBˆÙ[‹œİY[Ëœ^WØ‹œÙ]^
+¹¦ ¹`gŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹¤«y¥/¹i,z-)H‹İŠJJB‚ˆYˆİÜ
+Ù[ŠN‚ˆÙ[‹™[™Ú[™KœİÜ
+
+BˆÙ[‹š\×Ü^Z[™×İZHH˜[ÙBˆYˆ\Ø]ŠÙ[‹œİY[ÈŠN‚ˆÙ[‹œİY[Ëœ^WØ‹œÙ]^
+¹¤«y¥/ˆŠBˆÙ[‹œİY[Ë[Y[[™KœÙ]˜[YJ
+B‚ˆYˆ\]Wİ[Y[[™JÙ[ŠN‚ˆ\ˆHÙ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+BˆÜÈHÙ[‹™[™Ú[™KœÜÚ][Û—ÜÙXÛÛ™Ê
+BˆYˆ\ˆˆ[™›İÙ[‹—İ[Y[[™WÙ˜YÙÚ[™Î‚ˆÙ[‹œİY[Ë[Y[[™K˜›ØÚÔÚYÛ˜[ÊYJBˆÙ[‹œİY[Ë[Y[[™KœÙ]˜[YJ[
+Z[ŠKÜËÙ\ŠJŒL
+JBˆÙ[‹œİY[Ë[Y[[™K˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆYˆ›]
+ÊN‚ˆÈHX^
+[
+ÊJBˆ™]\›ˆˆÜËËÍŒŒ™NÜÉMŒŒ™H‚ˆÙ[‹œİY[Ë[YWÛX™[œÙ]^
+ˆÙ›]
+ÜÊ_HÈÙ›]
+\Š_HŠBˆYˆÙ[‹š\×Ü^Z[™×İZH[™›İÙ[‹™[™Ú[™Kœ^Z[™È[™›İÙ[‹™[™Ú[™Kœ]\ÙY‚ˆYˆ
+\Ø]ŠÙ[‹œÙ]\İŠH[™Ù[‹œÙ]\İ˜]]×Û™^š\ĞÚXÚÙY
+
+Bˆ[™›İÙ[‹—Ø]]×Û™^Ùš\™Y[™\ˆˆ[™ÜÈHX^
+\ˆHŒÍJJN‚ˆÙ[‹—Ø]]×Û™^Ùš\™YHYBˆU[Y\‹œÚ[™ÛTÚİ
+L[X™NˆÙ[‹˜Y˜[˜ÙWÜÙ]\İ
+K]]Ü^OUYJJBˆ[ÙN‚ˆÙ[‹—Ø]]×Û™^Ùš\™YH˜[ÙBˆÙ[‹š\×Ü^Z[™×İZHH˜[ÙBˆÙ[‹œİY[Ëœ^WØ‹œÙ]^
+¹¤«y¥/ˆŠB‚ˆYˆ™YÚ[—İ[Y[[™WÜÙYZÊÙ[ŠN‚ˆÙ[‹—İ[Y[[™WÙ˜YÙÚ[™ÈHYB‚ˆYˆ™]šY]×İ[Y[[™WÜÙYZÊÙ[‹˜[YJN‚ˆÙ[‹—İ[Y[[™WÙ˜YÙÚ[™ÈHYBˆ\ˆHÙ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+BˆYˆ\ˆH‚ˆ™]\›‚ˆ\™Ù]H\ˆ
+ˆX^
+Z[ŠL[
+˜[YJJJHÈLŒˆYˆ›]
+ÙXÛÛ™ÊN‚ˆÙXÛÛ™ÈHX^
+[
+ÙXÛÛ™ÊJBˆ™]\›ˆˆÜÙXÛÛ™ËËÍŒŒ™NÜÙXÛÛ™ÉMŒŒ™H‚ˆÙ[‹œİY[Ë[YWÛX™[œÙ]^
+ˆÙ›]
+\™Ù]
+_HÈÙ›]
+\Š_HŠB‚ˆYˆÙYZ×Ùœ›ÛWÜÛY\ŠÙ[ŠN‚ˆYˆ›İÙ[‹™[™Ú[™K™š[\Î‚ˆÙ[‹—İ[Y[[™WÙ˜YÙÚ[™ÈH˜[ÙBˆ™]\›‚ˆ˜][ÈHÙ[‹œİY[Ë[Y[[™K˜[YJ
+KÌLŒˆÙ[‹™[™Ú[™KœÙYZ×Ü˜][Ê˜][ÊBˆÙ[‹œİY[ËØ]™Y›Ü›KœÙ]ÜÜÚ][ÛŠ˜][ÊBˆÙ[‹—İ[Y[[™WÙ˜YÙÚ[™ÈH˜[ÙB‚ˆYˆ\WÛ]™WÜ™\Ù]
+Ù[‹]]YÚÙ^JN‚ˆ›ÜˆÙ^K›İÈ[ˆÙ[‹œİY[Ëœ›İÜËš][\Ê
+N‚ˆ›İËœÛÛËœÙ]ÚXÚÙY
+˜[ÙJBˆ›İË›]]KœÙ]ÚXÚÙY
+Ù^HOH]]YÚÙ^HYˆ]]YÚÙ^H[ÙH˜[ÙJBˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+Bˆ˜[Y\ÈHÂˆ™İZ]\ˆˆ¹§*9d"y.å¹¯%9icûï"9§*9d"y.åº/j9alúeë{ï"H‹ˆ™[XİšX×ÙİZ]\ˆˆ¹å-yd"y.å¹¯%9icûï"9å-yd"y.åº/j9alúeë{ï"H‹ˆœX[›Èˆºd¨¹ä-9o.ye,{ï":d¨¹ä-:/j9alúeë{ï"H‹ˆ™[\Èˆºo$ù¢bù¯%9aî»ï":o$ú/j9alúeë{ï"H‹ˆ˜˜\ÜÈˆº-'y¥«ù¯%9aî»ï":-'y¥«ú/j9alúeë{ï"H‹ˆ›ØØ[Èˆ¹î«ù/-9icËÒÕ»ï"9.®¹hì:/j9alúeë{ï"H‹ˆ›Û™Nˆ¹aj:`ê9 h¹i#H‚ˆBˆÙ[‹›]™Kœİ]\ËœÙ]^
+¹odùbczh¡:+¯»ï&ˆˆ
+È˜[Y\ÖÛ]]YÚÙ^WJB‚ˆYˆ\WÛ]™Wİ˜[œÜÜÙJÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹›]™WÜ›ÈŠN‚ˆ™]\›‚ˆYˆ›İÙ[‹˜˜\ÙWÜİ[WÙ\ˆ[™Ù[‹œİ[WÙ\‚ˆÙ[‹˜˜\ÙWÜİ[WÙ\T]
+Ù[‹œİ[WÙ\ŠBˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙKœÙ]˜[YJ[
+Ù[‹›]™WÜ›Ë˜[œÜÜÙK˜[YJ
+JJBˆÙ[‹™Ù[™\˜]Wİ˜[œÜÜÙYÜİ[\Ê
+B‚‚ˆYˆİ\ÛZYWİÛÜšÙ\ŠÙ[ŠN‚ˆYˆÙ[‹›ZYWİÛÜšÙ\ˆ[™Ù[‹›ZYWİÛÜšÙ\‹š\Ô[›š[™Ê
+N‚ˆ™]\›‚ˆÙ[‹›ZYWİÛÜšÙ\ˆHZYUÛÜšÙ\Š
+BˆÙ[‹›ZYWİÛÜšÙ\‹˜Xİ[Û‹˜ÛÛ›™Xİ
+Ù[‹š[™WÛZYWØXİ[ÛŠBˆÙ[‹›ZYWİÛÜšÙ\‹œİ]\Ë˜ÛÛ›™Xİ
+ˆ[X™HÎˆÙ[‹›]™WÜ›Ë›ZYWÜİ]\ËœÙ]^
+ÊHYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙH›Û™Bˆ
+BˆÙ[‹›ZYWİÛÜšÙ\‹œİ\
+
+B‚ˆYˆ[™WÛZYWØXİ[ÛŠÙ[‹Xİ[ÛŠN‚ˆYˆXİ[ÛˆOHœ^WÜ]\ÙH‚ˆÙ[‹œ^WÜ]\ÙJ
+Bˆ[YˆXİ[ÛˆOHœİÜ‚ˆÙ[‹œİÜ
+
+Bˆ[YˆXİ[ÛˆOH›™^‚ˆÙ[‹˜Y˜[˜ÙWÜÙ]\İ
+K]]Ü^OUYJBˆ[YˆXİ[ÛˆOHœ™]š[İ\È‚ˆÙ[‹˜Y˜[˜ÙWÜÙ]\İ
+LK]]Ü^OQ˜[ÙJB‚ˆYˆY˜[˜ÙWÜÙ]\İ
+Ù[‹[OLK]]Ü^OQ˜[ÙJN‚ˆYˆ›İ\Ø]ŠÙ[‹œÙ]\İŠHÜˆ›İÙ[‹œÙ]\İš][\Î‚ˆ™]\›‚ˆˆHÙ[‹œÙ]\İ˜İ\œ™[Ú[™^
+
+BˆYˆˆ‚ˆ\™Ù]Hˆ[ÙN‚ˆ\™Ù]Hˆ
+È[BˆYˆ\™Ù]Üˆ\™Ù]H[ŠÙ[‹œÙ]\İš][\ÊN‚ˆ™]\›‚ˆÙ[‹œİÜ
+
+BˆÙ[‹œÙ]\İœÙ[XİÚ[™^
+\™Ù]
+Bˆ][HHÙ[‹œÙ]\İš][\Öİ\™Ù]BˆÙ[‹œÛÛ™×Ùš[HH][VÈœ]—BˆÙ[‹—ÛØYÜÛÛ™×Û\šXÜÊ]
+Ù[‹œÛÛ™×Ùš[JJBˆÙ[‹œİY[Ë™š[WÛX™[œÙ]^
+]
+Ù[‹œÛÛ™×Ùš[JK›˜[YJB‚ˆÈ9/&9ab9i#yå*9mì¹îãùkf9g*9æ¡9akz/j9æë¹oexà ‚ˆØ[™Y]HHÕST×ÑTˆÈ]œ—Ú[]XÜ×ÍœÈˆÈ]
+Ù[‹œÛÛ™×Ùš[JKœİ[BˆYˆ›İØ[™Y]K™^\İÊ
+N‚ˆØ[™Y]HHÕST×ÑTˆÈš[]XÜ×ÍœÈˆÈ]
+Ù[‹œÛÛ™×Ùš[JKœİ[BˆYˆØ[™Y]K™^\İÊ
+N‚ˆN‚ˆÙ[‹œİ[WÙ\ˆHØ[™Y]BˆÙ[‹™[™Ú[™K›ØY
+Ø[™Y]JBˆÙ[‹›ØYİØ]™Y›Ü›WÚY—Ü™XYJ
+BˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+BˆYˆ]]Ü^N‚ˆU[Y\‹œÚ[™ÛTÚİ
+ÍLÙ[‹œ^WÜ]\ÙJBˆ™]\›‚ˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆÙ[‹›˜]‹œÙ]İ\œ™[›İÊŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹”Ù]\İ‹ˆˆ¹mì¹b!ù£h¹b,;ï&Ô]
+Ù[‹œÛÛ™×Ùš[JK›˜[Y_Wº+éy«c9¦ì¹l&¹¥è9cëùå*9akz/j9ï$ùkf;ï#:+íùab9¢iú(cRH9akz/j9b!¹é®øà ˆ‚ˆ
+B‚ˆYˆØ]™WÛ]™WÜÙ\ÜÚ[ÛŠÙ[ŠN‚ˆN‚ˆÙ[‹œØ]™WÛ]™WÜ™\Ù]Ùš[J
+Bˆ]HHÂˆ™\œÚ[Ûˆˆ‘T”ÒSÓ‹ˆœÛÛ™×Ùš[HˆÙ[‹œÛÛ™×Ùš[Kˆœİ[WÙ\ˆˆİŠÙ[‹œİ[WÙ\ŠHYˆÙ[‹œİ[WÙ\ˆ[ÙH›Û™KˆœÙ]\İˆÙ[‹œÙ]\İš][\ÈYˆ\Ø]ŠÙ[‹œÙ]\İŠH[ÙH×KˆœÙ]\İÚ[™^ˆÙ[‹œÙ]\İ˜İ\œ™[Ú[™^
+
+HYˆ\Ø]ŠÙ[‹œÙ]\İŠH[ÙHLKˆœÜÚ][Û—ÜÙXÛÛ™ÈˆÙ[‹™[™Ú[™KœÜÚ][Û—ÜÙXÛÛ™Ê
+Kˆ˜[œÜÜÙHˆÙ[‹›]™WÜ›Ë˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHˆœÜYYˆÙ[‹›]™WÜ›ËœÜYY˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHKŒˆBˆ]HTÑWÑTˆÈ\Ù\—Ù]HˆÈ›\İÛ]™WÜÙ\ÜÚ[Û‹šœÛÛˆ‚ˆ]œ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ]Üš]Wİ^
+œÛÛ‹™[\Ê]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆ™\İÜ™WÛ]™WÜÙ\ÜÚ[ÛŠÙ[ŠN‚ˆ]HTÑWÑTˆÈ\Ù\—Ù]HˆÈ›\İÛ]™WÜÙ\ÜÚ[Û‹šœÛÛˆ‚ˆYˆ›İ]™^\İÊ
+N‚ˆ™]\›‚ˆN‚ˆ]HHœÛÛ‹›ØYÊ]œ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆÛÛ™ÈHİŠ]K™Ù]
+œÛÛ™×Ùš[HŠHÜˆˆŠBˆYˆÛÛ™È[™]
+ÛÛ™ÊK™^\İÊ
+N‚ˆÙ[‹œÛÛ™×Ùš[HHÛÛ™ÂˆÙ[‹œÙ[XİYÛXœ˜\Wİ˜XÚ×ÚYH›Û™BˆÙ[‹œİY[Ë™š[WÛX™[œÙ]^
+]
+ÛÛ™ÊK›˜[YJBˆYˆ\Ø]ŠÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[ŠN‚ˆÙ[‹˜İ\œ™[ÜÛÛ™×ÛX™[œÙ]^
+]
+ÛÛ™ÊK›˜[YJBˆÙ[‹—ÛØYÜÛÛ™×Û\šXÜÊ]
+ÛÛ™ÊJBˆYˆ\Ø]ŠÙ[‹œÙ]\İŠN‚ˆÙ[‹œÙ]\İš][\ÈH]K™Ù]
+œÙ]\İ‹×JBˆÙ[‹œÙ]\İœ™Yœ™\Ú
+
+BˆYH[
+]K™Ù]
+œÙ]\İÚ[™^‹LJJBˆYˆYH‚ˆÙ[‹œÙ]\İœÙ[XİÚ[™^
+Y
+BˆYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠN‚ˆÙ[‹›]™WÜ›Ë˜[œÜÜÙKœÙ]˜[YJ[
+]K™Ù]
+˜[œÜÜÙH‹
+JJBˆÙ[‹›]™WÜ›ËœÜYYœÙ]˜[YJ›Ø]
+]K™Ù]
+œÜYY‹KŒ
+JJBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚‚ˆYˆÙ›Ü›X]İ[YJÙ[‹ÙXÛÛ™ÊN‚ˆÙXÛÛ™ÈHX^
+›Ø]
+ÙXÛÛ™ÈÜˆ
+JBˆHH[
+ÙXÛÛ™ÈËÈŒ
+BˆÈH[
+ÙXÛÛ™È	HŒ
+Bˆ™]\›ˆˆÛNŒ™NÜÎŒ™H‚‚ˆYˆİ˜[œÜÜÙWÛ›İWÛ˜[YJÙ[‹˜[YKÙ[Z]Û™\ÊN‚ˆ˜[Y\ÈHÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆ—Bˆ˜\ÙHHİŠ˜[YHÜˆÈŠKœ™\XÙJ¸¦kH‹˜ˆŠBˆ[X\Ù\ÈHÈ‘ˆˆÈÈ‹‘Xˆˆ‘È‹‘Øˆˆ‘ˆÈ‹Xˆˆ‘ÈÈ‹˜ˆˆHÈŸBˆ˜\ÙHH[X\Ù\Ë™Ù]
+˜\ÙK˜\ÙJBˆYˆ˜\ÙH›İ[ˆ˜[Y\Î‚ˆ™]\›ˆ˜\ÙBˆ™]\›ˆ˜[Y\ÖÊ˜[Y\Ëš[™^
+˜\ÙJJÚ[
+Ù[Z]Û™\ÊJILL—B‚ˆYˆİ˜[œÜÜÙWØÚÜ™
+Ù[‹ÚÜ™Ù[Z]Û™\ÊN‚ˆYˆ›İÚÜ™ÜˆÚÜ™OH“ˆ‚ˆ™]\›ˆÚÜ™ˆHH™K›X]Ú
+ˆ—ŠĞKQ×JÎˆßŠOÊJŠŠI‹ÚÜ™
+BˆYˆ›İN‚ˆ™]\›ˆÚÜ™ˆ™]\›ˆÙ[‹—İ˜[œÜÜÙWÛ›İWÛ˜[YJK™Ü›İ\
+JKÙ[Z]Û™\ÊH
+ÈK™Ü›İ\
+ŠB‚ˆYˆ\]Wİ\™Ù]ÚÙ^WÛX™[
+Ù[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆÙ^HHÙ[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+šÙ^H‹ˆŠHYˆÙ[‹˜[˜[\Ú\×Ü™\İ[[ÙHˆ‚ˆYˆ›İÙ^N‚ˆÙ[‹˜\œ˜[™Ù[Y[\™Ù]ÚÙ^KœÙ]^
+¹æë¹¨!ú, ûï&¸ %ŠBˆ™]\›‚ˆÙ[Z\ÈHÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+BˆÙ[‹˜\œ˜[™Ù[Y[\™Ù]ÚÙ^KœÙ]^
+¹æë¹¨!ú, ûï&ˆˆ
+ÈÙ[‹—İ˜[œÜÜÙWÛ›İWÛ˜[YJÙ^KÙ[Z\ÊJB‚ˆYˆ[˜[^™WÙ[ÜØÛÜ™JÙ[ŠN‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9kï9aiy«c9¦ì¸à ˆŠBˆ™]\›‚ˆN‚ˆ[\ÜXœ›ÜØBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJJBˆÙ[‹˜\œ˜[™Ù[Y[˜[˜[\Ú\×Üİ]\ËœÙ]^
+¹«hùg*:+îùcåºgìúh¤ynm¹¨à9­bú" ¹¢ãK‹‹ˆŠBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆKÜˆHXœ›ÜØK›ØY
+Ù[‹œÛÛ™×Ùš[KÜLŒŒL[Û›ÏUYJBˆÙ[‹—ÛØYÜÛÛ™×Û\šXÜÊ]
+Ù[‹œÛÛ™×Ùš[JK›Ø]
+Xœ›ÜØK™Ù]Ù\˜][ÛŠO^KÜ\ÜŠJJBˆ[\Ë™X]Ùœ˜[Y\ÈHXœ›ÜØK˜™X]˜™X]İ˜XÚÊO^KÜ\ÜŠBˆ[\×İ˜[H›Ø]
+œ˜\Ø\œ˜^J[\ÊKœ™\Ú\JLJVÌJBˆ™X]İ[Y\ÈHXœ›ÜØK™œ˜[Y\×İ×İ[YJ™X]Ùœ˜[Y\ËÜ\ÜŠBˆYˆ[Š™X]İ[Y\ÊH‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹§*¹¨à9­bùb,:-¬ùi'ú" ¹¢ã{ï#9¥è9¬åyå'ù¢$9.d:,,xà ˆŠBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJJBˆÚ›ÛXHHXœ›ÜØK™™X]\™K˜Ú›ÛXWØÜ]
+O^KÜ\ÜŠBˆ™X]ØÚ›ÛXHHXœ›ÜØK][œŞ[˜ÊÚ›ÛXK™X]Ùœ˜[Y\ËYÙÜ™YØ]O[œ›YYX[ŠB‚ˆ˜[Y\ÈHÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆ—BˆÚÜ™İ\\ÈHÂˆˆˆ
+Ì×KÌKŒÍJKˆ›Hˆ
+ÌË×KÌKŒÍJKˆÈˆ
+ÌËLKÌKŒ‹Ì‹ŒJKˆ›XZÈŠÌËLWKÌKŒ‹Ì‹NJKˆ›MÈˆ
+ÌËËLKÌKŒ‹Ì‹ŒJKˆœİ\ÍŠÌK×KÌKŒÌ—JKˆ™[Hˆ
+ÌË—KÌKŒÌJKˆBˆ[\]\ÏV×Bˆ›Üˆ›Ûİ[ˆ˜[™ÙJLŠN‚ˆ›ÜˆİY™š^
+[\˜[ËÙZYÚÊH[ˆÚÜ™İ\\Ëš][\Ê
+N‚ˆ[\[œ™\›ÜÊL‹\OY›Ø]
+Bˆ›Üˆ[\˜[ÙZYÚ[ˆš\
+[\˜[ËÙZYÚÊN‚ˆ[\Ê›Ûİ
+Ú[\˜[
+ILL—O]ÙZYÚˆ[\]\Ë˜\[™
+
+˜[Y\ÖÜ›ÛİJÜİY™š^[\
+JBˆÚÜ™ÏV×Bˆ›ÜˆH[ˆ˜[™ÙJ™X]ØÚ›ÛXKœÚ\VÌWJN‚ˆX™X]ØÚ›ÛXVÎ‹WK˜\İ\J›Ø]
+Bˆ›Ü›O[œ›[˜[Ë››Ü›JŠBˆYˆ›Ü›HYKN‚ˆÚÜ™Ë˜\[™
+“ˆŠBˆÛÛ[YBˆ]‹Û›Ü›Bˆ™\İJ“ˆ‹LYNJBˆ›ÜˆÛ˜[YK[\[ˆ[\]\Î‚ˆ][\Êœ›[˜[Ë››Ü›J[\
+JÌYKNJBˆØÛÜ™OY›Ø]
+œ™İ
+‹
+JBˆYˆØÛÜ™O˜™\İÌWN‚ˆ™\İJÛ˜[YKØÛÜ™JBˆÚÜ™Ë˜\[™
+™\İÌJB‚ˆ›ÜˆH[ˆ˜[™ÙJK[ŠÚÜ™ÊKLJN‚ˆYˆÚÜ™ÖÚKLWHOHÚÜ™ÖÚJÌWHOHÚÜ™ÖÚWN‚ˆÚÜ™ÖÚWOXÚÜ™ÖÚKLWB‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJMJBˆYX[—ØÚ›ÛXO[œ›YX[ŠÚ›ÛXK^\ÏLJBˆÙ^O[˜[Y\ÖÚ[
+œ˜\™ÛX^
+YX[—ØÚ›ÛXJJWBˆÙ[‹˜[˜[\Ú\×Ü™\İ[^È˜œHœ›İ[™
+[\×İ˜[JKšÙ^HšÙ^K[YWÜÚYÛ˜]\™HˆÍŸBˆÙ[‹œİY[Ë˜œWÛX™[œÙ]^
+ˆ”{ï&İ[\×İ˜[‹ŒYŸHŠBˆÙ[‹œİY[ËšÙ^WÛX™[œÙ]^
+ˆº, ù )ùcàº  ûï&ÚÙ^_HŠB‚ˆ›İÜÏV×Bˆİ[Ø™X]Ï[Z[Š[ŠÚÜ™ÊK[Š™X]İ[Y\ÊJBˆ˜\—Û›ÏLBˆ›Üˆİ\[ˆ˜[™ÙJİ[Ø™X]Ë
+N‚ˆÙ\OXÚÜ™ÖÜİ\œİ\
+ÍBˆÛÛ\XİV×Bˆ›ÜˆÈ[ˆÙ\N‚ˆYˆ›İÛÛ\XİÜˆÛÛ\XİËLWHOXÎ‚ˆÛÛ\Xİ˜\[™
+ÊBˆY›Ø]
+™X]İ[Y\ÖÜİ\JHYˆİ\[Š™X]İ[Y\ÊH[ÙHŒˆ›İÜË˜\[™
+È˜˜\ˆ˜˜\—Û›ËœÙXÛÛ™È˜ÚÜ™È˜ÛÛ\XİJBˆ˜\—Û›È
+ÏHB‚ˆÙXİ[ÛœÏV×BˆYˆÙ[‹›X\šÙ\œÎ‚ˆ›ÜˆH[ˆÙ[‹›X\šÙ\œÎ‚ˆÙXİ[ÛœË˜\[™
+È›˜[YH›K™Ù]
+›˜[YH‹¹«­z$/HŠKœÙXÛÛ™È™›Ø]
+K™Ù]
+œÙXÛÛ™È‹
+J_JBˆÙXİ[ÛœËœÛÜ
+Ù^O[[X™HÈœÙXÛÛ™È—JBˆ[ÙN‚ˆ›ÜˆH[ˆ˜[™ÙJ[Š›İÜÊK
+N‚ˆÙXİ[ÛœË˜\[™
+È›˜[YH™ˆ¹«­z$/HÚKËÎ
+Ì_H‹œÙXÛÛ™Èœ›İÜÖÚWVÈœÙXÛÛ™È—_JBˆÙ[‹œÙXİ[Û—İ[Y[[™O\ÙXİ[ÛœÂˆ›Üˆ›İÈ[ˆ›İÜÎ‚ˆÙXÏHˆ‚ˆ›ÜˆÈ[ˆÙXİ[ÛœÎ‚ˆYˆ›İÖÈœÙXÛÛ™È—HHÖÈœÙXÛÛ™È—N‚ˆÙXÏ\ÖÈ›˜[YH—Bˆ[ÙN‚ˆœ™XZÂˆ›İÖÈœÙXİ[Ûˆ—O\ÙXÈÜˆ¹«­z$/HH‚ˆÙ[‹˜ÚÜ™İ[Y[[™O\›İÜÂ‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJÎ
+BˆÙ[‹˜\œ˜[™Ù[Y[˜[˜[\Ú\×Üİ]\ËœÙ]^
+¹«hùg*9å'ù¢$9..ù¥âùo¢ù.¥9î¯ú,,xà yakyî¯ú,,y.#¹«c:+ãyd#9«iy¥l9£k‹‹‹ˆŠBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÙ[‹›Y[ÙWÜ™Y™\™[˜ÙO\Ù[‹—Ù^˜XİÛY[ÙWÜ™Y™\™[˜ÙJKÜŠB‚ˆÙ[‹˜\œ˜[™Ù[Y[˜ÚÜ™İX›KœÙ]›İĞÛİ[
+[Š›İÜÊJBˆ›Üˆ‹›İÈ[ˆ[[Y\˜]J›İÜÊN‚ˆ˜[Y\ÏVÜİŠ›İÖÈ˜˜\ˆ—JKÙ[‹—Ù›Ü›X]İ[YJ›İÖÈœÙXÛÛ™È—JKˆ‹š›Ú[Š›İÖÈ˜ÚÜ™È—JK›İÖÈœÙXİ[Ûˆ—WBˆ›ÜˆË˜[[ˆ[[Y\˜]J˜[Y\ÊN‚ˆÙ[‹˜\œ˜[™Ù[Y[˜ÚÜ™İX›KœÙ]][J‹ËUX›UÚYÙ]][J˜[
+JBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹˜\œ˜[™Ù[Y[˜[˜[\Ú\×Üİ]\ËœÙ]^
+ˆˆ¹b!¹§¤9k£9¢$;ï&İ[\×İ˜[‹ŒYŸH”H0­ÈÚÙ^_H:, ùcàº  È0­ÈÛ[Š›İÜÊ_H9l#ú" ˆ0­È9mì¹å'ù¢$9d£9o)¹¥íºeí9î¯È‚ˆ
+BˆÙ[‹\]Wİ\™Ù]ÚÙ^WÛX™[
+
+BˆYˆ\Ø]ŠÙ[‹š[œİ[Y[Ù^\šY[˜ÙHŠN‚ˆÙ[‹š[œİ[Y[Ù^\šY[˜ÙKœ™Yœ™\ÚÜÙXİ[ÛœÊ
+BˆÙ[‹œ™Yœ™\ÚÛX[X[ÜÙXİ[ÛœÊ
+BˆÙ[‹œ™Yœ™\ÚØÛÛ\\™WÜÙXİ[ÛœÊ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹.d:,,yb!¹§¤9i,z-)H‹İŠJJB‚ˆYˆÙ[™\˜]Wİ˜[œÜÜÙYÜİ[\ÊÙ[ŠN‚ˆÛİ\˜ÙWÙ\T]
+Ù[‹˜˜\ÙWÜİ[WÙ\ˆÜˆÙ[‹œİ[WÙ\ŠHYˆ
+Ù[‹˜˜\ÙWÜİ[WÙ\ˆÜˆÙ[‹œİ[WÙ\ŠH[ÙH›Û™BˆYˆ›İÛİ\˜ÙWÙ\ˆÜˆ›İÛİ\˜ÙWÙ\‹™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9k£9¢$9akz/j9b!¹é®øà ˆŠBˆ™]\›‚ˆÙ[Z\ÏZ[
+Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+JBˆYˆÙ[Z\ÈOH‚ˆÙ[‹œİ[WÙ\\Ûİ\˜ÙWÙ\‚ˆÙ[‹™[™Ú[™K›ØY
+Ûİ\˜ÙWÙ\ŠBˆÙ[‹™[™Ú[™KœÙ]ÜÜYY
+Ù[‹›]™WÜ›ËœÜYY˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHKŒ
+BˆÙ[‹›ØYİØ]™Y›Ü›WÚY—Ü™XYJ
+BˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹ h¹i#yc§ú, È‹ˆ¹mì¹ h¹i#yc§ú, ùb!º/j;ï&—ÜÛİ\˜ÙWÙ\ŸHŠBˆ™]\›‚ˆN‚ˆ[\ÜXœ›ÜØBˆÙ[‹œİÜ
+
+BˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆİ]Ù\PTÑWÑT‹È˜\œ˜[™Ù[Y[È‹ÙˆÜÛÛ™ßWİ˜[œÜÜÙWŞÜÙ[Z\ÎŠÙH‚ˆİ]Ù\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆİ[\ÏVÚÈ›ÜˆËËÈ[ˆÕSWÓÔ‘T—Bˆ›ÜˆYÙ^H[ˆ[[Y\˜]Jİ[\ÊN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ[
+YÛ[Šİ[\ÊJL
+JBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÜ˜Ï\Ûİ\˜ÙWÙ\‹ÙˆÚÙ^_KØ]ˆ‚ˆYˆ›İÜ˜Ëš\×Ùš[J
+N‚ˆÛÛ[YBˆ]KÜ\Ù‹œ™XY
+İŠÜ˜ÊK\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆÚYYV×Bˆ›ÜˆÚ[ˆ˜[™ÙJ]KœÚ\VÌWJN‚ˆÚYY˜\[™
+Xœ›ÜØK™Y™™XİËœ]ÚÜÚY
+]VÎ‹ÚKÜ\Ü‹—Üİ\Ï\Ù[Z\ÊJBˆİ][œœİXÚÊÚYY^\ÏLJK˜\İ\Jœ™›Ø]ÌŠBˆÙ‹Üš]JİŠİ]Ù\‹ÙˆÚÙ^_KØ]ˆŠKİ]Ü‹İX\OH”ÓWÌŠBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹œİ[WÙ\[İ]Ù\‚ˆÙ[‹™[™Ú[™K›ØY
+İ]Ù\ŠBˆÙ[‹™[™Ú[™KœÙ]ÜÜYY
+Ù[‹›]™WÜ›ËœÜYY˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHKŒ
+BˆÙ[‹›ØYİØ]™Y›Ü›WÚY—Ü™XYJ
+BˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹caúfcz, ùk£9¢$‹ˆ¹mì¹å'ù¢$ÜÙ[Z\ÎŠÙH9cbºgìù¯%9aî¹âb9nmº/oyai{ï&—Ûİ]Ù\ŸHŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹caúfcz, ùi,z-)H‹İŠJJB‚ˆYˆÜØÛÜ™WÜ›İÜ×İ˜[œÜÜÙY
+Ù[ŠN‚ˆÙ[Z\Ï\Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHˆİ]V×Bˆ›Üˆ›İÈ[ˆÙ[‹˜ÚÜ™İ[Y[[™N‚ˆİ]˜\[™
+ÊŠœ›İË˜ÚÜ™È–ÜÙ[‹—İ˜[œÜÜÙWØÚÜ™
+ËÙ[Z\ÊH›ÜˆÈ[ˆ›İË™Ù]
+˜ÚÜ™È‹×JW_JBˆ™]\›ˆİ]‚ˆYˆÛØYÜÛÛ™×Û\šXÜÊÙ[‹]\˜][ÛL
+N‚ˆN‚ˆÙ[‹›\šX×Ü™Y™\™[˜ÙO[ØYÜŞ[˜ÙYÛ\šXÜÊ]\˜][ÛŠBˆ^Ù\^Ù\[Û‚ˆÙ[‹›\šX×Ü™Y™\™[˜ÙOV×BˆYˆ\Ø]ŠÙ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙHŠN‚ˆÙ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙKœ™Yœ™\ÚÜØÛÜ™J
+B‚ˆYˆÙ^˜XİÛY[ÙWÜ™Y™\™[˜ÙJÙ[‹KÜŠN‚ˆ[\ÜXœ›ÜØBˆŒ›ÚXÙYÙ›YËÏ[Xœ›ÜØKœZ[ŠˆK›Z[[Xœ›ÜØK››İWİ×ÚŠÌˆŠK›X^[Xœ›ÜØK››İWİ×ÚŠÍÈŠKˆÜ\Ü‹œ˜[YWÛ[™İLŒÜÛ[™İMLL‹ˆ
+Bˆ[Y\Ï[Xœ›ÜØK[Y\×ÛZÙJŒÜ\Ü‹ÜÛ[™İMLLŠBˆ™YœÏV×Bˆİ\œ™[ÛZYOS›Û™Bˆİ\Ú[™^Lˆ›Üˆ[™^
+‹›ÚXÙY
+H[ˆ[[Y\˜]Jš\
+Œ›ÚXÙYÙ›YÊJN‚ˆZYOZ[
+›İ[™
+›Ø]
+Xœ›ÜØKš—İ×ÛZYJŠJJJHYˆ›ÚXÙY[™ˆ\È›İ›Û™H[™œš\Ùš[š]JŠH[ÙH›Û™BˆYˆZYHOXİ\œ™[ÛZYN‚ˆYˆİ\œ™[ÛZYH\È›İ›Û™H[™[™^œİ\Ú[™^‚ˆİ\Y›Ø]
+[Y\ÖÜİ\Ú[™^JBˆ[™Y›Ø]
+[Y\ÖÚ[™^LWJÍLL‹ÜÜŠBˆYˆ[™\İ\LŒ‚ˆ™YœË˜\[™
+Èœİ\œİ\™[™™[™›ZYH˜İ\œ™[ÛZYK››İH›Xœ›ÜØK›ZYWİ×Û›İJİ\œ™[ÛZYKØİ]™OUYKÙ[ÏQ˜[ÙJ_JBˆİ\œ™[ÛZYO[ZYBˆİ\Ú[™^Z[™^ˆYˆİ\œ™[ÛZYH\È›İ›Û™H[™[Š[Y\ÊOœİ\Ú[™^‚ˆİ\Y›Ø]
+[Y\ÖÜİ\Ú[™^JNÈ[™Y›Ø]
+[Y\ÖËLWJÍLL‹ÜÜŠBˆYˆ[™\İ\LŒ‚ˆ™YœË˜\[™
+Èœİ\œİ\™[™™[™›ZYH˜İ\œ™[ÛZYK››İH›Xœ›ÜØK›ZYWİ×Û›İJİ\œ™[ÛZYKØİ]™OUYKÙ[ÏQ˜[ÙJ_JBˆ™]\›ˆ™YœÖÎB‚ˆYˆÛXZÙWÜØÛÜ™WÚ[
+Ù[‹]K[œİ[Y[H›XYŠN‚ˆ›İÜÏ\Ù[‹—ÜØÛÜ™WÜ›İÜ×İ˜[œÜÜÙY
+
+BˆœO\Ù[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+˜œH‹¸ %ŠBˆÙ^O\Ù[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+šÙ^H‹¸ %ŠBˆÙ[Z\Ï\Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHˆ\™Ù]\Ù[‹—İ˜[œÜÜÙWÛ›İWÛ˜[YJÙ^KÙ[Z\ÊHYˆÙ^HOH¸ %ˆ[ÙHÙ^BˆİZY\Ï^Âˆ›XYˆ“XYÚY];ï&¹£"yl#ú" ¹¦/¹é.¹d£9o)¹.#¹«­z$/xà ˆ‹ˆ™İZ]\ˆˆ¹d"y.å»ï&¹nîº+«¹¨.y£k¹d£9o)¹/oùå*9o 9¥/¹d£9o)‹ùl zeëyd£9o)»ï&ÍÍ9cëùab9.éyajùb!ºgìùë)¹¢jùo)¹/g9..¹£¤¹îàú-mùà®xà ˆ‹ˆ˜˜\ÜÈˆº-'y¥«ûï&¹gî¹è`9âb9§+9.éy«ãù.*¹d£9o)¹¨.zgìù..¹..ûï#9o.¹¢ãz$/y¨.zgìûï#9«­z$/z/ç¹£©yi!9cëùb¨9aiy.¥9n©¹.#¹îãú/áúgìøà ˆ‹ˆ™[\Èˆºo$ûï&¹gî¹è`ÍÜ›Ûİ™{ï&’KR]9ajùb!ºgìùë)»ï#Û˜\™H‹Í9¢ã{ï#ÚXÚÈKÌÈ9¢ã{ï&ùbkù«c9cëùh§¹o.ˆÜ˜\Ú9.#ˆš[8à ˆ‹ˆœX[›Èˆºe+¹ææ;ï&¹cìù¢bù."yd£9o)‹ú/k9/c{ï#9mé¹¢bù¨.zgìù¢%¹¨.zgìÊù.¥9n©»ï&ù¨.y£k¹«­z$/yká¹n©º, ù¥m9îáù/døà ˆ‹ˆBˆœÏV×Bˆ›Üˆˆ[ˆ›İÜÎ‚ˆÚÜ™ÏHˆÈ‹š›Ú[Š[™\ØØ\JÊH›ÜˆÈ[ˆ–È˜ÚÜ™È—JBˆœË˜\[™
+ˆÜ–ÉØ˜\‰×_OİÜÙ[‹—Ù›Ü›X]İ[YJ–ÉÜÙXÛÛ™É×J_OİÚ[™\ØØ\J–ÉÜÙXİ[Û‰×J_OİÛ\ÜÏIØÚÜ™	ÏØÚÜ™ßOİİˆŠBˆ™]\›ˆ‰ÉÉÏYØİ\H[[XYY]HÚ\œÙ]H]‹N]OÚ[™\ØØ\J]J_Oİ]O‚İ[O˜›Ù^ŞÙ›ÛY˜[Z[N‰ÓZXÜ›ÜÛÙXRZHRIË\šX[Ø˜XÚÙÜ›İ[™ˆÌLLŒØÛÛÜˆÙYYŒÙ™ÜY[™ÎŒÌ_Z^ŞØÛÛÜˆØNLÙ™Ÿ_K›Y]^ŞØÛÛÜˆÎY˜ŒÙÛX\™Ú[‹X›İÛNŒŒ_K™İZY^ŞØ˜XÚÙÜ›İ[™ˆÌLLXÌÌÎØ›Ü™\Œ\ÛÛYÌ˜ÌØYNÜY[™ÎŒMØ›Ü™\‹\˜Y]\ÎŒLÛX\™Ú[ŒMœ_]X›^ŞİÚYŒL	NØ›Ü™\‹XÛÛ\ÙN˜ÛÛ\Ù__]ŞØ›Ü™\‹X›İÛNŒ\ÛÛYÌLÍLNÜY[™ÎŒLİ^X[YÛ›Y_]ŞØÛÛÜˆÎ˜L˜ÍŸ_K˜ÚÜ™ŞÙ›Û\Ú^™NŒNÙ›Û]ÙZYÚ˜›ÛØÛÛÜˆÍYLXÙ__\ÛX[ŞØÛÛÜˆÎÎMXŒ_OÜİ[OÚXY›ÙO‚OÚ[™\ØØ\J]J_OÚO]ˆÛ\ÜÏH›Y]H”HØœ_H0­È9c§ú, ùcàº  ÈÚ[™\ØØ\JİŠÙ^JJ_H0­È9¯%9aîº, ÈÚ[™\ØØ\JİŠ\™Ù]
+J_H0­È9caúfcHÜÙ[Z\ÎŠÙH9cbºgìÈ0­ÈÍÙ]‚]ˆÛ\ÜÏH™İZYHÚ[™\ØØ\JİZY\Ë™Ù]
+[œİ[Y[İZY\ÖÉÛXY	×JJ_OÙ]‚X›O¹l#ú" İ¹¥íºeíİ¹«­z$/Oİ¹d£9o)İİÉÉËš›Ú[ŠœÊ_OİX›O‚ÛX[¹ªf9dlùa/úgìù.d0­ÈRH9b!¹§¤9å'ù¢$9æ¡9£¤¹îàËù¯%9icùcàº  ú,,{ï#9nîº+«¹.d9¢bù¯%9aî¹bcy.®¹méy¨(ykîxà ÜÛX[ÜØ›ÙOÚ[‰ÉÉÂ‚ˆYˆ^ÜÛXYÜÚY]
+Ù[ŠN‚ˆÙ[‹™^ÜÚ[œİ[Y[ÜØÛÜ™J›XYŠB‚ˆYˆ^ÜÚ[œİ[Y[ÜØÛÜ™JÙ[‹[œİ[Y[
+N‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab:/ä:(c8 '9b!¹§¤9d£9o)ˆÈ”HÈ:, ù )ø 'xà ˆŠBˆ™]\›‚ˆ˜[Y\Ï^È›XYˆ“XYÚY]‹™İZ]\ˆˆ¹d"y.å¹¯%9icùcàº  ú,,H‹˜˜\ÜÈˆº-'y¥«ù¯%9icùcàº  ú,,H‹™[\Èˆºo$ù¢bù¯%9icùcàº  ú,,H‹œX[›Èˆºe+¹ææ9¯%9icùcàº  ú,,HŸBˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆY˜][QVÔ•×ÑT‹ÙˆÜÛÛ™ßWŞÚ[œİ[Y[WÜØÛÜ™Kš[‚ˆÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹¹kï9aî¹¯%9icú,,H‹İŠY˜][
+K’S9.d:,,H
+
+‹š[
+HŠBˆYˆ›İ‚ˆ™]\›‚ˆ]
+
+KÜš]Wİ^
+Ù[‹—ÛXZÙWÜØÛÜ™WÚ[
+ˆÜÛÛ™ßH0­ÈÛ˜[Y\Ë™Ù]
+[œİ[Y[[œİ[Y[
+_H‹[œİ[Y[
+K[˜ÛÙ[™ÏH]‹NŠBˆN‚ˆÙX˜œ›İÜÙ\‹›Ü[Š]
+
+Kœ™\ÛÛ™J
+K˜\×İ\šJ
+JBˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹aîº,,yk£9¢$‹ˆ¹mì¹å'ù¢$;ï&—ÜHŠB‚‚ˆYˆÙY™šXİ[Wİ˜[YJÙ[‹^
+N‚ˆ™]\›ˆÈ¹ë 9c%ˆŒMK¹¨!ùaáˆŒÍK¹.,9kãŒK¹.$ù.&ˆŒKŒK™Ù]
+İŠ^
+KÍJB‚ˆYˆØİ\œ™[Ü^Y\—Ü›Ùš[\ÊÙ[ŠN‚ˆYHHÙ]]ŠÙ[‹š[œİ[Y[Ù^\šY[˜ÙH‹›Û™JBˆYˆYH\È›Û™N‚ˆ™]\›ˆßBˆ™]\›ˆÂˆ™İZ]\ˆÂˆ™Y™šXİ[HšYK™İZ]\—ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ[š[™ÈšYK™İZ]\—İ[š[™Ë˜İ\œ™[^
+
+Kˆ˜Ø\ÈšYK™İZ]\—ØØ\Ë˜[YJ
+Kˆœİ[HšYK™İZ]\—Üİ[K˜İ\œ™[^
+
+Kˆ™[œÚ]HšYK™İZ]\—Ù[œÚ]K˜[YJ
+KˆKˆ˜˜\ÜÈÂˆ™Y™šXİ[HšYK˜˜\Ü×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆœİš[™ÜÈšYK˜˜\Ü×Üİš[™ÜË˜İ\œ™[^
+
+Kˆœ]\›ˆšYK˜˜\Ü×Ü]\›‹˜İ\œ™[^
+
+Kˆ™[œÚ]HšYK˜˜\Ü×Ù[œÚ]K˜[YJ
+Kˆœ˜[™ÙHšYK˜˜\Ü×ÛØİ]™K˜İ\œ™[^
+
+KˆKˆ™[\ÈÂˆ™Y™šXİ[HšYK™[\×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ™Ü›Ûİ™HšYK™[\×ÙÜ›Ûİ™K˜İ\œ™[^
+
+KˆšZ]šYK™[\×ÚZ]˜İ\œ™[^
+
+Kˆ™š[šYK™[\×Ùš[˜İ\œ™[^
+
+Kˆœİ™[™İšYK™[\×Üİ™[™İ˜[YJ
+KˆKˆœX[›ÈÂˆ™Y™šXİ[HšYKœX[›×ÙY™šXİ[K˜İ\œ™[^
+
+Kˆ›YšYKœX[›×ÛY˜İ\œ™[^
+
+KˆœšYÚšYKœX[›×ÜšYÚ˜İ\œ™[^
+
+Kˆœİ\İZ[ˆšYKœX[›×Üİ\İZ[‹˜İ\œ™[^
+
+Kˆ™[œÚ]HšYKœX[›×Ù[œÚ]K˜[YJ
+KˆBˆB‚ˆYˆ™Yœ™\ÚÜÛX\Ø\œ˜[™Ù\—Üİ[[X\JÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆ\Ù[‹—Øİ\œ™[Ü^Y\—Ü›Ùš[\Ê
+BˆYˆ›İ‚ˆÙ[‹˜\œ˜[™Ù[Y[œÛX\Üİ[[X\KœÙ]^
+¹§*¹¢o¹b,9.d9¢bùcà¹¥lŠBˆ™]\›‚ˆJˆˆ¹d"y.å»ï&ÜÉÙİZ]\‰×VÉÙY™šXİ[I×_HÈÜÉÙİZ]\‰×VÉÜİ[I×_HÈ9ká¹n©ˆÜÉÙİZ]\‰×VÉÙ[œÚ]I×_HÈØ\ÈÜÉÙİZ]\‰×VÉØØ\É×_Wˆ‚ˆˆ˜\Üûï&ÜÉØ˜\ÜÉ×VÉÙY™šXİ[I×_HÈÜÉØ˜\ÜÉ×VÉÜ]\›‰×_HÈ9ká¹n©ˆÜÉØ˜\ÜÉ×VÉÙ[œÚ]I×_HÈÜÉØ˜\ÜÉ×VÉÜ˜[™ÙI×_Wˆ‚ˆˆºo$ûï&ÜÉÙ[\É×VÉÙY™šXİ[I×_HÈÜÉÙ[\É×VÉÙÜ›Ûİ™I×_HÈÜÉÙ[\É×VÉÚZ]	×_HÈÜÉÙ[\É×VÉÙš[	×_Wˆ‚ˆˆºe+¹ææ;ï&ÜÉÜX[›É×VÉÙY™šXİ[I×_HÈ9mé¹¢bÈÜÉÜX[›É×VÉÛY	×_HÈ9cìù¢bÈÜÉÜX[›É×VÉÜšYÚ	×_HÈ9ká¹n©ˆÜÉÜX[›É×VÉÙ[œÚ]I×_H‚ˆ
+BˆÙ[‹˜\œ˜[™Ù[Y[œÛX\Üİ[[X\KœÙ]^
+
+B‚ˆYˆÜÛX\ØÚÜ™Û›İ\ÊÙ[‹ÚÜ™Ù[Z\ÊN‚ˆ›İ\Ï^ÈÈŒÈÈŒK‘Œ‹‘ÈŒË‘H‘ˆK‘ˆÈ‹‘ÈË‘ÈÈHKHÈÌˆÌ_BˆO\™K›X]Ú
+ˆ—ŠĞKQ×JÎˆßŠOÊJŠŠI‹ÚÜ™ÜˆˆŠBˆYˆ›İN‚ˆ™]\›ˆÍŒ×Bˆ›Ûİ\Ù[‹—İ˜[œÜÜÙWÛ›İWÛ˜[YJK™Ü›İ\
+JKÙ[Z\ÊBˆ˜\ÙO[›İ\Ë™Ù]
+›ÛİŒ
+BˆİY™š^[K™Ü›İ\
+ŠBˆYˆİY™š^œİ\İÚ]
+›HŠH[™›İİY™š^œİ\İÚ]
+›XZˆŠN‚ˆ\™LÂˆ[ÙN‚ˆ\™MˆœÏVØ˜\ÙK˜\ÙJİ\™˜\ÙJÍ×BˆYˆİY™š^OHÈ‚ˆœË˜\[™
+˜\ÙJÌL
+Bˆ[YˆİY™š^OH›XZÈ‚ˆœË˜\[™
+˜\ÙJÌLJBˆ[YˆİY™š^OH›MÈ‚ˆœÏVØ˜\ÙK˜\ÙJÌË˜\ÙJÍË˜\ÙJÌLBˆ[YˆİY™š^OHœİ\Í‚ˆœÏVØ˜\ÙK˜\ÙJÍK˜\ÙJÍ×Bˆ[YˆİY™š^OH™[H‚ˆœÏVØ˜\ÙK˜\ÙJÌË˜\ÙJÍ—Bˆ™]\›ˆœÂ‚ˆYˆÙİZ]\—Ø˜\—Ù]™[ÊÙ[‹˜XÚËœË›Ùš[K[ÙJN‚ˆœ›ÛHZYÈ[\ÜY\ÜØYÙBˆY™šXİ[O\Ù[‹—ÙY™šXİ[Wİ˜[YJ›Ùš[K™Ù]
+™Y™šXİ[HŠJBˆ[œÚ]O[X^
+KZ[ŠL[
+›Ùš[K™Ù]
+™[œÚ]H‹JJJJBˆİ[O\›Ùš[K™Ù]
+œİ[H‹º!ê¹bª9£ª:#dŠBˆØ\ÏZ[
+›Ùš[K™Ù]
+˜Ø\È‹
+JBˆ›İ\ÏVÛŠØØ\È›Üˆˆ[ˆœ×Bˆ™[ØÚ]OZ[
+
+ÌÍJ™Y™šXİ[JB‚ˆYˆ”İÙ\ˆÚÜ™ˆ[ˆİ[N‚ˆ›İ\ÏVÛ›İ\ÖÌK›İ\ÖÌJÍË›İ\ÖÌJÌL—Bˆ[Yˆ¹b!º)èÈˆ[ˆİ[HÜˆ‘š[™Ù\œİ[Hˆ[ˆİ[N‚ˆİ\ÏNYˆ[œÚ]OMˆ[ÙHˆ\LYˆİ\ÏON[ÙHˆ]\›VÌK‹K‹K—HYˆ[Š›İ\ÊOLÈ[ÙHÌJœİ\Âˆ›ÜˆH[ˆ˜[™ÙJİ\ÊN‚ˆ[›İ\ÖÜ]\›–ÚH	H[Š]\›ŠWH	H[Š›İ\ÊWBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠLŠK™[ØÚ]O]™[ØÚ]K[YOLÚ[›™[L
+JBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLŠK™[ØÚ]OL[YOY\‹Ú[›™[L
+JBˆ™]\›‚ˆ[ÙN‚ˆ™X]ÏMYˆ[œÚ]OMˆ[ÙHˆ\MYˆ™X]ÏOM[ÙHˆ›ÜˆÈ[ˆ˜[™ÙJ™X]ÊN‚ˆ›Üˆˆ[ˆ›İ\Î‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠLŠK™[ØÚ]O]™[ØÚ]K[YOLÚ[›™[L
+JBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠL›İ\ÖÌJK™[ØÚ]OL[YOZ[
+\ŠŒÎ
+KÚ[›™[L
+JBˆ›Üˆˆ[ˆ›İ\ÖÌN—N‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLŠK™[ØÚ]OL[YOLÚ[›™[L
+JBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠL›İ\ÖÌJK™[ØÚ]OLK[YO[X^
+K[
+\ŠŒŒŒŠJKÚ[›™[L
+JBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠL›İ\ÖÌJK™[ØÚ]OL[YOLÚ[›™[L
+JB‚ˆYˆØ˜\Ü×Ø˜\—Ù]™[ÊÙ[‹˜XÚËœË›Ùš[JN‚ˆœ›ÛHZYÈ[\ÜY\ÜØYÙBˆ›Ûİ[œÖÌKLˆYˆºjæ9¢¢¹/cHˆ[ˆ›Ùš[K™Ù]
+œ˜[™ÙH‹ˆŠN‚ˆ›Ûİ
+ÏLL‚ˆ[Yˆ¹/cºgìù¦í9ê,Èˆ[ˆ›Ùš[K™Ù]
+œ˜[™ÙH‹ˆŠN‚ˆ›ÛİOMBˆ[œÚ]O[X^
+KZ[ŠL[
+›Ùš[K™Ù]
+™[œÚ]H‹JJJJBˆ]\›\›Ùš[K™Ù]
+œ]\›ˆ‹¹¨.zgìù/&9abŠBˆY™\Ù[‹—ÙY™šXİ[Wİ˜[YJ›Ùš[K™Ù]
+™Y™šXİ[HŠJBˆ™[ØÚ]OZ[
+
+Ì
+™Y™ŠB‚ˆ›İ\ÏV×BˆYˆ•Ø[Ú[™Èˆ[ˆ]\›‚ˆ›İ\ÏVÜ›Ûİ›Ûİ
+Í›Ûİ
+ÍË›Ûİ
+ÎWBˆ[Yˆ¹ajùn©ˆˆ[ˆ]\›‚ˆ›İ\ÏVÜ›Ûİ›Ûİ
+ÌL‹›Ûİ
+ÍË›Ûİ
+ÌL—Bˆ[Yˆ¹.¥9n©ˆˆ[ˆ]\›‚ˆ›İ\ÏVÜ›Ûİ›Ûİ
+ÍË›Ûİ›Ûİ
+Í×Bˆ[Yˆ¹¥âùo¢ùc%ˆˆ[ˆ]\›‚ˆ›İ\ÏVÜ›Ûİ›Ûİ
+Í›Ûİ
+ÍË›Ûİ
+ÌLWBˆ[ÙN‚ˆ›İ\ÏVÜ›Ûİ›Ûİ›Ûİ›ÛİB‚ˆYˆ[œÚ]OLÎ‚ˆÙ\OVÛ›İ\ÖÌK›İ\ÖÌ—WBˆ\NMŒˆ[Yˆ[œÚ]ON‚ˆÙ\OVÛ›İ\ÖÌK›İ\ÖÌWK›İ\ÖÌ—K›İ\ÖÌ×K›İ\ÖÌJÌL‹›İ\ÖÌ—K›İ\ÖÌWK›İ\ÖÌ×WBˆ\Lˆ[ÙN‚ˆÙ\O[›İ\Âˆ\M‚ˆ›Üˆˆ[ˆÙ\N‚ˆ[X^
+Z[ŠÌ‹ŠJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[‹™[ØÚ]O]™[ØÚ]K[YOLÚ[›™[LJJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[‹™[ØÚ]OL[YOY\‹Ú[›™[LJJB‚ˆYˆÜX[›×Ø˜\—Ù]™[ÊÙ[‹˜XÚËœË›Ùš[JN‚ˆœ›ÛHZYÈ[\ÜY\ÜØYÙBˆY\›Ùš[K™Ù]
+›Y‹¹¨.zgìÈŠBˆšYÚ\›Ùš[K™Ù]
+œšYÚ‹¹."yd£9o)ˆŠBˆ[œÚ]O[X^
+KZ[ŠL[
+›Ùš[K™Ù]
+™[œÚ]H‹JJJJBˆY™\Ù[‹—ÙY™šXİ[Wİ˜[YJ›Ùš[K™Ù]
+™Y™šXİ[HŠJBˆ™[ØÚ]OZ[
+
+Ì
+™Y™ŠB‚ˆÚÜ™VÛŠÌLˆ›Üˆˆ[ˆœ×BˆYˆº/k9/cHˆ[ˆšYÚ[™[ŠÚÜ™
+OLÎ‚ˆÚÜ™VØÚÜ™ÌWKÚÜ™Ì—KÚÜ™ÌJÌL—H
+ÈÚÜ™ÌÎ—BˆYˆ”Yˆ[ˆšYÚ‚ˆ›Üˆˆ[ˆÚÜ™‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠLŠK™[ØÚ]O[X^
+ÍK™[ØÚ]KLLŠK[YOLÚ[›™[LŠJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLÚÜ™ÌJK™[ØÚ]OL[YOLNLŒÚ[›™[LŠJBˆ›Üˆˆ[ˆÚÜ™ÌN—N‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLŠK™[ØÚ]OL[YOLÚ[›™[LŠJBˆ™]\›‚‚ˆİ\ÏNYˆ[œÚ]OMÈ[ÙHˆ\LYˆİ\ÏON[ÙHˆ›ÜˆH[ˆ˜[™ÙJİ\ÊN‚ˆYˆ¹b!º)èÈˆ[ˆšYÚÜˆ”šÙ\Èˆ[ˆšYÚ‚ˆXÚÜ™ÚH	H[ŠÚÜ™
+WBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠLŠK™[ØÚ]O]™[ØÚ]K[YOLÚ[›™[LŠJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLŠK™[ØÚ]OL[YOY\‹Ú[›™[LŠJBˆ[ÙN‚ˆ›Üˆˆ[ˆÚÜ™‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠLŠK™[ØÚ]O]™[ØÚ]K[YOLÚ[›™[LŠJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLÚÜ™ÌJK™[ØÚ]OL[YOZ[
+\ŠŒJKÚ[›™[LŠJBˆ›Üˆˆ[ˆÚÜ™ÌN—N‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLŠK™[ØÚ]OL[YOLÚ[›™[LŠJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[Z[ŠLÚÜ™ÌJK™[ØÚ]OLK[YO[X^
+K[
+\ŠŒŒMJJKÚ[›™[LŠJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[Z[ŠLÚÜ™ÌJK™[ØÚ]OL[YOLÚ[›™[LŠJB‚ˆYˆÙ[WØ˜\—Ù]™[ÊÙ[‹˜XÚË›Ùš[K\×ÜÙXİ[Û—Ø›İ[™\OQ˜[ÙJN‚ˆœ›ÛHZYÈ[\ÜY\ÜØYÙBˆÜ›Ûİ™O\›Ùš[K™Ù]
+™Ü›Ûİ™H‹”Ü™X]ŠBˆZ]\›Ùš[K™Ù]
+šZ]‹¹ajùb!ºgìùë)ˆŠBˆš[\›Ùš[K™Ù]
+™š[‹¹l$zaãÈš[ŠBˆİ™[™İ[X^
+KZ[ŠL[
+›Ùš[K™Ù]
+œİ™[™İ‹JJJJBˆY™šXİ[O\Ù[‹—ÙY™šXİ[Wİ˜[YJ›Ùš[K™Ù]
+™Y™šXİ[HŠJBˆ™[Ø˜\ÙOZ[
+L
+ÌÍJ™Y™šXİ[JÊİ™[™İMJJŒŠB‚ˆÚ^Y[H¹c`yakHˆ[ˆZ]ˆİ\ÏLMˆYˆÚ^Y[[ÙHˆ\LLŒYˆÚ^Y[[ÙHˆÛ›İOMLHYˆ”šYHˆ[ˆZ][ÙH‚‚ˆ›Üˆİ\[ˆ˜[™ÙJİ\ÊN‚ˆ™X]ÜÜÈHİ\ÊYˆÚ^Y[[ÙHŠBˆ]™[ÏVÊÛ›İKX^
+ÍK™[Ø˜\ÙKLJJWBˆYˆXœÊ™X]ÜÜËLŒ
+OŒHÜˆXœÊ™X]ÜÜËL‹Œ
+OŒN‚ˆ]™[Ë˜\[™
+
+Í‹Z[ŠLŒ™[Ø˜\ÙJÌLŠJJBˆYˆXœÊ™X]ÜÜËLKŒ
+OŒHÜˆXœÊ™X]ÜÜËLËŒ
+OŒN‚ˆ]™[Ë˜\[™
+
+ÎZ[ŠLŒ™[Ø˜\ÙJÎ
+JJBˆYˆ”›ØÚÈˆ[ˆÜ›Ûİ™H[™™X]ÜÜÈ[ˆ
+ŒKK‹Œ
+N‚ˆ]™[Ë˜\[™
+
+Í‹Z[ŠLŒ™[Ø˜\ÙJÎ
+JJBˆYˆ‘[šÈˆ[ˆÜ›Ûİ™H[™İ\	HOHÎ‚ˆ]™[Ë˜\[™
+
+Í‹Z[ŠLMK™[Ø˜\ÙJJJBˆ›Üˆ›İK™[[ˆ]™[Î‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[›İK™[ØÚ]O]™[[YOLÚ[›™[NJJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İOZÛ›İK™[ØÚ]OL[YOY\‹Ú[›™[NJJBˆ›Üˆ›İKÈ[ˆ]™[ÖÌN—N‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[›İK™[ØÚ]OL[YOLÚ[›™[NJJB‚ˆØ[×Ùš[H\×ÜÙXİ[Û—Ø›İ[™\H[™
+¹«­z$/ybcHˆ[ˆš[Üˆ¹bkù«cˆ[ˆš[Üˆ¹.,9kãˆ[ˆš[
+BˆYˆØ[×Ùš[‚ˆÈ\[™HÚÜÛKÜÛ˜\™Hš[H›Üœ›İÚ[™ÈÛ™Hš[˜[]X\\‹[›İH™Y[‚ˆ›Üˆ›İH[ˆÍKËLÎN‚ˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[›İK™[ØÚ]O[Z[ŠLŒ™[Ø˜\ÙJÌL
+K[YOLÚ[›™[NJJBˆ˜XÚË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[›İK™[ØÚ]OL[YOLLŒÚ[›™[NJJB‚‚ˆYˆÜÙXİ[Û—Ü›ÛJÙ[‹˜[YK[™^İ[
+N‚ˆ^\İŠ˜[YHÜˆˆŠK›İÙ\Š
+BˆYˆš[›Èˆ[ˆ^Üˆ¹bcyicÈˆ[ˆ^‚ˆ™]\›ˆš[›È‚ˆYˆ™\œÙHˆ[ˆ^Üˆ¹..ù«cˆ[ˆ^‚ˆ™]\›ˆ™\œÙH‚ˆYˆ˜ÚÜ\Èˆ[ˆ^Üˆ¹bkù«cˆ[ˆ^‚ˆ™]\›ˆ˜ÚÜ\È‚ˆYˆ˜œšYÙHˆ[ˆ^Üˆ¹¨iHˆ[ˆ^‚ˆ™]\›ˆ˜œšYÙH‚ˆYˆœÛÛÈˆ[ˆ^Üˆºeí9icÈˆ[ˆ^‚ˆ™]\›ˆœÛÛÈ‚ˆYˆ›İ]›Èˆ[ˆ^Üˆ¹l/¹icÈˆ[ˆ^‚ˆ™]\›ˆ›İ]›È‚ˆYˆİ[HN‚ˆ™]\›ˆ™\œÙH‚ˆ˜][ÏZ[™^ÛX^
+Kİ[LJBˆYˆ˜][ÈŒL‚ˆ™]\›ˆš[›È‚ˆYˆ˜][È‚ˆ™]\›ˆ™\œÙH‚ˆYˆ˜][È‚ˆ™]\›ˆ˜ÚÜ\È‚ˆYˆ˜][È‚ˆ™]\›ˆ˜œšYÙH‚ˆ™]\›ˆ›İ]›È‚‚ˆYˆÜÙXİ[Û—Üİ˜]YŞJÙ[‹›ÛKİ\™OHº!ê¹bª9b)9¥«HŠN‚ˆ˜\ÙHHÂˆš[›ÈˆÈ™[™\™ŞHŒ™İZ]\ˆŒMK˜˜\ÜÈŒK™[\ÈŒŒÍKœX[›ÈŒK™š[ŒŒMKœÜXÙHŒŒÍ_Kˆ™\œÙHˆÈ™[™\™ŞHŒN™İZ]\ˆŒŒ‹˜˜\ÜÈŒN™[\ÈŒMKœX[›ÈŒN™š[ŒŒŒœÜXÙHŒŒ_Kˆ˜ÚÜ\ÈˆÈ™[™\™ŞHŒL‹™İZ]\ˆŒ˜˜\ÜÈŒ™[\ÈŒMKœX[›ÈŒ‹™š[ŒÌ‹œÜXÙHŒŒ_Kˆ˜œšYÙHˆÈ™[™\™ŞHŒL‹™İZ]\ˆŒ˜˜\ÜÈŒL™[\ÈŒ‹œX[›ÈŒÌ‹™š[ŒŒÍKœÜXÙHŒ_KˆœÛÛÈˆÈ™[™\™ŞHŒ‹™İZ]\ˆŒÌ‹˜˜\ÜÈŒÎ™[\ÈŒœX[›ÈŒMK™š[ŒKœÜXÙHŒŒLKˆ›İ]›ÈˆÈ™[™\™ŞHŒK™İZ]\ˆŒL˜˜\ÜÈŒ™[\ÈŒŒÎœX[›ÈŒN™š[ŒŒœÜXÙHŒKˆVÜ›ÛWK˜ÛÜJ
+B‚ˆYˆİ\™OOH¹®$:/æùh§¹o.ˆ‚ˆYˆ›ÛH[ˆ
+š[›È‹™\œÙHŠN‚ˆ˜\ÙVÈ™[™\™ŞH—JLˆ[Yˆ›ÛH[ˆ
+˜ÚÜ\È‹œÛÛÈŠN‚ˆ˜\ÙVÈ™[™\™ŞH—O[Z[ŠKŒ˜\ÙVÈ™[™\™ŞH—JŒKŒŠBˆ[Yˆİ\™OOH¹nlùê,ùã¬9g.ˆ‚ˆ›ÜˆÈ[ˆ
+™[™\™ŞH‹™İZ]\ˆ‹˜˜\ÜÈ‹™[\È‹œX[›ÈŠN‚ˆ˜\ÙVÚ×OL
+È
+˜\ÙVÚ×KL
+JŒŒÍBˆ[Yˆİ\™OOH¹o.¹o,ykîy«å‚ˆYˆ›ÛH[ˆ
+™\œÙH‹˜œšYÙH‹š[›ÈŠN‚ˆ˜\ÙVÈ™[™\™ŞH—JLÎˆYˆ›ÛH[ˆ
+˜ÚÜ\È‹œÛÛÈŠN‚ˆ˜\ÙVÈ™[™\™ŞH—O[Z[ŠKŒ˜\ÙVÈ™[™\™ŞH—JŒKŒ
+Bˆ[Yˆİ\™OOH¹¢¤¹ áyabùb-ˆ‚ˆ˜\ÙVÈ™[\È—JLÌ‚ˆ˜\ÙVÈ™İZ]\ˆ—JL‚ˆ˜\ÙVÈ˜˜\ÜÈ—JL‚ˆ˜\ÙVÈœX[›È—O[Z[ŠKŒ˜\ÙVÈœX[›È—JŒKŒJBˆ˜\ÙVÈ™š[—JLBˆ˜\ÙVÈœÜXÙH—O[Z[Š˜\ÙVÈœÜXÙH—JÌŒN
+Bˆ™]\›ˆ˜\ÙB‚ˆYˆØZ[ÜÙXİ[Û—ÛX\
+Ù[ŠN‚ˆ›İÜÏ\Ù[‹˜ÚÜ™İ[Y[[™HÜˆ×BˆYˆ›İ›İÜÎ‚ˆ™]\›ˆ×Bˆ[š\]YOV×BˆÙY[\Ù]
+
+Bˆ›Üˆ›İÈ[ˆ›İÜÎ‚ˆÏ\›İË™Ù]
+œÙXİ[Ûˆ‹¹«­z$/HŠBˆYˆÈ›İ[ˆÙY[‚ˆÙY[‹˜Y
+ÊNÈ[š\]YK˜\[™
+ÊBˆİ\™O\Ù[‹˜\œ˜[™Ù[Y[™[™\™ŞWØİ\™K˜İ\œ™[^
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHº!ê¹bª9b)9¥«H‚ˆİ]V×Bˆ›ÜˆK˜[YH[ˆ[[Y\˜]J[š\]YJN‚ˆ›ÛO\Ù[‹—ÜÙXİ[Û—Ü›ÛJ˜[YKK[Š[š\]YJJBˆİ]˜\[™
+Âˆ›˜[YH›˜[YKˆœ›ÛHœ›ÛKˆœİ˜]YŞHœÙ[‹—ÜÙXİ[Û—Üİ˜]YŞJ›ÛKİ\™JBˆJBˆ™]\›ˆİ]‚ˆYˆ™Yœ™\ÚÛ]\ÚXØ[Ú[[YÙ[˜ÙWÜ™]šY]ÊÙ[ŠN‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆÙ[‹˜\œ˜[™Ù[Y[š[[YÙ[˜ÙWÜİ[[X\KœÙ]^
+º+íùab9k£9¢$9«c9¦ì¹d£9o)‹ù«­z$/yb!¹§¤8à ˆŠBˆ™]\›‚ˆÛX\\Ù[‹—ØZ[ÜÙXİ[Û—ÛX\
+
+BˆX™[Ï^Èš[›Èˆ¹bcyicÈ‹™\œÙHˆ¹..ù«c‹˜ÚÜ\Èˆ¹bkù«c‹˜œšYÙHˆ¹¨iy«­H‹œÛÛÈˆºeí9icËùâë9icÈ‹›İ]›Èˆ¹l/¹icÈŸBˆ[™\ÏV×Bˆ›ÜˆÈ[ˆÛX\‚ˆİ\ÖÈœİ˜]YŞH—Bˆ[™\Ë˜\[™
+ˆˆÜÖÉÛ˜[YI×_H8¡¤ˆÛX™[Ë™Ù]
+ÖÉÜ›ÛI×KÖÉÜ›ÛI×J_H‚ˆˆº ïzaãÈÚ[
+İÉÙ[™\™ŞI×JŒL
+_IH‚ˆˆ¹d"y.åˆÚ[
+İÉÙİZ]\‰×JŒL
+_IH˜\ÜÈÚ[
+İÉØ˜\ÜÉ×JŒL
+_IH‚ˆˆºo$ÈÚ[
+İÉÙ[\É×JŒL
+_IH:e+¹ææÚ[
+İÉÜX[›É×JŒL
+_IH‚ˆˆ‘š[Ú[
+İÉÙš[	×JŒL
+_IH‚ˆ
+BˆÙ[‹˜\œ˜[™Ù[Y[š[[YÙ[˜ÙWÜİ[[X\KœÙ]^
+—ˆ‹š›Ú[Š[™\ÊJB‚ˆYˆÜÙXİ[Û—Üİ˜]YŞWÙ›Ü—Û˜[YJÙ[‹ÙXİ[Û—Û˜[YKÙXİ[Û—ÛX\
+N‚ˆ›Üˆ][H[ˆÙXİ[Û—ÛX\‚ˆYˆ][VÈ›˜[YH—HOHÙXİ[Û—Û˜[YN‚ˆ™]\›ˆ][VÈœİ˜]YŞH—K][VÈœ›ÛH—Bˆ™]\›ˆÙ[‹—ÜÙXİ[Û—Üİ˜]YŞJ™\œÙHŠK™\œÙH‚‚ˆYˆØ\WÜÙXİ[Û—Ü›Ùš[JÙ[‹›Ùš[Kİ˜]YŞK[œİ[Y[
+N‚ˆYXİ
+›Ùš[HÜˆßJBˆ˜XİÜY›Ø]
+İ˜]YŞK™Ù]
+[œİ[Y[ÊJBˆ[œÚ]WÚÙ^OH™[œÚ]H‚ˆYˆ[œÚ]WÚÙ^H[ˆ‚ˆÙ[œÚ]WÚÙ^WO[X^
+KZ[ŠL[
+›İ[™
+›Ø]
+Ù[œÚ]WÚÙ^WJJ™˜XİÜŠJJJBˆYˆ[œİ[Y[OH™[\È‚ˆÈœİ™[™İ—O[X^
+KZ[ŠL[
+›İ[™
+›Ø]
+™Ù]
+œİ™[™İ‹JJJ›X^
+MKİ˜]YŞK™Ù]
+™[\È‹ÊJJJJJBˆYˆİ˜]YŞK™Ù]
+™š[‹
+OŒN‚ˆÈ™š[—OH¹l$zaãÈš[‚ˆ[Yˆİ˜]YŞK™Ù]
+™š[‹
+OŒN‚ˆÈ™š[—OH¹«­z$/ybcHš[‚ˆ™]\›ˆ‚ˆYˆÛ]\ÚXØ[Ú[[YÙ[˜ÙWØ˜\ŠÙ[‹˜XÚÜË›İËœË›Ùš[\Ëİ˜]YŞK›ÛK›İ[™\K[ÙJN‚ˆİZ]\‹˜\ÜËX[›Ë[\ÈH˜XÚÜÂˆÜ\Ù[‹—Ø\WÜÙXİ[Û—Ü›Ùš[J›Ùš[\Ë™Ù]
+™İZ]\ˆ‹ßJKİ˜]YŞK™İZ]\ˆŠBˆœ\Ù[‹—Ø\WÜÙXİ[Û—Ü›Ùš[J›Ùš[\Ë™Ù]
+˜˜\ÜÈ‹ßJKİ˜]YŞK˜˜\ÜÈŠBˆ\Ù[‹—Ø\WÜÙXİ[Û—Ü›Ùš[J›Ùš[\Ë™Ù]
+œX[›È‹ßJKİ˜]YŞKœX[›ÈŠBˆ\Ù[‹—Ø\WÜÙXİ[Û—Ü›Ùš[J›Ùš[\Ë™Ù]
+™[\È‹ßJKİ˜]YŞK™[\ÈŠB‚ˆÈ[X[‹YœšY[™HÜ˜Ú\İ˜][ÛˆXÚ\Ú[ÛœË‚ˆYˆ›ÛOOHš[›È‚ˆYˆ¹¢jùo)ˆˆ[ˆÜ™Ù]
+œİ[H‹ˆŠN‚ˆÜÈœİ[H—OH¹b!º)èùd£9o)ˆ‚ˆÈœİ™[™İ—O[X^
+‹™Ù]
+œİ™[™İ‹JKLŠBˆ[Yˆ›ÛOOH˜ÚÜ\È‚ˆYˆÜ™Ù]
+œİ[H‹º!ê¹bª9£ª:#dŠOOHº!ê¹bª9£ª:#d‚ˆÜÈœİ[H—OH¹¢jùo)ˆ‚ˆœÈ™[œÚ]H—O[X^
+œ™Ù]
+™[œÚ]H‹JKŠBˆÈœİ™[™İ—O[Z[ŠL™Ù]
+œİ™[™İ‹JJÌŠBˆYˆ™Ù]
+™š[ŠOOH¹l$zaãÈš[‚ˆÈ™š[—OH¹«­z$/ybcHš[‚ˆ[Yˆ›ÛOOH˜œšYÙH‚ˆÈX]™HÜXÙNˆX[›ÈX^HÛÛ™Ù\ˆ›İ\ÎÈİZ]\ˆ™YXÙY‚ˆÜÈ™[œÚ]H—O[X^
+K[
+Ü™Ù]
+™[œÚ]H‹JJŒMJJBˆÈœšYÚ—OH”Y:dî¹n¥H‚ˆÈœİ™[™İ—O[X^
+K[
+™Ù]
+œİ™[™İ‹JJŒÊJBˆ[Yˆ›ÛOOH›İ]›È‚ˆÜÈ™[œÚ]H—O[X^
+K[
+Ü™Ù]
+™[œÚ]H‹JJŒJJBˆœÈ™[œÚ]H—O[X^
+K[
+œ™Ù]
+™[œÚ]H‹JJŒJJBˆÈœİ™[™İ—O[X^
+K[
+™Ù]
+œİ™[™İ‹JJŒŠJBˆÈœšYÚ—OH”Y:dî¹n¥H‚‚ˆÈœ™\]Y[˜ŞKÜš]HÙ\\˜][Ûˆ]\š\İXÎ‚ˆÈYˆX[›È\È[œÙKİZ]\ˆ™XÛÛY\Èš]ZXØ[HÚ[\\ÈYˆİZ]\ˆ[œÙKX[›Èİ\İZ[œË‚ˆYˆ[
+™Ù]
+™[œÚ]H‹JJHHÈ[™[
+Ü™Ù]
+™[œÚ]H‹JJHHÎ‚ˆYˆ›ÛH[ˆ
+˜ÚÜ\È‹œÛÛÈŠN‚ˆÈœšYÚ—OH”Y:dî¹n¥H‚ˆ[ÙN‚ˆÜÈ™[œÚ]H—OMB‚ˆÙ[‹—ÙİZ]\—Ø˜\—Ù]™[ÊİZ]\‹œËÜ[ÙJBˆÙ[‹—Ø˜\Ü×Ø˜\—Ù]™[Ê˜\ÜËœËœ
+BˆÙ[‹—ÜX[›×Ø˜\—Ù]™[ÊX[›ËœË
+BˆÙ[‹—Ù[WØ˜\—Ù]™[Ê[\Ë›İ[™\JB‚‚‚‚ˆYˆÚ[YÜ˜]YÜ›\×ÙŠÙ[‹]
+N‚ˆ]KÜ\Ù‹œ™XY
+]\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆYˆ[Š]JOOL‚ˆ™]\›ˆLLŒŒˆ[Û›Ï[œ›YX[Š]K^\ÏLJBˆÈYÛ›Ü™H™X\‹\Ú[[˜ÙH›Üˆ[Ü™H\ÙY[›ÙÜ˜[K[]™[X]Ú[™Ë‚ˆX\ÚÏ[œ˜XœÊ[Û›ÊOŒYKMBˆYˆœ˜[JX\ÚÊN‚ˆ[Û›Ï[[Û›ÖÛX\Ú×Bˆ›\ÏY›Ø]
+œœÜ\
+œ›YX[ŠœœÜ]X\™J[Û›ÊJJÌYKLLŠJBˆ™]\›ˆŒŒ
+›X]›ÙÌL
+X^
+›\ËYKLLŠJB‚ˆYˆ™\\™WØX—ÛİY™\Ü×ÛX]Ú
+Ù[ŠN‚ˆO\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+H‹ˆŠBˆ\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+ˆ‹ˆŠBˆYˆ›İHÜˆ›İˆÜˆ›İ]
+JK™^\İÊ
+HÜˆ›İ]
+ŠK™^\İÊ
+N‚ˆ™]\›ˆ˜[ÙBˆN‚ˆO\Ù[‹—Ú[YÜ˜]YÜ›\×ÙŠJBˆ\Ù[‹—Ú[YÜ˜]YÜ›\×ÙŠŠBˆ\™Ù][Z[ŠKŠBˆÙ[‹˜X—ÙØZ[–ÈH—OLL
+ŠŠ
+\™Ù]YJKÌŒŒ
+BˆÙ[‹˜X—ÙØZ[–Èˆ—OLL
+ŠŠ
+\™Ù]YŠKÌŒŒ
+BˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[™Y™—ÛX™[œÙ]^
+ˆˆ¹dãyn©¹c.zac{ï&HÙN‹ŒYŸHˆ“TÈÈˆÙ‹ŒYŸHˆ“TÈ8¡¤ˆ9alyd#9æë¹¨!Èİ\™Ù]‹ŒYŸHˆ“TÈ‚ˆ
+Bˆ™]\›ˆYBˆ^Ù\^Ù\[Û‚ˆÙ[‹˜X—ÙØZ[^ÈHŒKŒˆŒKŒBˆ™]\›ˆ˜[ÙB‚ˆYˆ™Yœ™\ÚØX—İØ]™Y›Ü›\ÊÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆO\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+H‹ˆŠBˆ\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+ˆ‹ˆŠBˆYˆH[™]
+JK™^\İÊ
+N‚ˆÙ[‹˜\œ˜[™Ù[Y[˜X—İØ]™WØKœÙ]İØ]™Y›Ü›WÙœ›ÛWİØ]ŠJBˆYˆˆ[™]
+ŠK™^\İÊ
+N‚ˆÙ[‹˜\œ˜[™Ù[Y[˜X—İØ]™WØ‹œÙ]İØ]™Y›Ü›WÙœ›ÛWİØ]ŠŠB‚ˆYˆÛÜ[—ØX—Ùš[\ÊÙ[ŠN‚ˆÙ[‹—ØÛÜÙWØX—Ùš[\Ê
+Bˆ›Üˆˆ[ˆ
+H‹ˆŠN‚ˆ\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+‹ˆŠBˆYˆ[™]
+
+K™^\İÊ
+N‚ˆÙ[‹˜X—Ùš[\Öİ—O\Ù‹”Ûİ[™š[JœˆŠBˆYˆÙ]
+Ù[‹˜X—Ùš[\ËšÙ^\Ê
+JHOHÈH‹ˆŸN‚ˆÙ[‹—ØÛÜÙWØX—Ùš[\Ê
+Bˆ™]\›ˆ˜[ÙBˆO\Ù[‹˜X—Ùš[\ÖÈH—NÈ\Ù[‹˜X—Ùš[\ÖÈˆ—BˆYˆKœØ[\\˜]HOX‹œØ[\\˜]HÜˆK˜Ú[›™[ÈOX‹˜Ú[›™[Î‚ˆÙ[‹—ØÛÜÙWØX—Ùš[\Ê
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹KĞˆ9.#yao9k®H‹KĞˆ9®,¹§äù¥¡ù.í¹æ¡:aáù¨-ùã¡ù¢%¹hì:`dù¥l9.#yd#8à ˆŠBˆ™]\›ˆ˜[ÙBˆ™]\›ˆYB‚ˆYˆØÛÜÙWØX—Ùš[\ÊÙ[ŠN‚ˆ›Üˆˆ[ˆÙ]]ŠÙ[‹˜X—Ùš[\È‹ßJK˜[Y\Ê
+N‚ˆNˆ‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Ûˆ\ÜÂˆÙ[‹˜X—Ùš[\Ï^ßB‚ˆYˆİ\ØX—Ú[œİ[Ü™]šY]ÊÙ[ŠN‚ˆYˆ›İÙ[‹—ÛÜ[—ØX—Ùš[\Ê
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9¢¢ˆH9d£ˆ:`ïy®,¹§äù¢$ĞU¸à ˆŠBˆ™]\›ˆ˜[ÙB‚ˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[™Ù[‹˜\œ˜[™Ù[Y[›İY™\Ü×ÛX]Úš\ĞÚXÚÙY
+
+N‚ˆÙ[‹œ™\\™WØX—ÛİY™\Ü×ÛX]Ú
+
+Bˆ[ÙN‚ˆÙ[‹˜X—ÙØZ[^ÈHŒKŒˆŒKŒB‚ˆİ\[™\Ù[‹—ÜÙ[XİYØÛÛ\\™WÜÙYÛY[
+
+BˆÜ\Ù[‹˜X—Ùš[\ÖÈH—KœØ[\\˜]BˆÚ\Ù[‹˜X—Ùš[\ÖÈH—K˜Ú[›™[ÂˆÛÜX›ÛÛ
+\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[™Ù[‹˜\œ˜[™Ù[Y[›ÛÜØÛÛ\\™Kš\ĞÚXÚÙY
+
+JBˆİ\Ùœ˜[YO[X^
+[
+İ\
+œÜŠJBˆ[™Ùœ˜[YOZ[
+[™
+œÜŠHYˆ[™[ÙHZ[ŠÙ[‹˜X—Ùš[\ÖÈH—K™œ˜[Y\ËÙ[‹˜X—Ùš[\ÖÈˆ—K™œ˜[Y\ÊBˆÙ[‹˜X—Ùœ˜[YO\İ\Ùœ˜[YBˆ›Üˆˆ[ˆÙ[‹˜X—Ùš[\Ë˜[Y\Ê
+N‚ˆ‹œÙYZÊİ\Ùœ˜[YJB‚ˆYˆØŠİ]]Kœ˜[Y\Ë[YWÚ[™›Ëİ]\ÊN‚ˆ\Ù[‹˜X—Øİ\œ™[İ˜\šX[ˆ\Ù[‹˜X—Ùš[\Öİ—BˆÈÙY\›İš[\È[YÛ™Y]™[ˆÚ[ˆÛ›HÛ™H\È]YX›K‚ˆÜÏ\Ù[‹˜X—Ùœ˜[YBˆ›ÜˆÙ^Kš[ˆÙ[‹˜X—Ùš[\Ëš][\Ê
+N‚ˆšœÙYZÊÜÊBˆ]O\Ù[‹˜X—Ùš[\Öİ—Kœ™XY
+œ˜[Y\Ë\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆ[[Š]JB‚ˆYˆœ˜[Y\ÈÜˆÜÊÛY[™Ùœ˜[YN‚ˆ˜[Y[X^
+Z[Š‹[™Ùœ˜[YK\ÜÊJBˆš\œİY]VÎ˜[YBˆYˆÛÜ‚ˆ™[XZ[Yœ˜[Y\Ë]˜[Yˆ›Üˆš[ˆÙ[‹˜X—Ùš[\Ë˜[Y\Ê
+N‚ˆšœÙYZÊİ\Ùœ˜[YJBˆÙXÛÛ™\Ù[‹˜X—Ùš[\Öİ—Kœ™XY
+™[XZ[‹\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆ]O[œœİXÚÊÙš\œİÙXÛÛ™JHYˆ[Šš\œİ
+H[ÙHÙXÛÛ™ˆÙ[‹˜X—Ùœ˜[YO\İ\Ùœ˜[YJÛ[ŠÙXÛÛ™
+Bˆ[ÙN‚ˆİ]]K™š[
+
+BˆYˆ˜[Y‚ˆİ]]VÎ˜[YOYš\œİ
+œÙ[‹˜X—ÙØZ[‹™Ù]
+‹KŒ
+Bˆ˜Z\ÙHÙØ[˜XÚÔİÜ
+
+Bˆ[ÙN‚ˆÙ[‹˜X—Ùœ˜[YO\ÜÊÙœ˜[Y\Â‚ˆYˆ[Š]JOœ˜[Y\Î‚ˆYY[œ™\›ÜÊ
+œ˜[Y\ËÚ
+K\O[œ™›Ø]ÌŠBˆYYÎ›[Š]JWOY]Bˆ]O\YYˆİ]]VÎ—OY]VÎ™œ˜[Y\×JœÙ[‹˜X—ÙØZ[‹™Ù]
+‹KŒ
+B‚ˆÙ[‹œİÜØX—Ú[œİ[Ü™]šY]Ê
+BˆÙ[‹˜X—Üİ™X[O\Ù“İ]]İ™X[JˆØ[\\˜]O\Ü‹Ú[›™[ÏXÚ\OH™›Ø]Ìˆ‹›ØÚÜÚ^™OMLL‹Ø[˜XÚÏXØ‚ˆ
+BˆÙ[‹˜X—Üİ™X[Kœİ\
+
+Bˆ™]\›ˆYB‚ˆYˆİÜØX—Ú[œİ[Ü™]šY]ÊÙ[ŠN‚ˆYˆÙ[‹˜X—Üİ™X[N‚ˆN‚ˆÙ[‹˜X—Üİ™X[KœİÜ
+
+BˆÙ[‹˜X—Üİ™X[K˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹˜X—Üİ™X[OS›Û™BˆÙ[‹—ØÛÜÙWØX—Ùš[\Ê
+B‚ˆYˆ[œİ[ÜİÚ]Úİ˜\šX[
+Ù[‹˜\šX[
+N‚ˆYˆ˜\šX[›İ[ˆ
+H‹ˆŠN‚ˆ™]\›‚ˆÙ[‹˜X—Øİ\œ™[İ˜\šX[]˜\šX[ˆÙ[‹˜Xİ]™Wİ˜\šX[]˜\šX[ˆYˆ›İÙ[‹˜X—Üİ™X[N‚ˆYˆ›İÙ[‹œİ\ØX—Ú[œİ[Ü™]šY]Ê
+N‚ˆ™]\›‚ˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[™Y™—ÛX™[œÙ]^
+ˆˆ¹«hùg*9ç«9¥íˆKĞˆ9kîy«å;ï&¹odùbcHİ˜\šX[H0­È‚ˆˆÉùmì¹d+ùå*9dãyn©¹c.zacIÈYˆÙ[‹˜\œ˜[™Ù[Y[›İY™\Ü×ÛX]Úš\ĞÚXÚÙY
+
+H[ÙH	ù§*¹d+ùå*9dãyn©¹c.zacIßH‚ˆ
+B‚ˆYˆ[˜[^™WØX—ÙY™™\™[˜ÙJÙ[ŠN‚ˆO\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+H‹ˆŠBˆ\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+ˆ‹ˆŠBˆYˆ›İHÜˆ›İˆÜˆ›İ]
+JK™^\İÊ
+HÜˆ›İ]
+ŠK™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9®,¹§äÈKĞˆĞU¸à ˆŠBˆ™]\›‚ˆN‚ˆKÜ˜O\Ù‹œ™XY
+K\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆ‹Ü˜\Ù‹œ™XY
+‹\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆYˆÜ˜HO\Ü˜‚ˆ˜Z\ÙH[[YQ\œ›ÜŠKĞˆ:aáù¨-ùã¡ù.#yd#ŠBˆ[Z[Š[ŠJK[ŠŠJBˆYˆL‚ˆ˜Z\ÙH[[YQ\œ›ÜŠKĞˆ:gìúh¤y..¹ênˆŠBˆOXVÎ›—NÈX–Î›—BˆYˆKœÚ\VÌWHOX‹œÚ\VÌWN‚ˆO[Z[ŠKœÚ\VÌWK‹œÚ\VÌWJBˆOXVÎ‹›WNÈX–Î‹›WB‚ˆÈÛÛ\\™HY\ˆ]™[X]Ú[™ÈÈ[\\Ú^™H\œ˜[™Ù[Y[İ[Xœ™HY™™\™[˜Ù\Ë‚ˆO\Ù[‹—Ú[YÜ˜]YÜ›\×ÙŠJBˆ\Ù[‹—Ú[YÜ˜]YÜ›\×ÙŠŠBˆ\™Ù][Z[ŠKŠBˆØOLL
+ŠŠ
+\™Ù]YJKÌŒŒ
+BˆØLL
+ŠŠ
+\™Ù]YŠKÌŒŒ
+BˆXOXJ™ØNÈ˜XŠ™Ø‚ˆY™XXKX˜‚‚ˆ›\×ØOY›Ø]
+œœÜ\
+œ›YX[ŠXJŠŒŠJÌYKLLŠJBˆ›\×ØY›Ø]
+œœÜ\
+œ›YX[Š˜ŠŠŒŠJÌYKLLŠJBˆ›\×ÙY™Y›Ø]
+œœÜ\
+œ›YX[ŠY™ŠŠŒŠJÌYKLLŠJBˆÛÜœY›Ø]
+œ˜ÛÜœ˜ÛÙYŠXKœ™\Ú\JLJK˜‹œ™\Ú\JLJJVÌWJHYˆŒL[ÙHŒˆÛÜœ[X^
+LKŒZ[ŠKŒÛÜœˆYˆ›İœš\Û˜[ŠÛÜœŠH[ÙHŒ
+JBˆ™[]]™OLLŒ
+œ›\×ÙY™‹ÛX^
+YKNK
+›\×ØJÜ›\×ØŠKÌ‹Œ
+B‚ˆÙ[‹˜\œ˜[™Ù[Y[™Y™—ÛX™[œÙ]^
+ˆˆKĞˆ9më¹o ¹b!¹§¤;ï&¹dãyn©¹c.zacyd#¹më¹o ¹o.¹n©¹î©ˆÜ™[]]™N‹ŒYŸIH0­È‚ˆˆ¹¬è¹oh¹æî9alùn©ˆØÛÜœ‹ŒÙŸH0­È‚ˆˆHÙN‹ŒYŸHˆ“TÈÈˆÙ‹ŒYŸHˆ“Tøà ˆ‚ˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹KĞˆ9më¹o ¹b!¹§¤9i,z-)H‹İŠJJB‚ˆYˆ™\İÜ™WÜÙ[XİYÚ\İÜJÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆ›İÏ\Ù[‹˜\œ˜[™Ù[Y[š\İÜWİX›K˜İ\œ™[›İÊ
+BˆYˆ›İÏ‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹c¡¹cì¹ h¹i#H‹º+íùab:`"y¢êy. 9§hyc¡¹cìº+¬9oexà ˆŠBˆ™]\›‚ˆÈX›H\È™]Ù\İYš\œİ‚ˆ[™^[[ŠÙ[‹˜\œ˜[™Ù[Y[Ú\İÜJKLK\›İÂˆYˆ[™^Üˆ[™^[[ŠÙ[‹˜\œ˜[™Ù[Y[Ú\İÜJN‚ˆ™]\›‚ˆÙ[‹—Ü\Úİ[™×Üİ]J¹ h¹i#yc¡¹cì¹bcHŠBˆİ]O\Ù[‹˜\œ˜[™Ù[Y[Ú\İÜVÚ[™^BˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÏZœÛÛ‹›ØYÊœÛÛ‹™[\Êİ]K™Ù]
+›X[X[Ûİ™\œšY\È‹ßJK[œİ\™WØ\ØÚZOQ˜[ÙJJBˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[ÏZœÛÛ‹›ØYÊœÛÛ‹™[\Êİ]K™Ù]
+˜\šX[È‹ÈHßKˆß_JK[œİ\™WØ\ØÚZOQ˜[ÙJJBˆÙ[‹˜Xİ]™Wİ˜\šX[\İ]K™Ù]
+˜Xİ]™Wİ˜\šX[‹ˆŠBˆÙ[‹›ØYÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊ
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹c¡¹cì¹ h¹i#H‹ˆ¹mì¹ h¹i#{ï&Üİ]K™Ù]
+	ÛX™[	Ë	ùc¡¹cì¹oêùáiÉÊ_HŠB‚‚ˆYˆÜÛ˜\ÚİÜİ]JÙ[‹X™[HˆŠN‚ˆ™]\›ˆÂˆ[YH[YK[YJ
+Kˆ›X™[›X™[ˆ›X[X[Ûİ™\œšY\ÈšœÛÛ‹›ØYÊœÛÛ‹™[\ÊÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\Ë[œİ\™WØ\ØÚZOQ˜[ÙJJKˆ˜\šX[ÈšœÛÛ‹›ØYÊœÛÛ‹™[\ÊÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë[œİ\™WØ\ØÚZOQ˜[ÙJJKˆ˜Xİ]™Wİ˜\šX[œÙ[‹˜Xİ]™Wİ˜\šX[ˆB‚ˆYˆÜ\Úİ[™×Üİ]JÙ[‹X™[H¹/ë¹¥.HŠN‚ˆÙ[‹[™×ÜİXÚË˜\[™
+Ù[‹—ÜÛ˜\ÚİÜİ]JX™[
+JBˆYˆ[ŠÙ[‹[™×ÜİXÚÊHˆL‚ˆÙ[‹[™×ÜİXÚÏ\Ù[‹[™×ÜİXÚÖËML—BˆÙ[‹œ™Y×ÜİXÚË˜ÛX\Š
+B‚ˆYˆ[™×Ø\œ˜[™Ù[Y[ØÚ[™ÙJÙ[ŠN‚ˆYˆ›İÙ[‹[™×ÜİXÚÎ‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹•[™È‹¹¬¨y§"ycëù¤©:e 9æ¡9¤ãy/g8à ˆŠBˆ™]\›‚ˆÙ[‹œ™Y×ÜİXÚË˜\[™
+Ù[‹—ÜÛ˜\ÚİÜİ]Jœ™YÈŠJBˆİ]O\Ù[‹[™×ÜİXÚËœÜ
+
+BˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\Ï\İ]K™Ù]
+›X[X[Ûİ™\œšY\È‹ßJBˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ï\İ]K™Ù]
+˜\šX[È‹ÈHßKˆß_JBˆÙ[‹˜Xİ]™Wİ˜\šX[\İ]K™Ù]
+˜Xİ]™Wİ˜\šX[‹ˆŠBˆÙ[‹›ØYÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊ
+BˆÙ[‹œ™Yœ™\ÚÚ\İÜWİX›J
+B‚ˆYˆ™Y×Ø\œ˜[™Ù[Y[ØÚ[™ÙJÙ[ŠN‚ˆYˆ›İÙ[‹œ™Y×ÜİXÚÎ‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹”™YÈ‹¹¬¨y§"ycëúaãy`f¹æ¡9¤ãy/g8à ˆŠBˆ™]\›‚ˆÙ[‹[™×ÜİXÚË˜\[™
+Ù[‹—ÜÛ˜\ÚİÜİ]J[™ÈŠJBˆİ]O\Ù[‹œ™Y×ÜİXÚËœÜ
+
+BˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\Ï\İ]K™Ù]
+›X[X[Ûİ™\œšY\È‹ßJBˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ï\İ]K™Ù]
+˜\šX[È‹ÈHßKˆß_JBˆÙ[‹˜Xİ]™Wİ˜\šX[\İ]K™Ù]
+˜Xİ]™Wİ˜\šX[‹ˆŠBˆÙ[‹›ØYÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊ
+BˆÙ[‹œ™Yœ™\ÚÚ\İÜWİX›J
+B‚ˆYˆØ]™WØ\œ˜[™Ù[Y[ÜÛ˜\Úİ
+Ù[ŠN‚ˆİ]O\Ù[‹—ÜÛ˜\ÚİÜİ]J¹¢bùbª9oêùáiÈŠBˆÙ[‹˜\œ˜[™Ù[Y[Ú\İÜK˜\[™
+İ]JBˆ›Û\PTÑWÑT‹È˜\œ˜[™Ù[Y[Ú\İÜH‚ˆ›Û\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœ›Ú™Xİ‚ˆY›Û\‹ÙˆÜÛÛ™ßWŞÚ[
+İ]VÉİ[YI×J_KšœÛÛˆ‚ˆÜš]Wİ^
+œÛÛ‹™[\Êİ]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆİ]VÈ™š[H—O\İŠ
+BˆÙ[‹œ™Yœ™\ÚÚ\İÜWİX›J
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹c¡¹cì¹oêùáiÈ‹ˆ¹mì¹/çykf;ï&—ÜHŠB‚ˆYˆ™Yœ™\ÚÚ\İÜWİX›JÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆX›O\Ù[‹˜\œ˜[™Ù[Y[š\İÜWİX›BˆX›KœÙ]›İĞÛİ[
+[ŠÙ[‹˜\œ˜[™Ù[Y[Ú\İÜJJBˆ›Üˆ‹][H[ˆ[[Y\˜]J™]™\œÙY
+Ù[‹˜\œ˜[™Ù[Y[Ú\İÜJJN‚ˆÏ][YKœİ™[YJ‰VKI[KIY	R‰SN‰TÈ‹[YK›ØØ[[YJ][K™Ù]
+[YH‹
+JJBˆ˜[ÏVÂˆËˆ][K™Ù]
+˜Xİ]™Wİ˜\šX[‹ˆŠHÜˆ‹H‹ˆ][K™Ù]
+›X™[‹ˆŠKˆ][K™Ù]
+™š[H‹ˆŠBˆBˆ›ÜˆËˆ[ˆ[[Y\˜]J˜[ÊN‚ˆX›KœÙ]][J‹ËUX›UÚYÙ]][JİŠŠJJB‚ˆYˆİ˜\šX[ÛZYWÜ]
+Ù[‹˜\šX[
+N‚ˆ\İŠÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+˜\šX[ßJK™Ù]
+›ZYH‹ˆŠJBˆYˆ[™]
+
+K™^\İÊ
+N‚ˆ™]\›ˆˆ™]\›ˆˆ‚‚ˆYˆİ˜\šX[Ü™[™\—Ûİ]]
+Ù[‹˜\šX[^HØ]ˆŠN‚ˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆ›Û\QVÔ•×ÑT‹È˜X—ØÛÛ\\™H‚ˆ›Û\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ™]\›ˆİŠ›Û\‹ÙˆÜÛÛ™ßWİ˜\šX[Şİ˜\šX[KÙ^HŠB‚ˆYˆ™[™\—İ˜\šX[Ø]Y[ÊÙ[‹˜\šX[
+N‚ˆZYO\Ù[‹—İ˜\šX[ÛZYWÜ]
+˜\šX[
+BˆYˆ›İZYN‚ˆÙ[‹™Ù[™\˜]Wİ˜\šX[ÛZYJ˜\šX[
+BˆZYO\Ù[‹—İ˜\šX[ÛZYWÜ]
+˜\šX[
+BˆYˆ›İZYN‚ˆ™]\›‚‚ˆÙ\Ù[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]^
+
+Kœİš\
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHÙ[‹œÛİ[™›ÛÜ]ˆYˆ›İÙˆÜˆ›İ]
+ÙŠK™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9g*8 '9¥¬9ï%ºaczgìù®¤9®,¹§äø 'yc.¹gçú`"y¢êHÛİ[™›Û8à ˆŠBˆ™]\›‚ˆ›ZYŞ[\Ù[‹—Ùš[™Ù›ZYŞ[
+
+BˆYˆ›İ›ZYŞ[‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹ï.¹l$H›ZYŞ[‹¹§*¹¢o¹b,›ZYŞ[™^xà ˆŠBˆ™]\›‚‚ˆİ]\Ù[‹—İ˜\šX[Ü™[™\—Ûİ]]
+˜\šX[Ø]ˆŠBˆN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+Bˆ\İXœ›ØÙ\ÜËœ[ŠˆÙ›ZYŞ[‹[šH‹Ù‹ZYK‹Qˆ‹İ]‹\ˆ‹L—KˆØ\\™WÛİ]]UYK^UYK[Y[İ]MŒˆ
+BˆYˆœ™]\›˜ÛÙHOHÜˆ›İ]
+İ]
+K™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ
+œİ\œˆÜˆœİİ]Üˆ‘›ZYŞ[9®,¹§äùi,z-)HŠVËLŒ—JBˆÙ[‹˜\šX[Ø]Y[Öİ˜\šX[O[İ]ˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[ËœÙ]Y˜][
+˜\šX[ßJVÈœ™[™\—İØ]ˆ—O[İ]ˆÙ[‹œ™Yœ™\ÚØX—İØ]™Y›Ü›\Ê
+BˆYˆÙ[‹˜\šX[Ø]Y[Ë™Ù]
+HŠH[™Ù[‹˜\šX[Ø]Y[Ë™Ù]
+ˆŠN‚ˆÙ[‹œ™\\™WØX—ÛİY™\Ü×ÛX]Ú
+
+BˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹®,¹§äùk£9¢$‹ˆİ˜\šX[H9âb9mì¹®,¹§äûï&—Ûİ]HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹®,¹§äùi,z-)H‹İŠJJB‚ˆYˆÜÙ[XİYØÛÛ\\™WÜÙYÛY[
+Ù[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›ˆ
+Œ›Û™JBˆ^\Ù[‹˜\œ˜[™Ù[Y[˜ÛÛ\\™WÜÙXİ[Û‹˜İ\œ™[^
+
+BˆÙXİ[ÛœÏ\Ù[‹œÙXİ[Û—İ[Y[[™HÜˆ×BˆYˆ›İ^Üˆ›İÙXİ[ÛœÎ‚ˆ™]\›ˆ
+Œ›Û™JBˆY\Ù[‹˜\œ˜[™Ù[Y[˜ÛÛ\\™WÜÙXİ[Û‹˜İ\œ™[]J
+BˆYˆY\È›Û™N‚ˆ™]\›ˆ
+Œ›Û™JBˆYZ[
+Y
+Bˆİ\Y›Ø]
+ÙXİ[ÛœÖÚYK™Ù]
+œÙXÛÛ™È‹
+JBˆ[™Y›Ø]
+ÙXİ[ÛœÖÚY
+ÌWK™Ù]
+œÙXÛÛ™È‹
+JHYˆY
+ÌO[ŠÙXİ[ÛœÊH[ÙH›Û™Bˆ™]\›ˆ
+İ\[™
+B‚ˆYˆ™]šY]×İ˜\šX[
+Ù[‹˜\šX[
+N‚ˆ]\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+˜\šX[ˆŠBˆYˆ›İ]Üˆ›İ]
+]
+K™^\İÊ
+N‚ˆÙ[‹œ™[™\—İ˜\šX[Ø]Y[Ê˜\šX[
+Bˆ]\Ù[‹˜\šX[Ø]Y[Ë™Ù]
+˜\šX[ˆŠBˆYˆ›İ]Üˆ›İ]
+]
+K™^\İÊ
+N‚ˆ™]\›‚ˆN‚ˆYˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\‚ˆN‚ˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\‹œİÜ
+
+BˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\S›Û™B‚ˆ\Ù‹”Ûİ[™š[J]œˆŠBˆÜY‹œØ[\\˜]BˆÚY‹˜Ú[›™[Âˆİ\[™\Ù[‹—ÜÙ[XİYØÛÛ\\™WÜÙYÛY[
+
+BˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[™Ù[‹˜\œ˜[™Ù[Y[›ÛÜØÛÛ\\™Kš\ĞÚXÚÙY
+
+H[™İ\Œ‚ˆ‹œÙYZÊ[
+İ\
+œÜŠJB‚ˆÛÜÜİ\Z[
+İ\
+œÜŠBˆÛÜÙ[™Z[
+[™
+œÜŠHYˆ[™[ÙH‹™œ˜[Y\ÂˆÛÜÙ[˜X›YX›ÛÛ
+\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[™Ù[‹˜\œ˜[™Ù[Y[›ÛÜØÛÛ\\™Kš\ĞÚXÚÙY
+
+JB‚ˆYˆØŠİ]]Kœ˜[Y\Ë[YWÚ[™›Ëİ]\ÊN‚ˆ]OY‹œ™XY
+œ˜[Y\Ë\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆYˆ[Š]JOœ˜[Y\Î‚ˆYˆÛÜÙ[˜X›Y‚ˆ‹œÙYZÊÛÜÜİ\
+Bˆ^˜OY‹œ™XY
+œ˜[Y\Ë[[Š]JK\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆ]O[œœİXÚÊÙ]K^˜WJHYˆ[Š]JH[ÙH^˜Bˆ[ÙN‚ˆİ]]VÎ›[Š]JWHH]BˆYˆ[Š]JOœ˜[Y\Îˆİ]]VÛ[Š]JN—OLˆ˜Z\ÙHÙØ[˜XÚÔİÜ
+
+B‚ˆYˆÛÜÙ[˜X›Y[™‹[
+
+HHÛÜÙ[™‚ˆ™[XZ[[X^
+ÛÜÙ[™J‹[
+
+K[[Š]JJJBˆYˆ™[XZ[ˆ[Š]JN‚ˆš\œİY]VÎœ™[XZ[—Bˆ‹œÙYZÊÛÜÜİ\
+BˆÙXÛÛ™Y‹œ™XY
+[Š]JK\™[XZ[‹\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆ]O[œœİXÚÊÙš\œİÙXÛÛ™JHYˆ[Šš\œİ
+H[ÙHÙXÛÛ™ˆİ]]VÎ—HH]VÎ™œ˜[Y\×B‚ˆİ™X[O\Ù“İ]]İ™X[JØ[\\˜]O\Ü‹Ú[›™[ÏXÚ\OH™›Ø]Ìˆ‹Ø[˜XÚÏXØŠBˆİ™X[Kœİ\
+
+BˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\\İ™X[BˆÙ[‹—İ˜\šX[Ü™]šY]×Ùš[OY‚ˆÙ[‹˜Xİ]™Wİ˜\šX[]˜\šX[ˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹º+åyd+9i,z-)H‹İŠJJB‚ˆYˆİÜİ˜\šX[Ü™]šY]ÊÙ[ŠN‚ˆYˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\‚ˆN‚ˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\‹œİÜ
+
+BˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆÙ[‹˜\šX[Ü™]šY]×Ü^Y\S›Û™BˆN‚ˆYˆ\Ø]ŠÙ[‹—İ˜\šX[Ü™]šY]×Ùš[HŠH[™Ù[‹—İ˜\šX[Ü™]šY]×Ùš[N‚ˆÙ[‹—İ˜\šX[Ü™]šY]×Ùš[K˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆYÜİ˜\šX[
+Ù[‹˜\šX[
+N‚ˆYˆ›İÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+˜\šX[
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹ˆ¹âb9§+İ˜\šX[H:/æ9¬¨y§"y/çykf8à ˆŠBˆ™]\›‚ˆÙ[‹—Ü\Úİ[™×Üİ]Jˆºaáùå*İ˜\šX[HŠBˆÙ[‹˜Xİ]™Wİ˜\šX[]˜\šX[ˆÚÜÙ[ZœÛÛ‹›ØYÊœÛÛ‹™[\ÊÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Öİ˜\šX[K[œİ\™WØ\ØÚZOQ˜[ÙJJBˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÏXÚÜÙ[‹™Ù]
+›X[X[Ûİ™\œšY\È‹Ù[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÊBˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[XÚÜÙ[‹˜ÛÜJ
+BˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœ›Ú™Xİ‚ˆ›Û\PTÑWÑT‹È˜\œ˜[™Ù[Y[Ú\İÜH‚ˆ›Û\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆİ]O\Ù[‹—ÜÛ˜\ÚİÜİ]Jˆºaáùå*9âb9§+İ˜\šX[HŠBˆY›Û\‹ÙˆÜÛÛ™ßWØYÜŞİ˜\šX[WŞÚ[
+[YK[YJ
+J_KšœÛÛˆ‚ˆÜš]Wİ^
+œÛÛ‹™[\Êİ]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆİ]VÈ™š[H—O\İŠ
+BˆÙ[‹˜\œ˜[™Ù[Y[Ú\İÜK˜\[™
+İ]JBˆÙ[‹œ™Yœ™\ÚÚ\İÜWİX›J
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹mìºaáùå*‹ˆ¹âb9§+İ˜\šX[H9mìº+¯¹..¹odùbcy«hùo#ùï%ºacxà ˆŠB‚ˆYˆ™Yœ™\ÚØÛÛ\\™WÜÙXİ[ÛœÊÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆÛÛX›Ï\Ù[‹˜\œ˜[™Ù[Y[˜ÛÛ\\™WÜÙXİ[Û‚ˆÛÛX›Ë˜ÛX\Š
+Bˆ›ÜˆKÈ[ˆ[[Y\˜]JÙ[‹œÙXİ[Û—İ[Y[[™HÜˆ×JN‚ˆÛÛX›Ë˜Y][JˆÜË™Ù]
+	Û˜[YIË	ù«­z$/IÊ_H0­ÈÜÙ[‹—Ù›Ü›X]İ[YJË™Ù]
+	ÜÙXÛÛ™ÉË
+J_H‹JB‚ˆYˆ™Yœ™\ÚÛX[X[ÜÙXİ[ÛœÊÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆÛÛX›Ï\Ù[‹˜\œ˜[™Ù[Y[›X[X[ÜÙXİ[Û‚ˆİ\œ™[XÛÛX›Ë˜İ\œ™[^
+
+BˆÛÛX›Ë˜›ØÚÔÚYÛ˜[ÊYJBˆÛÛX›Ë˜ÛX\Š
+BˆÙXİ[ÛœÏV×Bˆ›Üˆ›İÈ[ˆÙ[‹˜ÚÜ™İ[Y[[™HÜˆ×N‚ˆÏ\›İË™Ù]
+œÙXİ[Ûˆ‹¹«­z$/HŠBˆYˆÈ›İ[ˆÙXİ[ÛœÎ‚ˆÙXİ[ÛœË˜\[™
+ÊBˆÛÛX›Ë˜Y][\ÊÙXİ[ÛœÊBˆYˆİ\œ™[‚ˆYXÛÛX›Ë™š[™^
+İ\œ™[
+BˆYˆYLˆÛÛX›ËœÙ]İ\œ™[[™^
+Y
+BˆÛÛX›Ë˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹›ØYÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊ
+B‚ˆYˆØYÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆÙXÏ\Ù[‹˜\œ˜[™Ù[Y[›X[X[ÜÙXİ[Û‹˜İ\œ™[^
+
+Bˆ]O\Ù[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\Ë™Ù]
+ÙXËßJBˆZ\œÏVÂˆ
+›X[X[ÙİZ]\ˆ‹™İZ]\ˆŠKˆ
+›X[X[Ø˜\ÜÈ‹˜˜\ÜÈŠKˆ
+›X[X[Ù[\È‹™[\ÈŠKˆ
+›X[X[ÜX[›È‹œX[›ÈŠKˆ
+›X[X[Ùš[‹™š[ŠKˆ
+›X[X[ÜÜXÙH‹œÜXÙHŠKˆBˆ›Üˆ]‹Ù^H[ˆZ\œÎ‚ˆÙ]]ŠÙ[‹˜\œ˜[™Ù[Y[]ŠKœÙ]˜[YJ[
+]K™Ù]
+Ù^K
+JJB‚ˆYˆØ\\™WÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊÙ[ŠN‚ˆYˆ›İ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆ™]\›‚ˆÙXÏ\Ù[‹˜\œ˜[™Ù[Y[›X[X[ÜÙXİ[Û‹˜İ\œ™[^
+
+BˆYˆ›İÙXÎ‚ˆ™]\›‚ˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÖÜÙX×O^Âˆ™İZ]\ˆœÙ[‹˜\œ˜[™Ù[Y[›X[X[ÙİZ]\‹˜[YJ
+Kˆ˜˜\ÜÈœÙ[‹˜\œ˜[™Ù[Y[›X[X[Ø˜\ÜË˜[YJ
+Kˆ™[\ÈœÙ[‹˜\œ˜[™Ù[Y[›X[X[Ù[\Ë˜[YJ
+KˆœX[›ÈœÙ[‹˜\œ˜[™Ù[Y[›X[X[ÜX[›Ë˜[YJ
+Kˆ™š[œÙ[‹˜\œ˜[™Ù[Y[›X[X[Ùš[˜[YJ
+KˆœÜXÙHœÙ[‹˜\œ˜[™Ù[Y[›X[X[ÜÜXÙK˜[YJ
+KˆB‚ˆYˆØ]™WØ\œ˜[™Ù[Y[İ˜\šX[
+Ù[‹˜[YJN‚ˆÙ[‹—Ü\Úİ[™×Üİ]Jˆ¹/çykf9âb9§+Û˜[Y_HŠBˆÙ[‹˜Ø\\™WÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊ
+Bˆ]O^Âˆ›˜[YH›˜[YKˆ™[™\™ŞWØİ\™HœÙ[‹˜\œ˜[™Ù[Y[™[™\™ŞWØİ\™K˜İ\œ™[^
+
+Kˆ›X[X[Ûİ™\œšY\ÈšœÛÛ‹›ØYÊœÛÛ‹™[\ÊÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\Ë[œİ\™WØ\ØÚZOQ˜[ÙJJKˆœ^Y\—Ü›Ùš[\ÈœÙ[‹—Øİ\œ™[Ü^Y\—Ü›Ùš[\Ê
+Kˆ˜[œÜÜÙHœÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+Kˆ˜\œ˜[™ÙWÛ[ÙHœÙ[‹˜\œ˜[™Ù[Y[˜\œ˜[™ÙWÛ[ÙK˜İ\œ™[^
+
+KˆBˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[ÖÛ˜[YWOY]BˆYˆÙ[‹œÛÛ™×Ùš[N‚ˆ›Û\PTÑWÑT‹È˜\œ˜[™Ù[Y[İ˜\šX[È‚ˆ›Û\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆY›Û\‹ÙˆÔ]
+Ù[‹œÛÛ™×Ùš[JKœİ[_Wİ˜\šX[ŞÛ˜[Y_KšœÛÛˆ‚ˆÜš]Wİ^
+œÛÛ‹™[\Ê]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹âb9§+9mì¹/çykf‹ˆ¹mì¹/çykf9ï%ºacyâb9§+Û˜[Y_HŠB‚ˆYˆÜİ˜]YŞWİÚ]ÛX[X[Ûİ™\œšYJÙ[‹ÙXİ[Û—Û˜[YKİ˜]YŞK˜\šX[S›Û™JN‚ˆİYXİ
+İ˜]YŞJBˆÛİ\˜ÙO\Ù[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÂˆYˆ˜\šX[[™Ù[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+˜\šX[
+N‚ˆÛİ\˜ÙO\Ù[‹˜\œ˜[™Ù[Y[İ˜\šX[Öİ˜\šX[K™Ù]
+›X[X[Ûİ™\œšY\È‹Ûİ\˜ÙJBˆİ\Ûİ\˜ÙK™Ù]
+ÙXİ[Û—Û˜[YKßJBˆ›ÜˆÙ^H[ˆ
+™İZ]\ˆ‹˜˜\ÜÈ‹™[\È‹œX[›È‹™š[ŠN‚ˆYˆÙ^H[ˆİ‚ˆİÚÙ^WO[X^
+ŒKZ[ŠKŒİ™Ù]
+Ù^KÊJŠKŒ
+Ù›Ø]
+İ–ÚÙ^WJKÌLŒ
+JJBˆYˆœÜXÙHˆ[ˆİ‚ˆİÈœÜXÙH—O[X^
+ŒZ[ŠMKİ™Ù]
+œÜXÙH‹ŒŠJÙ›Ø]
+İ–ÈœÜXÙH—JKÌLŒ
+JBˆÈ[Ü™HÜXÙH[ÛÈİXH™YXÙ\ÈXİ]™H[œÚ]Bˆ™YXÙWÙ˜XİÜ[X^
+KKŒY›Ø]
+İ–ÈœÜXÙH—JKÌNŒ
+BˆYˆ›Ø]
+İ–ÈœÜXÙH—JOŒ‚ˆ›ÜˆÙ^H[ˆ
+™İZ]\ˆ‹˜˜\ÜÈ‹™[\È‹œX[›ÈŠN‚ˆİÚÙ^WJ\™YXÙWÙ˜XİÜ‚ˆ™]\›ˆİ‚ˆYˆÙ[™\˜]Wİ˜\šX[ÛZYJÙ[‹˜\šX[
+N‚ˆYˆ›İÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+˜\šX[
+N‚ˆÙ[‹œØ]™WØ\œ˜[™Ù[Y[İ˜\šX[
+˜\šX[
+BˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9b!¹§¤9«c9¦ì¸à ˆŠBˆ™]\›‚‚ˆN‚ˆœ›ÛHZYÈ[\ÜZYQš[KZYU˜XÚËY]SY\ÜØYÙKœL[\Âˆ\Ù[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+˜\šX[ßJBˆ›Ùš[\Ï]‹™Ù]
+œ^Y\—Ü›Ùš[\ÈŠHÜˆÙ[‹—Øİ\œ™[Ü^Y\—Ü›Ùš[\Ê
+Bˆ[ÙO]‹™Ù]
+˜\œ˜[™ÙWÛ[ÙHŠHÜˆÙ[‹˜\œ˜[™Ù[Y[˜\œ˜[™ÙWÛ[ÙK˜İ\œ™[^
+
+BˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆİ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹ˆ¹å'ù¢$İ˜\šX[H9âbRQH‹ˆİŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWŞÛ[Ù_Wİ˜\šX[Şİ˜\šX[K›ZYŠKˆ“RQH
+
+‹›ZY
+H‚ˆ
+BˆYˆ›İİ]‚ˆ™]\›‚‚ˆZYSZYQš[JXÚÜ×Ü\—Ø™X]M
+BˆY]OSZYU˜XÚÊ
+NÈZY˜XÚÜË˜\[™
+Y]JBˆœOY›Ø]
+Ù[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+˜œH‹LŒ
+HÜˆLŒ
+BˆY]K˜\[™
+Y]SY\ÜØYÙJ	ÜÙ]İ[\ÉË[\ÏXœL[\ÊœJK[YOL
+JBˆY]K˜\[™
+Y]SY\ÜØYÙJ	İ[YWÜÚYÛ˜]\™IË[Y\˜]ÜM[›ÛZ[˜]ÜM[YOL
+JB‚ˆİZ]\SZYU˜XÚÊ
+NÈİZ]\‹˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOY‰Ò]ÙZY\ˆ˜\šX[İ˜\šX[HİZ]\‰Ë[YOL
+JNÈZY˜XÚÜË˜\[™
+İZ]\ŠBˆ˜\ÜÏSZYU˜XÚÊ
+NÈ˜\ÜË˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOY‰Ò]ÙZY\ˆ˜\šX[İ˜\šX[H˜\ÜÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+˜\ÜÊBˆX[›ÏSZYU˜XÚÊ
+NÈX[›Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOY‰Ò]ÙZY\ˆ˜\šX[İ˜\šX[HX[›ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+X[›ÊBˆ[\ÏSZYU˜XÚÊ
+NÈ[\Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOY‰Ò]ÙZY\ˆ˜\šX[İ˜\šX[H[\ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+[\ÊB‚ˆÙXİ[Û—ÛX\\Ù[‹—ØZ[ÜÙXİ[Û—ÛX\
+
+BˆÙ[Z\ÏZ[
+‹™Ù]
+˜[œÜÜÙH‹Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+JJBˆ™]—ÜÙXİ[ÛS›Û™Bˆİ[[X^
+K[ŠÙ[‹˜ÚÜ™İ[Y[[™JJBˆ›ÜˆY›İÈ[ˆ[[Y\˜]JÙ[‹˜ÚÜ™İ[Y[[™JN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ[
+Yİİ[
+MJJBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆœÏ\Ù[‹—ÜÛX\ØÚÜ™Û›İ\ÊÚÜ™Ù[Z\ÊBˆÙXİ[Û\›İË™Ù]
+œÙXİ[Ûˆ‹¹«­z$/HŠBˆİ˜]YŞK›ÛO\Ù[‹—ÜÙXİ[Û—Üİ˜]YŞWÙ›Ü—Û˜[YJÙXİ[Û‹ÙXİ[Û—ÛX\
+Bˆİ˜]YŞO\Ù[‹—Üİ˜]YŞWİÚ]ÛX[X[Ûİ™\œšYJÙXİ[Û‹İ˜]YŞK˜\šX[
+Bˆ›İ[™\O\™]—ÜÙXİ[Ûˆ\È›İ›Û™H[™ÙXİ[ÛˆO\™]—ÜÙXİ[Û‚ˆ™]—ÜÙXİ[Û\ÙXİ[Û‚ˆÙ[‹—Û]\ÚXØ[Ú[[YÙ[˜ÙWØ˜\Šˆ
+İZ]\‹˜\ÜËX[›Ë[\ÊKˆ›İËœË›Ùš[\Ëİ˜]YŞK›ÛK›İ[™\K[ÙBˆ
+BˆZYœØ]™Jİ]
+BˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Öİ˜\šX[VÈ›ZYH—O[İ]ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹å'ù¢$9k£9¢$‹ˆİ˜\šX[H9âbRQH9mì¹å'ù¢$;ï&—Ûİ]HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹å'ù¢$9i,z-)H‹İŠJJB‚ˆYˆÛÛ\\™Wİ˜\šX[Üİ[[X\JÙ[ŠN‚ˆO\Ù[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+H‹ßJBˆ\Ù[‹˜\œ˜[™Ù[Y[İ˜\šX[Ë™Ù]
+ˆ‹ßJBˆ™]\›ˆÈH˜Kˆ˜ŸB‚ˆYˆÙ[™\˜]WÛ]\ÚXØ[Ú[[YÙ[˜ÙWÛZYJÙ[ŠN‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9b!¹§¤9«c9¦ì¹d£9o)¸à ˆŠBˆ™]\›‚ˆYˆ›İÙ]]ŠÙ[‹˜\œ˜[™Ù[Y[›]\ÚXØ[Ú[[YÙ[˜ÙH‹›Û™JHÜˆ›İÙ[‹˜\œ˜[™Ù[Y[›]\ÚXØ[Ú[[YÙ[˜ÙKš\ĞÚXÚÙY
+
+N‚ˆ™]\›ˆÙ[‹™Ù[™\˜]WÜÛX\Ø\œ˜[™Ù[Y[ÛZYJ
+B‚ˆN‚ˆœ›ÛHZYÈ[\ÜZYQš[KZYU˜XÚËY]SY\ÜØYÙKœL[\Âˆ›Ùš[\Ï\Ù[‹—Øİ\œ™[Ü^Y\—Ü›Ùš[\Ê
+Bˆ[ÙO\Ù[‹˜\œ˜[™Ù[Y[˜\œ˜[™ÙWÛ[ÙK˜İ\œ™[^
+
+BˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆİ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹kï9aîºgìù.d9 )ù¦nº ïyï%ºacHRQH‹ˆİŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWŞÛ[Ù_WÛ]\ÚXØ[›ZYŠKˆ“RQH
+
+‹›ZY
+H‚ˆ
+BˆYˆ›İİ]‚ˆ™]\›‚‚ˆZYSZYQš[JXÚÜ×Ü\—Ø™X]M
+BˆY]OSZYU˜XÚÊ
+NÈZY˜XÚÜË˜\[™
+Y]JBˆœOY›Ø]
+Ù[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+˜œH‹LŒ
+HÜˆLŒ
+BˆY]K˜\[™
+Y]SY\ÜØYÙJ	ÜÙ]İ[\ÉË[\ÏXœL[\ÊœJK[YOL
+JBˆY]K˜\[™
+Y]SY\ÜØYÙJ	İ[YWÜÚYÛ˜]\™IË[Y\˜]ÜM[›ÛZ[˜]ÜM[YOL
+JB‚ˆİZ]\SZYU˜XÚÊ
+NÈİZ]\‹˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆ]\ÚXØ[İZ]\‰Ë[YOL
+JNÈZY˜XÚÜË˜\[™
+İZ]\ŠBˆ˜\ÜÏSZYU˜XÚÊ
+NÈ˜\ÜË˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆ]\ÚXØ[˜\ÜÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+˜\ÜÊBˆX[›ÏSZYU˜XÚÊ
+NÈX[›Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆ]\ÚXØ[X[›ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+X[›ÊBˆ[\ÏSZYU˜XÚÊ
+NÈ[\Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆ]\ÚXØ[[\ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+[\ÊB‚ˆÙXİ[Û—ÛX\\Ù[‹—ØZ[ÜÙXİ[Û—ÛX\
+
+BˆÙ[Z\Ï\Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+Bˆ™]—ÜÙXİ[ÛS›Û™Bˆİ[[X^
+K[ŠÙ[‹˜ÚÜ™İ[Y[[™JJB‚ˆ›ÜˆY›İÈ[ˆ[[Y\˜]JÙ[‹˜ÚÜ™İ[Y[[™JN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ[
+Yİİ[
+MJJBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆœÏ\Ù[‹—ÜÛX\ØÚÜ™Û›İ\ÊÚÜ™Ù[Z\ÊBˆÙXİ[Û\›İË™Ù]
+œÙXİ[Ûˆ‹¹«­z$/HŠBˆİ˜]YŞK›ÛO\Ù[‹—ÜÙXİ[Û—Üİ˜]YŞWÙ›Ü—Û˜[YJÙXİ[Û‹ÙXİ[Û—ÛX\
+BˆÙ[‹˜Ø\\™WÛX[X[ÜÙXİ[Û—ÜÙ][™ÜÊ
+Bˆİ˜]YŞO\Ù[‹—Üİ˜]YŞWİÚ]ÛX[X[Ûİ™\œšYJÙXİ[Û‹İ˜]YŞJBˆ›İ[™\O\™]—ÜÙXİ[Ûˆ\È›İ›Û™H[™ÙXİ[ÛˆO\™]—ÜÙXİ[Û‚ˆ™]—ÜÙXİ[Û\ÙXİ[Û‚ˆÙ[‹—Û]\ÚXØ[Ú[[YÙ[˜ÙWØ˜\Šˆ
+İZ]\‹˜\ÜËX[›Ë[\ÊKˆ›İËœË›Ùš[\Ëİ˜]YŞK›ÛK›İ[™\K[ÙBˆ
+B‚ˆZYœØ]™Jİ]
+BˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[^Âˆ›[ÙH›[ÙKˆ›ZYH›İ]ˆ˜[œÜÜÙHœÙ[Z\ËˆœÛX\Ø\œ˜[™Ù\ˆ•YKˆ›]\ÚXØ[Ú[[YÙ[˜ÙH•YKˆ™[™\™ŞWØİ\™HœÙ[‹˜\œ˜[™Ù[Y[™[™\™ŞWØİ\™K˜İ\œ™[^
+
+KˆœÙXİ[Û—ÛX\œÙXİ[Û—ÛX\ˆœ^Y\—Ü›Ùš[\Èœ›Ùš[\ËˆBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹œ™Yœ™\ÚÛ]\ÚXØ[Ú[[YÙ[˜ÙWÜ™]šY]Ê
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹ºgìù.d9 )ù¦nº ïyï%ºacyk£9¢$‹ˆˆ¹mì¹¨.y£k¹«­z$/yo.¹o,xà y.d9fj9ênºeí9d£9odùbcy.d9¢bú+¯¹ïk¹å'ù¢$9¥¬RQ{ï&—Ûİ]H‚ˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹ºgìù.d9 )ùï%ºacyi,z-)H‹İŠJJB‚ˆYˆÙ[™\˜]WÜÛX\Ø\œ˜[™Ù[Y[ÛZYJÙ[ŠN‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9b!¹§¤9«c9¦ì¹d£9o)¸à ˆŠBˆ™]\›‚ˆN‚ˆœ›ÛHZYÈ[\ÜZYQš[KZYU˜XÚËY\ÜØYÙKY]SY\ÜØYÙKœL[\Âˆ›Ùš[\Ï\Ù[‹—Øİ\œ™[Ü^Y\—Ü›Ùš[\Ê
+Bˆ[ÙO\Ù[‹˜\œ˜[™Ù[Y[˜\œ˜[™ÙWÛ[ÙK˜İ\œ™[^
+
+BˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆİ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹kï9aî¹¦nº ïyï%ºacHRQH‹ˆİŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWŞÛ[Ù_WÜÛX\›ZYŠKˆ“RQH
+
+‹›ZY
+H‚ˆ
+BˆYˆ›İİ]‚ˆ™]\›‚‚ˆZYSZYQš[JXÚÜ×Ü\—Ø™X]M
+BˆY]OSZYU˜XÚÊ
+NÈZY˜XÚÜË˜\[™
+Y]JBˆœOY›Ø]
+Ù[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+˜œH‹LŒ
+HÜˆLŒ
+BˆY]K˜\[™
+Y]SY\ÜØYÙJ	ÜÙ]İ[\ÉË[\ÏXœL[\ÊœJK[YOL
+JBˆY]K˜\[™
+Y]SY\ÜØYÙJ	İ[YWÜÚYÛ˜]\™IË[Y\˜]ÜM[›ÛZ[˜]ÜM[YOL
+JB‚ˆİZ]\SZYU˜XÚÊ
+NÈİZ]\‹˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆÛX\İZ]\‰Ë[YOL
+JNÈZY˜XÚÜË˜\[™
+İZ]\ŠBˆ˜\ÜÏSZYU˜XÚÊ
+NÈ˜\ÜË˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆÛX\˜\ÜÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+˜\ÜÊBˆX[›ÏSZYU˜XÚÊ
+NÈX[›Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆÛX\X[›ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+X[›ÊBˆ[\ÏSZYU˜XÚÊ
+NÈ[\Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆÛX\[\ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+[\ÊB‚ˆÙ[Z\Ï\Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+Bˆ™]—ÜÙXİ[ÛS›Û™Bˆİ[[X^
+K[ŠÙ[‹˜ÚÜ™İ[Y[[™JJBˆ›ÜˆY›İÈ[ˆ[[Y\˜]JÙ[‹˜ÚÜ™İ[Y[[™JN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ[
+Yİİ[
+MJJBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆœÏ\Ù[‹—ÜÛX\ØÚÜ™Û›İ\ÊÚÜ™Ù[Z\ÊBˆÙXİ[Û\›İË™Ù]
+œÙXİ[Ûˆ‹ˆŠBˆ›İ[™\HH™]—ÜÙXİ[Ûˆ\È›İ›Û™H[™ÙXİ[ÛˆOH™]—ÜÙXİ[Û‚ˆ™]—ÜÙXİ[Û\ÙXİ[Û‚‚ˆÙ[‹—ÙİZ]\—Ø˜\—Ù]™[ÊİZ]\‹œË›Ùš[\Ë™Ù]
+™İZ]\ˆ‹ßJK[ÙJBˆÙ[‹—Ø˜\Ü×Ø˜\—Ù]™[Ê˜\ÜËœË›Ùš[\Ë™Ù]
+˜˜\ÜÈ‹ßJJBˆÙ[‹—ÜX[›×Ø˜\—Ù]™[ÊX[›ËœË›Ùš[\Ë™Ù]
+œX[›È‹ßJJBˆÙ[‹—Ù[WØ˜\—Ù]™[Ê[\Ë›Ùš[\Ë™Ù]
+™[\È‹ßJK›İ[™\JB‚ˆZYœØ]™Jİ]
+BˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[^Âˆ›[ÙH›[ÙKˆ›ZYH›İ]ˆ˜[œÜÜÙHœÙ[Z\ËˆœÛX\Ø\œ˜[™Ù\ˆ•YKˆœ^Y\—Ü›Ùš[\Èœ›Ùš[\ÂˆBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹¦nº ïyï%ºacyk£9¢$‹ˆˆ¹mì¹£"yáiùodùbcyd"y.å‹Ğ˜\ÜËúo$Ëúe+¹ææ:+¯¹ïk¹å'ù¢$9¥¬RQ{ï&—Ûİ]H‚ˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹¦nº ïyï%ºacyi,z-)H‹İŠJJB‚ˆYˆÙ[™\˜]WØ\œ˜[™Ù[Y[ÛZYJÙ[ŠN‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9b!¹§¤9«c9¦ì¹d£9o)¸à ˆŠBˆ™]\›‚ˆN‚ˆœ›ÛHZYÈ[\ÜZYQš[KZYU˜XÚËY\ÜØYÙKY]SY\ÜØYÙKœL[\Âˆ[ÙO\Ù[‹˜\œ˜[™Ù[Y[˜\œ˜[™ÙWÛ[ÙK˜İ\œ™[^
+
+BˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆİ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹¹kï9aî¹¥¬9ï%ºacHRQH‹İŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWŞÛ[Ù_K›ZYŠK“RQH
+
+‹›ZY
+HŠBˆYˆ›İİ]‚ˆ™]\›‚ˆZYSZYQš[JXÚÜ×Ü\—Ø™X]M
+BˆY]OSZYU˜XÚÊ
+BˆZY˜XÚÜË˜\[™
+Y]JBˆœOY›Ø]
+Ù[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+˜œH‹LŒ
+HÜˆLŒ
+BˆY]K˜\[™
+Y]SY\ÜØYÙJ	ÜÙ]İ[\ÉË[\ÏXœL[\ÊœJK[YOL
+JBˆY]K˜\[™
+Y]SY\ÜØYÙJ	İ[YWÜÚYÛ˜]\™IË[Y\˜]ÜM[›ÛZ[˜]ÜM[YOL
+JBˆ›İ\Ï^ÈÈŒÈÈŒK‘Œ‹‘ÈŒË‘H‘ˆK‘ˆÈ‹‘ÈË‘ÈÈHKHÈÌˆÌ_BˆÙ[Z\Ï\Ù[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+B‚ˆYˆÚÜ™Û›İ\ÊÚ
+N‚ˆO\™K›X]Ú
+ˆ—ŠĞKQ×JÎˆßŠOÊJOÊH‹ÚÜˆˆŠBˆYˆ›İN‚ˆ™]\›ˆÍŒ×Bˆ›Ûİ\Ù[‹—İ˜[œÜÜÙWÛ›İWÛ˜[YJK™Ü›İ\
+JKÙ[Z\ÊBˆ˜\ÙO[›İ\Ë™Ù]
+›ÛİŒ
+Bˆ\™LÈYˆK™Ü›İ\
+ŠOOH›Hˆ[ÙHˆ™]\›ˆØ˜\ÙK˜\ÙJİ\™˜\ÙJÍ×B‚ˆİZ]\SZYU˜XÚÊ
+NÈİZ]\‹˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆİZ]\‰Ë[YOL
+JNÈZY˜XÚÜË˜\[™
+İZ]\ŠBˆ˜\ÜÏSZYU˜XÚÊ
+NÈ˜\ÜË˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆ˜\ÜÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+˜\ÜÊBˆX[›ÏSZYU˜XÚÊ
+NÈX[›Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆX[›ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+X[›ÊBˆ[\ÏSZYU˜XÚÊ
+NÈ[\Ë˜\[™
+Y]SY\ÜØYÙJ	İ˜XÚ×Û˜[YIË˜[YOIÒ]ÙZY\ˆ[\ÉË[YOL
+JNÈZY˜XÚÜË˜\[™
+[\ÊB‚ˆ›Üˆ›İÈ[ˆÙ[‹˜ÚÜ™İ[Y[[™N‚ˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆœÏXÚÜ™Û›İ\ÊÚÜ™
+Bˆİ™[MYˆºd¨¹ä-ˆ[ˆ[ÙH[ÙHÌ‚ˆ›Üˆ™X][ˆ˜[™ÙJ
+N‚ˆ›Üˆˆ[ˆœÎ‚ˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[‹™[ØÚ]OYİ™[[YOLÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[œÖÌK™[ØÚ]OL[YOLÍŒÚ[›™[L
+JBˆ›Üˆˆ[ˆœÖÌN—N‚ˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[‹™[ØÚ]OL[YOLÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[œÖÌK™[ØÚ]OLK[YOLLŒÚ[›™[L
+JBˆİZ]\‹˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[œÖÌK™[ØÚ]OL[YOLÚ[›™[L
+JB‚ˆ˜˜\ÙO[œÖÌKLˆ›Üˆ™X][ˆ˜[™ÙJ
+N‚ˆ›X˜˜\ÙHYˆ™X]	LOL[ÙH˜˜\ÙJÍÂˆ˜\ÜË˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[X^
+›ŠK™[ØÚ]OMÎ[YOLÚ[›™[LJJBˆ˜\ÜË˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[X^
+›ŠK™[ØÚ]OL[YOMÚ[›™[LJJB‚ˆ™[MYˆ
+¹§*9d"y.åˆˆ[ˆ[ÙHÜˆ¹.#y£ä¹å-Hˆ[ˆ[ÙJH[ÙHˆ›Üˆˆ[ˆœÎ‚ˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[ŠÌL‹™[ØÚ]O\™[[YOLÚ[›™[LŠJBˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[œÖÌJÌL‹™[ØÚ]OL[YOLNLŒÚ[›™[LŠJBˆ›Üˆˆ[ˆœÖÌN—N‚ˆX[›Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[ŠÌL‹™[ØÚ]OL[YOLÚ[›™[LŠJB‚ˆ›ÜˆZYÚ[ˆ˜[™ÙJ
+N‚ˆÚ[][[™[İ\ÏVÊ‹JWBˆYˆZYÚ[ˆ
+
+N‚ˆÚ[][[™[İ\Ë˜\[™
+
+Í‹
+JBˆYˆZYÚ[ˆ
+‹ŠN‚ˆÚ[][[™[İ\Ë˜\[™
+
+ÎŠJBˆ›Üˆ›İK™[[ˆÚ[][[™[İ\Î‚ˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÛ‰Ë›İO[›İK™[ØÚ]O]™[[YOLÚ[›™[NJJBˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İOM‹™[ØÚ]OL[YOLÚ[›™[NJJBˆ›Üˆ›İKÈ[ˆÚ[][[™[İ\ÖÌN—N‚ˆ[\Ë˜\[™
+Y\ÜØYÙJ	Û›İWÛÙ™‰Ë›İO[›İK™[ØÚ]OL[YOLÚ[›™[NJJBˆZYœØ]™Jİ]
+BˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[^È›[ÙH›[ÙK›ZYH›İ]˜[œÜÜÙHœÙ[Z\ßBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹RH9¥.yï%ˆRQH9k£9¢$‹ˆ¹mì¹å'ù¢$9¥¬9æ¡9/-9icùï%ºacHRQ{ï&—Ûİ]W—¹."ù. :f-¹«­ycëùå*9âë9êâúgìù®¤9®,¹§äù¢$9aj9¥¬9æ¡ĞU‹ÓTÈ9/-9icøà ˆŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹å'ù¢$RQH9i,z-)H‹İŠJJB‚‚ˆYˆÚÛÜÙWÜÛİ[™›Û
+Ù[ŠN‚ˆÈHQš[QX[ÙË™Ù]Ü[‘š[S˜[YJˆÙ[‹º`"y¢êHÛİ[™›Û‹ˆ‹”Ûİ[™›Û
+
+‹œÙŒˆ
+‹œÙŒÊNÎù¢`9§"y¥¡ù.íˆ
+
+‹ŠŠH‚ˆ
+BˆYˆ›İ‚ˆ™]\›‚ˆÙ[‹œÛİ[™›ÛÜ]HˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]œÙ]^
+
+B‚ˆYˆÙš[™Ù›ZYŞ[
+Ù[ŠN‚ˆØ[™Y]\ÈHÂˆTÑWÑT‹Èœ[[YH‹È™›ZYŞ[‹È˜š[ˆ‹È™›ZYŞ[™^H‹ˆTÑWÑT‹Èœ[[YH‹È™›ZYŞ[‹È™›ZYŞ[™^H‹ˆTÑWÑT‹È™›ZYŞ[™^H‹ˆBˆ›Üˆ[ˆØ[™Y]\Î‚ˆYˆ™^\İÊ
+N‚ˆ™]\›ˆİŠ
+Bˆœ›ÛHÚ][[\ÜÚXÚˆ™]\›ˆÚXÚ
+™›ZYŞ[ŠHÜˆˆ‚‚ˆYˆÙš[™Ù™›\YÊÙ[ŠN‚ˆØ[™Y]\ÈHÂˆTÑWÑT‹Èœ[[YH‹È™™›\YÈ‹È˜š[ˆ‹È™™›\YË™^H‹ˆTÑWÑT‹Èœ[[YH‹È™™›\YÈ‹È™™›\YË™^H‹ˆTÑWÑT‹È™™›\YÈ‹È™™›\YË™^H‹ˆBˆ›Üˆ[ˆØ[™Y]\Î‚ˆYˆ™^\İÊ
+N‚ˆ™]\›ˆİŠ
+Bˆœ›ÛHÚ][[\ÜÚXÚˆ™]\›ˆÚXÚ
+™™›\YÈŠHÜˆˆ‚‚ˆYˆÜ™\ÛÛ™WØ\œ˜[™Ù[Y[ÛZYJÙ[ŠN‚ˆHİŠÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[™Ù]
+›ZYH‹ˆŠHYˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[[ÙHˆŠBˆYˆ[™]
+
+K™^\İÊ
+N‚ˆ™]\›ˆˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9å'ù¢$8 '9¥¬9ï%ºacHRQx 'xà ˆŠBˆ™]\›ˆˆ‚‚ˆYˆ™[™\—Ø\œ˜[™Ù[Y[İØ]ŠÙ[ŠN‚ˆZYHHÙ[‹—Ü™\ÛÛ™WØ\œ˜[™Ù[Y[ÛZYJ
+BˆYˆ›İZYN‚ˆ™]\›‚ˆÙˆHÙ[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]^
+
+Kœİš\
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHÙ[‹œÛİ[™›ÛÜ]ˆYˆ›İÙˆÜˆ›İ]
+ÙŠK™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab:`"y¢êy. 9.*¹d"9¬åyæ¡Ûİ[™›Û;ï"œÙŒ‹ËœÙŒûï"xà ˆŠBˆ™]\›‚ˆ›ZYŞ[HÙ[‹—Ùš[™Ù›ZYŞ[
+
+BˆYˆ›İ›ZYŞ[‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+ˆÙ[‹¹ï.¹l$H›ZYŞ[‹ˆ¹§*¹¢o¹b,›ZYŞ[™^xà —º+íù¢¢ˆÚ[™İÜÈ›ZYŞ[9¥/¹b,[[YW›ZYŞ[š[—›ZYŞ[™^{ï#‚ˆ¹¢%¹k¢z(áyd#¹b¨9aiHU8à ˆ‚ˆ
+Bˆ™]\›‚ˆİ]ÈHQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹®,¹§äù¥¬9ï%ºacHĞUˆ‹ˆİŠVÔ•×ÑT‹ÙˆÔ]
+ZYJKœİ[_WÜ™[™\‹Ø]ˆŠKˆ•ĞUˆ
+
+‹Ø]ŠH‚ˆ
+BˆYˆ›İİ]‚ˆ™]\›‚ˆN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJMJBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆÛYHÂˆ›ZYŞ[‹[šH‹Ù‹ZYKˆ‹Qˆ‹İ]‹\ˆ‹L‚ˆBˆHİXœ›ØÙ\ÜËœ[ŠÛYØ\\™WÛİ]]UYK^UYK[Y[İ]MŒ
+BˆYˆœ™]\›˜ÛÙHOHÜˆ›İ]
+İ]
+K™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ
+œİ\œˆÜˆœİİ]Üˆ‘›ZYŞ[9®,¹§äùi,z-)HŠVËLŒ—JBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[Èœ™[™\—İØ]ˆ—HHİ]ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹®,¹§äùk£9¢$‹ˆ¹mì¹å'ù¢$9¥¬9æ¡9/-9icÈĞU»ï&—Ûİ]HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹•ĞUˆ9®,¹§äùi,z-)H‹İŠJJB‚ˆYˆ™[™\—Ø\œ˜[™Ù[Y[Û\ÊÙ[ŠN‚ˆZYHHÙ[‹—Ü™\ÛÛ™WØ\œ˜[™Ù[Y[ÛZYJ
+BˆYˆ›İZYN‚ˆ™]\›‚ˆÙˆHÙ[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]^
+
+Kœİš\
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHÙ[‹œÛİ[™›ÛÜ]ˆYˆ›İÙˆÜˆ›İ]
+ÙŠK™^\İÊ
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab:`"y¢êHÛİ[™›Û8à ˆŠBˆ™]\›‚ˆ›ZYŞ[HÙ[‹—Ùš[™Ù›ZYŞ[
+
+Bˆ™›\YÈHÙ[‹—Ùš[™Ù™›\YÊ
+BˆYˆ›İ›ZYŞ[‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹ï.¹l$H›ZYŞ[‹¹§*¹¢o¹b,›ZYŞ[™^xà ˆŠBˆ™]\›‚ˆYˆ›İ™›\YÎ‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹ï.¹l$H‘›\YÈ‹¹§*¹¢o¹b,™›\YË™^{ï#9¥è9¬åyï%¹è HTøà ˆŠBˆ™]\›‚ˆİ]ÈHQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹®,¹§äù¥¬9ï%ºacHTÈ‹ˆİŠVÔ•×ÑT‹ÙˆÔ]
+ZYJKœİ[_WÜ™[™\‹›\ÈŠKˆ“TÈ
+
+‹›\ÊH‚ˆ
+BˆYˆ›İİ]‚ˆ™]\›‚ˆ\HTÑWÑT‹È[\‹ÙˆÔ]
+ZYJKœİ[_WÜ™[™\—İ\Ø]ˆ‚ˆ\œ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆHHİXœ›ØÙ\ÜËœ[ŠˆÙ›ZYŞ[‹[šH‹Ù‹ZYK‹Qˆ‹İŠ\
+K‹\ˆ‹L—KˆØ\\™WÛİ]]UYK^UYK[Y[İ]MŒˆ
+BˆYˆKœ™]\›˜ÛÙHOHÜˆ›İ\™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠKœİ\œˆÜˆKœİİ]Üˆ‘›ZYŞ[9®,¹§äùi,z-)HŠBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJÍJBˆP\XØ][Û‹œ›ØÙ\ÜÑ]™[Ê
+BˆˆHİXœ›ØÙ\ÜËœ[ŠˆÙ™›\YË‹^H‹‹ZH‹İŠ\
+K‹XÛÙXÎ˜H‹›X›\Û[YH‹‹X˜H‹ŒÌŒÈ‹İ]KˆØ\\™WÛİ]]UYK^UYK[Y[İ]LÌˆ
+BˆYˆ‹œ™]\›˜ÛÙHOHÜˆ›İ]
+İ]
+K™^\İÊ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ‹œİ\œ–ËLŒ—HYˆ‹œİ\œˆ[ÙH‘‘›\YÈTÈ9ï%¹è yi,z-)HŠBˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJL
+BˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[Èœ™[™\—Û\È—HHİ]ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹®,¹§äùk£9¢$‹ˆ¹mì¹å'ù¢$9¥¬9æ¡9/-9icÈTûï&—Ûİ]HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ[‹˜\œ˜[™Ù[Y[œ›ÙÜ™\ÜËœÙ]˜[YJ
+BˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹“TÈ9®,¹§äùi,z-)H‹İŠJJBˆš[˜[N‚ˆN‚ˆYˆ\™^\İÊ
+N‚ˆ\[›[šÊ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆÛ]\ÚXŞ[ØÚÜ™Ü\ÊÙ[‹ÚÜ™
+N‚ˆ[\Ü™H\ÈÜ™BˆOWÜ™K›X]Ú
+ˆ—ŠĞKQ×JJÈØ—OÊJŠŠI‹ÚÜ™ÜˆÈŠBˆYˆ›İN‚ˆ™]\›ˆÈ‹›XZ›Üˆ‚ˆİ\[K™Ü›İ\
+JBˆXØÚY[[[K™Ü›İ\
+ŠBˆİY™š^[K™Ü›İ\
+ÊBˆ[\LHYˆXØÚY[[OHˆÈˆ[ÙH
+LHYˆXØÚY[[OH˜ˆˆ[ÙH
+BˆÚ[™ÛX\^Âˆˆˆ›XZ›Üˆ‹›Hˆ›Z[›Üˆ‹Èˆ™ÛZ[˜[‹›XZÈˆ›XZ›Ü‹\Ù]™[‹ˆ›MÈˆ›Z[›Ü‹\Ù]™[‹œİ\Íˆœİ\Ü[™YY›İ\‹™[Hˆ™[Z[š\ÚY‚ˆBˆ™]\›ˆİ\[\‹Ú[™ÛX\™Ù]
+İY™š^›XZ›ÜˆŠB‚ˆYˆ^ÜÛ]\ÚXŞ[
+Ù[ŠN‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9k£9¢$9d£9o)‹ù.d:,,yb!¹§¤8à ˆŠBˆ™]\›‚ˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹kï9aîˆ]\ÚXÖS‹ˆİŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWÒ]ÙZY\‹›]\ÚXŞ[ŠKˆ“]\ÚXÖS
+
+‹›]\ÚXŞ[
+‹[
+H‚ˆ
+BˆYˆ›İ‚ˆ™]\›‚ˆ›İÜÏ\Ù[‹—ÜØÛÜ™WÜ›İÜ×İ˜[œÜÜÙY
+
+BˆÙ^WÛX\^ÈÈŒ‘ÈŒK‘Œ‹HŒË‘HˆK‘ˆÈ‹‘ˆ‹LKHÈ‹L‹‘È‹LË‘ÈÈ‹MÈÈßBˆ\™Ù]ÚÙ^O\Ù[‹—İ˜[œÜÜÙWÛ›İWÛ˜[YJˆÙ[‹˜[˜[\Ú\×Ü™\İ[™Ù]
+šÙ^H‹ÈŠKˆÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+Bˆ
+BˆšYÏZÙ^WÛX\™Ù]
+\™Ù]ÚÙ^K
+Bˆ\ÏV×Bˆ›ÜˆY›İÈ[ˆ[[Y\˜]J›İÜËİ\LJN‚ˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆİ\[\‹Ú[™\Ù[‹—Û]\ÚXŞ[ØÚÜ™Ü\ÊÚÜ™
+Bˆ]œÏHˆ‚ˆYˆYOLN‚ˆ]œÏYˆˆˆ]šX]\Ï]š\Ú[ÛœÏŒOÙ]š\Ú[ÛœÏÙ^OšYÏÙšYßOÙšYÏÚÙ^O[YO™X]ÏØ™X]Ï™X]]\OØ™X]]\Oİ[YOÛYÚYÛ‘ÏÜÚYÛ[™OŒÛ[™OØÛYØ]šX]\Ïˆˆˆ‚ˆ[\—Ş[Yˆ›ÛİX[\Ø[\ŸOÜ›ÛİX[\ˆˆYˆ[\ˆ[ÙHˆ‚ˆ\Ë˜\[™
+ˆˆˆˆYX\İ\™H[X™\HÚYHØ]œßB\›[ÛO›Ûİ›Ûİ\İ\Üİ\OÜ›Ûİ\İ\Ø[\—Ş[OÜ›ÛİÚ[™ÚÚ[™OÚÚ[™Ú\›[ÛO‚\™Xİ[ÛˆXÙ[Y[H˜X›İ™H\™Xİ[Û‹]\OÛÜ™ÏÚ[™\ØØ\J›İË™Ù]
+œÙXİ[Ûˆ‹ˆŠJ_OİÛÜ™ÏÙ\™Xİ[Û‹]\OÙ\™Xİ[Û‚›İO™\İÏ\˜][ÛÙ\˜][Û\OÚÛOİ\OÛ›İO‚ÛYX\İ\™Oˆˆˆ‚ˆ
+Bˆ[YˆˆˆŞ[™\œÚ[ÛHŒKŒˆ[˜ÛÙ[™ÏH•U‹Nˆİ[™[Û™OH››ÈÏ‚QĞÕTHØÛÜ™K\\Ú\ÙHP“PÈ‹KËÔ™XÛÜ™\™KËÑ]\ÚXÖSŒ\Ú\ÙKËÑSˆˆš‹ËİİİË›]\ÚXŞ[›Ü™ËÙËÜ\Ú\ÙK™‚ØÛÜ™K\\Ú\ÙH™\œÚ[ÛHŒ‚ÛÜšÏÛÜšË]]OÚ[™\ØØ\JÛÛ™Ê_OİÛÜšË]]OİÛÜšÏ‚\[\İØÛÜ™K\\YH”H\[˜[YO’]ÙZY\ˆXYÚY]Ü\[˜[YOÜØÛÜ™K\\Ü\[\İ‚\YH”HÉÉËš›Ú[Š\Ê_OÜ\‚ÜØÛÜ™K\\Ú\ÙOˆˆˆ‚ˆ]
+
+KÜš]Wİ^
+[[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹“]\ÚXÖS9k£9¢$‹ˆ¹mì¹å'ù¢$;ï&—ÜHŠB‚ˆYˆ^ÜÛY[ÙWÜ™Y™\™[˜ÙJÙ[ŠN‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9kï9aiy«c9¦ì¸à ˆŠBˆ™]\›‚ˆN‚ˆ[\ÜXœ›ÜØBˆKÜ[Xœ›ÜØK›ØY
+Ù[‹œÛÛ™×Ùš[KÜLŒŒL[Û›ÏUYJBˆ™YœÏ\Ù[‹—Ù^˜XİÛY[ÙWÜ™Y™\™[˜ÙJKÜŠBˆÙ[‹›Y[ÙWÜ™Y™\™[˜ÙO\™YœÂˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[BˆÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹kï9aî¹..ù¥âùo¢ùcàº  È‹ˆİŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWÛY[ÙWÜ™Y™\™[˜ÙK˜ÜİˆŠKˆÔÕˆ
+
+‹˜ÜİŠH‚ˆ
+BˆYˆ›İ‚ˆ™]\›‚ˆ[™\ÏVÈœİ\ÜÙXÛÛ™Ë[™ÜÙXÛÛ™Ë›İH—Bˆ›Üˆˆ[ˆ™YœÎ‚ˆYˆ–È™[™—K\–Èœİ\—HHŒ‚ˆ[™\Ë˜\[™
+‰ŞÜ–Èœİ\—N‹ŒÙŸKÜ–È™[™—N‹ŒÙŸKÜ–È››İH—_IÊBˆ]
+
+KÜš]Wİ^
+—ˆ‹š›Ú[Š[™\ÊK[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹..ù¥âùo¢ùcàº  ùk£9¢$‹ˆˆ¹mì¹å'ù¢$9ceyhì:`ê:gìújæ9càº  ûï&—ÜW—º/æy¦+ú!ê¹bª:gìújæ:-çú.*¹îäù§§;ï#9.#yëbyd#9.£¹.®¹méy¨(ykîyæ¡9..ù¥âùo¢ù .ú,,xà ˆ‚ˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹..ù¥âùo¢ùcàº  ú/k9a¦yi,z-)H‹İŠJJB‚‚ˆYˆÜ›ÛİÛZYJÙ[‹ÚÜ™Øİ]™OM
+N‚ˆ[\Ü™H\ÈÜ™BˆOWÜ™K›X]Ú
+ˆ—ŠĞKQ×JJÈØ—OÊJOÊH‹ÚÜ™ÜˆÈŠBˆYˆ›İN‚ˆ™]\›ˆŒˆÏ^ÈÈŒ‘Œ‹‘H‘ˆK‘ÈËHKˆŒL_VÛK™Ü›İ\
+JWBˆYˆK™Ü›İ\
+ŠOOHˆÈˆÊÏLBˆ[YˆK™Ü›İ\
+ŠOOH˜ˆˆËOLBˆ™]\›ˆLŠŠØİ]™JÌJJÊÉLLŠB‚ˆYˆ^ÜÚ[œİ[Y[Û]\ÚXŞ[
+Ù[‹[œİ[Y[
+N‚ˆYˆ›İÙ[‹˜ÚÜ™İ[Y[[™N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9b!¹§¤9«c9¦ì¹d£9o)¸à ˆŠBˆ™]\›‚ˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[HYˆÙ[‹œÛÛ™×Ùš[H[ÙHœÛÛ™È‚ˆÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹ˆ¹kï9aîˆÚ[œİ[Y[H]\ÚXÖS‹ˆİŠVÔ•×ÑT‹ÙˆÜÛÛ™ßWŞÚ[œİ[Y[K›]\ÚXŞ[ŠKˆ“]\ÚXÖS
+
+‹›]\ÚXŞ[
+H‚ˆ
+BˆYˆ›İˆ™]\›‚ˆ›İÜÏ\Ù[‹—ÜØÛÜ™WÜ›İÜ×İ˜[œÜÜÙY
+
+BˆYX\İ\™\ÏV×Bˆ›ÜˆK›İÈ[ˆ[[Y\˜]J›İÜËJN‚ˆÚÜ™J›İË™Ù]
+˜ÚÜ™ÈŠHÜˆÈÈ—JVÌBˆZYO\Ù[‹—Ü›ÛİÛZYJÚÜ™ÈYˆ[œİ[Y[OH˜˜\ÜÈˆ[ÙH
+Bˆİ\Û˜[Y\ÏVÈÈ‹È‹‘‹‘‹‘H‹‘ˆ‹‘ˆ‹‘È‹‘È‹H‹H‹ˆ—Bˆ[\œÏVÌKKKKKBˆÏ[ZYILL‚ˆØİ]™O[ZYKËÌL‹LBˆİ\\İ\Û˜[Y\ÖÜ×NÈ[\X[\œÖÜ×Bˆ[\—Ş[Yˆ[\Ø[\ŸOØ[\ˆˆYˆ[\ˆ[ÙHˆ‚ˆ]œÏHˆ‚ˆYˆOOLN‚ˆÛYHÚYÛ‘ÜÚYÛ[™OÛ[™OˆˆYˆ[œİ[Y[OH˜˜\ÜÈˆ[ÙHÚYÛ‘ÏÜÚYÛ[™OŒÛ[™Oˆ‚ˆ]œÏYˆ]šX]\Ï]š\Ú[ÛœÏÙ]š\Ú[ÛœÏ[YO™X]ÏØ™X]Ï™X]]\OØ™X]]\Oİ[YOÛYØÛYŸOØÛYØ]šX]\Ïˆ‚ˆYˆ[œİ[Y[OH™[\È‚ˆ›İ\ÈHˆˆ‚ˆ›İO[œ]ÚY\Ü^K\İ\‘ÏÙ\Ü^K\İ\\Ü^K[Øİ]™OOÙ\Ü^K[Øİ]™Oİ[œ]ÚY\˜][ÛŒÙ\˜][Û›ÚXÙOŒOİ›ÚXÙO\O™ZYÚİ\O›İZXYÛ›İZXYÛ›İO‚ˆ›İO[œ]ÚY\Ü^K\İ\ÏÙ\Ü^K\İ\\Ü^K[Øİ]™OOÙ\Ü^K[Øİ]™Oİ[œ]ÚY\˜][ÛŒÙ\˜][Û›ÚXÙOŒOİ›ÚXÙO\O™ZYÚİ\OÛ›İO‚ˆ›İO[œ]ÚY\Ü^K\İ\‘ÏÙ\Ü^K\İ\\Ü^K[Øİ]™OOÙ\Ü^K[Øİ]™Oİ[œ]ÚY\˜][ÛŒÙ\˜][Û›ÚXÙOŒOİ›ÚXÙO\O™ZYÚİ\O›İZXYÛ›İZXYÛ›İO‚ˆ›İO[œ]ÚY\Ü^K\İ\‘Ù\Ü^K\İ\\Ü^K[Øİ]™OÙ\Ü^K[Øİ]™Oİ[œ]ÚY\˜][ÛŒÙ\˜][Û›ÚXÙOŒOİ›ÚXÙO\O™ZYÚİ\OÛ›İO‚ˆˆˆ‚ˆ›İ\ÈH›İ\ÊŒ‚ˆ[Yˆ[œİ[Y[OH™İZ]\ˆ‚ˆÈ]X\\‹[›İHÚÜ™\›ÛİXÚÚ[™È™Y™\™[˜ÙK‚ˆ›İ\ÏHˆ‹š›Ú[ŠÂˆˆ›İO]Úİ\Üİ\OÜİ\Ø[\—Ş[OØİ]™OÛØİ]™_OÛØİ]™OÜ]Ú\˜][ÛÙ\˜][Û\Oœ]X\\İ\OÛ›İOˆ‚ˆ›ÜˆÈ[ˆ˜[™ÙJ
+BˆJBˆ[Yˆ[œİ[Y[OHœX[›È‚ˆ›İ\ÏYˆ›İO]Úİ\Üİ\OÜİ\Ø[\—Ş[OØİ]™OÛØİ]™_OÛØİ]™OÜ]Ú\˜][ÛŒMÙ\˜][Û\OÚÛOİ\OÛ›İOˆ‚ˆ[ÙN‚ˆ›İ\ÏHˆ‹š›Ú[ŠÂˆˆ›İO]Úİ\Üİ\OÜİ\Ø[\—Ş[OØİ]™OÛØİ]™_OÛØİ]™OÜ]Ú\˜][ÛÙ\˜][Û\Oš[İ\OÛ›İOˆ‚ˆ›ÜˆÈ[ˆ˜[™ÙJŠBˆJBˆYX\İ\™\Ë˜\[™
+ˆYX\İ\™H[X™\IŞÚ_IÏØ]œß^Û›İ\ßOÛYX\İ\™OˆŠBˆ\Û˜[YO^È™İZ]\ˆˆ‘İZ]\ˆ‹˜˜\ÜÈˆ˜\ÜÈ‹™[\Èˆ‘[\È‹œX[›Èˆ”X[›ÈŸK™Ù]
+[œİ[Y[[œİ[Y[
+Bˆ[YˆˆˆŞ[™\œÚ[ÛHŒKŒˆ[˜ÛÙ[™ÏH•U‹NÏ‚ØÛÜ™K\\Ú\ÙH™\œÚ[ÛHŒ‚ÛÜšÏÛÜšË]]OÚ[™\ØØ\JÛÛ™Ê_OİÛÜšË]]OİÛÜšÏ‚\[\İØÛÜ™K\\YH”H\[˜[YOÜ\Û˜[Y_OÜ\[˜[YOÜØÛÜ™K\\Ü\[\İ‚\YH”HÉÉËš›Ú[ŠYX\İ\™\Ê_OÜ\ÜØÛÜ™K\\Ú\ÙOˆˆˆ‚ˆ]
+
+KÜš]Wİ^
+[[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹b!º,,yk£9¢$‹ˆ¹mì¹kï9aî»ï&—ÜHŠB‚‚ˆYˆØ]™WÛ]™WÜ™\Ù]Ùš[JÙ[ŠN‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆ™]\›‚ˆÛÛ™ÏT]
+Ù[‹œÛÛ™×Ùš[JKœİ[BˆPTÑWÑT‹Èœ™\Ù]È‹ÙˆÜÛÛ™ßKšœÛÛˆ‚ˆœ\™[›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆ]O^ÂˆœÛÛ™ÈœÙ[‹œÛÛ™×Ùš[Kˆ˜XÚÜÈÂˆÙ^NÂˆ›]]Hœ›İË›]]Kš\ĞÚXÚÙY
+
+KˆœÛÛÈœ›İËœÛÛËš\ĞÚXÚÙY
+
+Kˆ›Û[YHœ›İË›Û[YK˜[YJ
+BˆH›ÜˆÙ^K›İÈ[ˆÙ[‹œİY[Ëœ›İÜËš][\Ê
+BˆKˆ˜[œÜÜÙHœÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHˆ›]™Wİ˜[œÜÜÙHœÙ[‹›]™WÜ›Ë˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHˆ›]™WÜÜYYœÙ[‹›]™WÜ›ËœÜYY˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHKŒˆBˆÜš]Wİ^
+œÛÛ‹™[\Ê]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠB‚ˆYˆØYÛ]™WÜ™\Ù]Ùš[JÙ[ŠN‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆ™]\›‚ˆPTÑWÑT‹Èœ™\Ù]È‹ÙˆÔ]
+Ù[‹œÛÛ™×Ùš[JKœİ[_KšœÛÛˆ‚ˆYˆ›İ™^\İÊ
+N‚ˆ™]\›‚ˆN‚ˆ]OZœÛÛ‹›ØYÊœ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆ›ÜˆÙ^K˜[[ˆ]K™Ù]
+˜XÚÜÈ‹ßJKš][\Ê
+N‚ˆYˆÙ^H[ˆÙ[‹œİY[Ëœ›İÜÎ‚ˆ›İÏ\Ù[‹œİY[Ëœ›İÜÖÚÙ^WBˆ›İË›]]KœÙ]ÚXÚÙY
+›ÛÛ
+˜[™Ù]
+›]]H‹˜[ÙJJJBˆ›İËœÛÛËœÙ]ÚXÚÙY
+›ÛÛ
+˜[™Ù]
+œÛÛÈ‹˜[ÙJJJBˆ›İË›Û[YKœÙ]˜[YJ[
+˜[™Ù]
+›Û[YH‹L
+JJBˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙKœÙ]˜[YJ[
+]K™Ù]
+˜[œÜÜÙH‹
+JJBˆYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠN‚ˆÙ[‹›]™WÜ›Ë˜[œÜÜÙKœÙ]˜[YJ[
+]K™Ù]
+›]™Wİ˜[œÜÜÙH‹
+JJBˆÙ[‹›]™WÜ›ËœÜYYœÙ]˜[YJ›Ø]
+]K™Ù]
+›]™WÜÜYY‹KŒ
+JJBˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆØYÜ›Ú™XİÙš[JÙ[‹]
+N‚ˆN‚ˆ]H]
+]
+Bˆ]HHœÛÛ‹›ØYÊ]œ™XYİ^
+[˜ÛÙ[™ÏH]‹NŠJBˆÛİ\˜ÙHH]
+İŠ]K™Ù]
+œÛİ\˜ÙWÜÛÛ™ÈŠHÜˆˆŠJBˆYˆ›İÛİ\˜ÙKš\×Ùš[J
+N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹¢dùo 9méyê"È‹ˆ¹méyê"ù®¤:gìúh¤y.#ykf9g*;ï&—ÜÛİ\˜Ù_HŠBˆ™]\›‚ˆÙ[‹š[\ÜÜÛÛ™ÊİŠÛİ\˜ÙJJBˆÙ[‹›X\šÙ\œÈH\İ
+]K™Ù]
+›X\šÙ\œÈŠHÜˆ×JBˆÙ[‹˜[˜[\Ú\×Ü™\İ[HXİ
+]K™Ù]
+˜[˜[\Ú\ÈŠHÜˆßJBˆÙ[‹˜ÚÜ™İ[Y[[™HH\İ
+]K™Ù]
+˜ÚÜ™İ[Y[[™HŠHÜˆ×JBˆÙ[‹œÙXİ[Û—İ[Y[[™HH\İ
+]K™Ù]
+œÙXİ[Û—İ[Y[[™HŠHÜˆ×JBˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[HXİ
+]K™Ù]
+˜\œ˜[™Ù[Y[ŠHÜˆßJBˆÙ[‹›Y[ÙWÜ™Y™\™[˜ÙHH\İ
+]K™Ù]
+›Y[ÙWÜ™Y™\™[˜ÙHŠHÜˆ×JBˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÈHXİ
+]K™Ù]
+›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÈŠHÜˆßJBˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[ÈHXİ
+]K™Ù]
+˜\œ˜[™Ù[Y[İ˜\šX[ÈŠHÜˆÈHˆßKˆˆß_JBˆÙ[‹˜\šX[Ø]Y[ÈHXİ
+]K™Ù]
+˜\šX[Ø]Y[ÈŠHÜˆÈHˆˆ‹ˆˆˆŸJBˆÙ[‹˜\œ˜[™Ù[Y[Ú\İÜHH\İ
+]K™Ù]
+˜\œ˜[™Ù[Y[Ú\İÜHŠHÜˆ×JBˆİ[WÙ\ˆH]
+İŠ]K™Ù]
+œİ[WÙ\ˆŠHÜˆˆŠJBˆYˆİ[WÙ\‹š\×Ù\Š
+N‚ˆÙ[‹œİ[WÙ\ˆHİ[WÙ\‚ˆÙ[‹˜˜\ÙWÜİ[WÙ\ˆHİ[WÙ\‚ˆÙ[‹™[™Ú[™K›ØYÙ›Û\Šİ[WÙ\ŠBˆ›ÜˆÙ^KÙ][™ÜÈ[ˆ
+]K™Ù]
+˜XÚÜÈŠHÜˆßJKš][\Ê
+N‚ˆYˆÙ^H[ˆÙ[‹œİY[Ëœ›İÜÎ‚ˆ›İÈHÙ[‹œİY[Ëœ›İÜÖÚÙ^WBˆ›İË›]]KœÙ]ÚXÚÙY
+›ÛÛ
+Ù][™ÜË™Ù]
+›]]H‹˜[ÙJJJBˆ›İËœÛÛËœÙ]ÚXÚÙY
+›ÛÛ
+Ù][™ÜË™Ù]
+œÛÛÈ‹˜[ÙJJJBˆ›İË›Û[YKœÙ]˜[YJ[
+Ù][™ÜË™Ù]
+›Û[YH‹L
+JJBˆYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠN‚ˆÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙKœÙ]˜[YJ[
+]K™Ù]
+œØÛÜ™Wİ˜[œÜÜÙH‹
+JJBˆÙ[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]œÙ]^
+İŠ]K™Ù]
+œÛİ[™›ÛŠHÜˆˆŠJBˆYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠN‚ˆÙ[‹›]™WÜ›Ë˜[œÜÜÙKœÙ]˜[YJ[
+]K™Ù]
+›]™Wİ˜[œÜÜÙH‹
+JJBˆÙ[‹›]™WÜ›ËœÜYYœÙ]˜[YJ›Ø]
+]K™Ù]
+›]™WÜÜYY‹KŒ
+JJBˆYˆ\Ø]ŠÙ[‹œÙ]\İŠNˆÙ[‹œÙ]\İš][\ÈH\İ
+]K™Ù]
+œÙ]\İŠHÜˆ×JBˆÙ[‹œŞ[˜×ÛZ^ØÛÛ›ÛÊ
+BˆÙ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙKœ™Yœ™\ÚÜØÛÜ™J
+BˆÙ[‹›˜]‹œÙ]İ\œ™[›İÊÊBˆÙ[‹œİ]\Ğ˜\Š
+KœÚİÓY\ÜØYÙJˆ¹mì¹¢dùo 9méyê"ûï&Ü]›˜[Y_HŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹¢dùo 9méyê"ùi,z-)H‹İŠ^ÊJB‚ˆYˆØ]™WÜ›Ú™Xİ
+Ù[ŠN‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹¹odùbcy¬¨y§"y«c9¦ì¹méyê"øà ˆŠBˆ™]\›‚ˆ]HHÂˆ˜\ˆTÓSQKˆ™\œÚ[Ûˆˆ‘T”ÒSÓ‹ˆ›X\šÙ\œÈˆÙ[‹›X\šÙ\œËˆ˜[˜[\Ú\ÈˆÙ[‹˜[˜[\Ú\×Ü™\İ[ˆ˜ÚÜ™İ[Y[[™HˆÙ[‹˜ÚÜ™İ[Y[[™KˆœÙXİ[Û—İ[Y[[™HˆÙ[‹œÙXİ[Û—İ[Y[[™Kˆ˜\œ˜[™Ù[Y[ˆÙ[‹˜\œ˜[™Ù[Y[Ü™\İ[ˆœØÛÜ™Wİ˜[œÜÜÙHˆÙ[‹˜\œ˜[™Ù[Y[˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHˆœÛİ[™›ÛˆÙ[‹˜\œ˜[™Ù[Y[œÛİ[™›ÛÙY]^
+
+Kœİš\
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHˆ‹ˆ›Y[ÙWÜ™Y™\™[˜ÙHˆÙ[‹›Y[ÙWÜ™Y™\™[˜ÙKˆœØÛÜ™WÙ›Ûİ×Ù[˜X›YˆÙ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙK˜]]×Ù›ÛİËš\ĞÚXÚÙY
+
+HYˆ\Ø]ŠÙ[‹œØÛÜ™WÜ\™›Ü›X[˜ÙHŠH[ÙHYKˆš[œİ[Y[Ü›Ùš[HˆÙ[‹š[œİ[Y[Ù^\šY[˜ÙK—Ü›Ùš[WÙ]J
+HYˆ\Ø]ŠÙ[‹š[œİ[Y[Ù^\šY[˜ÙHŠH[ÙHßKˆ˜[Ü^Y\—Ü›Ùš[\ÈˆÙ[‹—Øİ\œ™[Ü^Y\—Ü›Ùš[\Ê
+Kˆ›]\ÚXØ[Ú[[YÙ[˜ÙWÙ[˜X›YˆÙ[‹˜\œ˜[™Ù[Y[›]\ÚXØ[Ú[[YÙ[˜ÙKš\ĞÚXÚÙY
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHYKˆ™[™\™ŞWØİ\™HˆÙ[‹˜\œ˜[™Ù[Y[™[™\™ŞWØİ\™K˜İ\œ™[^
+
+HYˆ\Ø]ŠÙ[‹˜\œ˜[™Ù[Y[ŠH[ÙHº!ê¹bª9b)9¥«H‹ˆ›X[X[ÜÙXİ[Û—Ûİ™\œšY\ÈˆÙ[‹›X[X[ÜÙXİ[Û—Ûİ™\œšY\Ëˆ˜\œ˜[™Ù[Y[İ˜\šX[ÈˆÙ[‹˜\œ˜[™Ù[Y[İ˜\šX[Ëˆ˜\šX[Ø]Y[ÈˆÙ[‹˜\šX[Ø]Y[Ëˆ˜Xİ]™Wİ˜\šX[ˆÙ[‹˜Xİ]™Wİ˜\šX[ˆ˜\œ˜[™Ù[Y[Ú\İÜHˆÙ[‹˜\œ˜[™Ù[Y[Ú\İÜKˆ˜X—ÙØZ[ˆˆÙ[‹˜X—ÙØZ[‹ˆ˜X—Øİ\œ™[İ˜\šX[ˆÙ[‹˜X—Øİ\œ™[İ˜\šX[ˆœ\[[™WÙ[˜X›YˆYKˆœÙ]\İˆÙ[‹œÙ]\İš][\ÈYˆ\Ø]ŠÙ[‹œÙ]\İŠH[ÙH×Kˆ›]™Wİ˜[œÜÜÙHˆÙ[‹›]™WÜ›Ë˜[œÜÜÙK˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHˆ›]™WÜÜYYˆÙ[‹›]™WÜ›ËœÜYY˜[YJ
+HYˆ\Ø]ŠÙ[‹›]™WÜ›ÈŠH[ÙHKŒˆœÛİ\˜ÙWÜÛÛ™ÈˆÙ[‹œÛÛ™×Ùš[Kˆœİ[WÙ\ˆˆİŠÙ[‹œİ[WÙ\ŠHYˆÙ[‹œİ[WÙ\ˆ[ÙH›Û™Kˆ˜XÚÜÈˆÂˆÙ^NˆÂˆ›]]Hˆ›İË›]]Kš\ĞÚXÚÙY
+
+KˆœÛÛÈˆ›İËœÛÛËš\ĞÚXÚÙY
+
+Kˆ›Û[YHˆ›İË›Û[YK˜[YJ
+BˆH›ÜˆÙ^K›İÈ[ˆÙ[‹œİY[Ëœ›İÜËš][\Ê
+BˆBˆBˆY˜][H“Ò‘PÕ×ÑTˆÈ
+]
+Ù[‹œÛÛ™×Ùš[JKœİ[H
+È‹››İœšXKšœÛÛˆŠBˆÈHQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹¹/çykf9méyê"È‹İŠY˜][
+K¹ªf9dlùa/úgìù.d9méyê"È
+
+‹šœÛÛŠHŠBˆYˆ›İ‚ˆ™]\›‚ˆ]
+
+KÜš]Wİ^
+œÛÛ‹™[\Ê]K[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠK[˜ÛÙ[™ÏH]‹NŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹¢$9b§È‹¹méyê"ùmì¹/çykf8à ˆŠB‚ˆYˆ^ÜÛZ^
+Ù[ŠN‚ˆYˆ›İÙ[‹™[™Ú[™K™š[\ÈÜˆ›İÙ[‹œİ[WÙ\‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9k£9¢$9akz/j9b!¹é®øà ˆŠBˆ™]\›‚ˆİ]ÈHQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹¹kï9aî¹­íúgìÈ‹İŠVÔ•×ÑTˆÈˆÔ]
+Ù[‹œÛÛ™×Ùš[JKœİ[_WÛZ^Ø]ˆŠKˆ•ĞUˆ
+
+‹Ø]ŠH‚ˆ
+BˆYˆ›İİ]‚ˆ™]\›‚ˆN‚ˆÙ[‹œİÜ
+
+Bˆİ[\ÈHßBˆÜˆH›Û™BˆX^Ùœ˜[Y\ÈHˆÛÛÜÈHÚÈ›ÜˆËˆ[ˆÙ[‹™[™Ú[™KœÛÛËš][\Ê
+HYˆ—BˆXİ]™HHÙ]
+ÛÛÜÊHYˆÛÛÜÈ[ÙHÚÈ›ÜˆÈ[ˆÙ[‹™[™Ú[™K™š[\ÈYˆ›İÙ[‹™[™Ú[™K›]]VÚ×_Bˆ›ÜˆÙ^KËÈ[ˆÕSWÓÔ‘T‚ˆYˆÙ^H›İ[ˆXİ]™N‚ˆÛÛ[YBˆİ[WÜ]\Ù[‹œİ[WÙ\‹ÙˆÚÙ^_KØ]ˆ‚ˆYˆ›İİ[WÜ]š\×Ùš[J
+N‚ˆÛÛ[YBˆ]K\×ÜÜˆHÙ‹œ™XY
+İŠİ[WÜ]
+K\OH™›Ø]Ìˆ‹[Ø^\×Ì™UYJBˆÜˆHÜˆÜˆ\×ÜÜ‚ˆİ[\ÖÚÙ^WHH]H
+ˆÙ[‹™[™Ú[™K›Û[YVÚÙ^WBˆX^Ùœ˜[Y\ÈHX^
+X^Ùœ˜[Y\Ë[Š]JJBˆYˆ›İİ[\Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ¹¬¨y§"ycëùkï9aî¹æ¡9­.ùbª:gìú/j8à ˆŠBˆÚH™^
+]\Šİ[\Ë˜[Y\Ê
+JJKœÚ\VÌWBˆZ^Hœ™\›ÜÊ
+X^Ùœ˜[Y\ËÚ
+K\O[œ™›Ø]ÌŠBˆ›Üˆ]H[ˆİ[\Ë˜[Y\Ê
+N‚ˆZ^Î›[Š]JWH
+ÏH]BˆXZÈH›Ø]
+œ›X^
+œ˜XœÊZ^
+JJBˆYˆXZÈˆN‚ˆZ^
+HNÈXZÂˆÙ‹Üš]Jİ]Z^Ü‹İX\OH”ÓWÌŠBˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹¹kï9aî¹k£9¢$‹ˆ¹mì¹kï9aî»ï&—Ûİ]HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹kï9aî¹i,z-)H‹İŠJJB‚‚ˆYˆÙYZ×Ü˜][×Ù\™Xİ
+Ù[‹˜][ÊN‚ˆN‚ˆÙ[‹™[™Ú[™KœÙYZ×Ü˜][Ê›Ø]
+˜][ÊJBˆYˆ\Ø]ŠÙ[‹œİY[Ë[Y[[™HŠN‚ˆÙ[‹œİY[Ë[Y[[™KœÙ]˜[YJ[
+›Ø]
+˜][ÊJŒL
+JBˆYˆ\Ø]ŠÙ[‹œİY[ËØ]™Y›Ü›HŠN‚ˆÙ[‹œİY[ËØ]™Y›Ü›KœÙ]ÜÜÚ][ÛŠ›Ø]
+˜][ÊJBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆ[˜[^™WÛ]\ÚXÊÙ[ŠN‚ˆˆˆº/núaãù§+9g,9b!¹§¤8à ¹/&9abXœ›ÜØ{ï&ù¬¨y§"y¥í¹îæyaî¹¦#¹èk¹£ä9é.¸à ˆˆˆ‚ˆYˆ›İÙ[‹œÛÛ™×Ùš[N‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9kï9aiy«c9¦ì¸à ˆŠBˆ™]\›‚ˆN‚ˆ[\ÜXœ›ÜØBˆKÜˆHXœ›ÜØK›ØY
+Ù[‹œÛÛ™×Ùš[KÜS›Û™K[Û›ÏUYK\˜][ÛLN
+Bˆ[\ËÈHXœ›ÜØK˜™X]˜™X]İ˜XÚÊO^KÜ\ÜŠBˆN‚ˆ[\×İ˜[H›Ø]
+œ˜\Ø\œ˜^J[\ÊKœ™\Ú\JLJVÌJBˆ^Ù\^Ù\[Û‚ˆ[\×İ˜[H›Ø]
+[\ÊBˆÚ›ÛXHHXœ›ÜØK™™X]\™K˜Ú›ÛXWØÜ]
+O^KÜ\ÜŠBˆ]ÚØÛ\ÜÈH[
+œ˜\™ÛX^
+œ›YX[ŠÚ›ÛXK^\ÏLJJJBˆ˜[Y\ÈHÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆ—BˆÙ^HH˜[Y\ÖÜ]ÚØÛ\Ü×BˆÙ[‹˜[˜[\Ú\×Ü™\İ[HÈ˜œHˆ›İ[™
+[\×İ˜[JKšÙ^HˆÙ^_BˆÙ[‹œİY[Ë˜œWÛX™[œÙ]^
+ˆ”{ï&İ[\×İ˜[‹ŒYŸHŠBˆÙ[‹œİY[ËšÙ^WÛX™[œÙ]^
+ˆº, ù )ùcàº  ûï&ÚÙ^_HŠBˆ^Ù\[\Ü\œ›Ü‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠÙ[‹ºg :) yb!¹§¤9îá9.íˆ‹ˆ¹odùbcz/ä:(c9ã«ùh ù§*¹c!yd*ÈXœ›ÜØxà —ºaãy¥¬9§¡9nîˆŒŒVH9d#¹/&º!ê¹bª9c!yd*È”Kú, ù )ùb!¹§¤9îá9.í¸à ˆŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆSY\ÜØYÙP›Ş˜Üš]XØ[
+Ù[‹¹b!¹§¤9i,z-)H‹İŠJJB‚ˆYˆYÛX\šÙ\ŠÙ[ŠN‚ˆYˆ›İÙ[‹™[™Ú[™K™š[\Î‚ˆSY\ÜØYÙP›ŞØ\›š[™ÊÙ[‹¹£ä9é.ˆ‹º+íùab9k£9¢$9b!º/j9nm¹b¨:/ozgìú/j8à ˆŠBˆ™]\›‚ˆ\ˆHÙ[‹™[™Ú[™K™\˜][Û—ÜÙXÛÛ™Ê
+BˆÜÈHÙ[‹™[™Ú[™KœÜÚ][Û—ÜÙXÛÛ™Ê
+Bˆ˜][ÈH
+ÜËÙ\ŠHYˆ\ˆˆ[ÙHˆÈHX\šÙ\‘X[ÙÊÙ[ŠBˆYˆË™^XÊ
+HOHQX[ÙËXØÙ\Y‚ˆÙ[‹›X\šÙ\œË˜\[™
+È›˜[YHˆË›˜[YJ
+Kœ˜][Èˆ˜][ËœÙXÛÛ™ÈˆÜßJBˆÙ[‹›X\šÙ\œËœÛÜ
+Ù^O[[X™HˆÈœ˜][È—JBˆYˆ\Ø]ŠÙ[‹œİY[ËØ]™Y›Ü›HŠN‚ˆÙ[‹œİY[ËØ]™Y›Ü›KœÙ]ÛX\šÙ\œÊÙ[‹›X\šÙ\œÊB‚ˆYˆØYİØ]™Y›Ü›WÚY—Ü™XYJÙ[ŠN‚ˆN‚ˆYˆÙ[‹œİ[WÙ\ˆ[™\Ø]ŠÙ[‹œİY[ËØ]™Y›Ü›HŠN‚ˆH]
+Ù[‹œİ[WÙ\ŠHÈ›ØØ[ËØ]ˆ‚ˆYˆ™^\İÊ
+N‚ˆÙ[‹œİY[ËØ]™Y›Ü›KœÙ]İØ]™Y›Ü›WÙœ›ÛWİØ]Š
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆYˆÛÜÙQ]™[
+Ù[‹]™[ˆPÛÜÙQ]™[
+N‚ˆXœ˜\OYÙ]]ŠÙ[‹›]\ÚX×ÛXœ˜\H‹›Û™JBˆÛÜšÙ\œÏVÙÙ]]ŠÙ[‹ÛÜšÙ\ˆ‹›Û™JWBˆÛÜšÙ\œË™^[™
+\İ
+Ù]]ŠÙ[‹œÙ\™\—Ø\Y˜XİİÛÜšÙ\œÈ‹×JJJBˆYˆXœ˜\H\È›İ›Û™N‚ˆÛÜšÙ\œË™^[™
+ÂˆÙ]]ŠXœ˜\K˜˜]ÚİÛÜšÙ\ˆ‹›Û™JKˆÙ]]ŠXœ˜\Kœ\[[™WØ˜]ÚİÛÜšÙ\ˆ‹›Û™JKˆJBˆÛÜšÙ\œË™^[™
+\İ
+Ù]]ŠXœ˜\K—ØØ][Ù×İÛÜšÙ\œÈ‹×JJJBˆİYÙWİÛÜšÙ\YÙ]]ŠXœ˜\Kœ\[[™WÜİYÙWİÛÜšÙ\ˆ‹›Û™JBˆYˆİYÙWİÛÜšÙ\ˆ[™İYÙWİÛÜšÙ\‹š\Ô[›š[™Ê
+N‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹«hùg*9k¢yaj9k£9¢$9.îùb¨H‹ˆ¹odùbcyb!¹§¤ùï%ºaczf-¹«­y.ãyg*:/ä:(c8à ¹..ºf,¹«h¹méyê"ù¥¡ù.í¹£gùgcûï#:+íùëbyo¡y§+:f-¹«­yk£9¢$9d#¹a£yalúeëz/kù.í¸à ˆ‚ˆ
+Bˆ]™[šYÛ›Ü™J
+Bˆ™]\›‚ˆ›ÜˆÛÜšÙ\ˆ[ˆÛÜšÙ\œÎ‚ˆYˆÛÜšÙ\ˆ[™ÛÜšÙ\‹š\Ô[›š[™Ê
+N‚ˆN‚ˆYˆ\Ø]ŠÛÜšÙ\‹œİÜŠN‚ˆÛÜšÙ\‹œİÜ
+
+Bˆ[ÙN‚ˆÛÜšÙ\‹œ™\]Y\İ[\œ\[ÛŠ
+BˆÛÜšÙ\‹ØZ]
+Ì
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆYˆÛÜšÙ\‹š\Ô[›š[™Ê
+N‚ˆSY\ÜØYÙP›Şš[™›Ü›X][ÛŠˆÙ[‹¹«hùg*9`g9«hˆRH9.îùb¨H‹ˆ¹akz/j9.îùb¨y.ãyg*:aâ¹¥/¹ª(yg¢ú-a9®¤;ï#:+íùê#yd#¹a£yalúeëz/kù.í¸à ˆ‚ˆ
+Bˆ]™[šYÛ›Ü™J
+Bˆ™]\›‚ˆÙ[‹™[™Ú[™K˜ÛÜÙJ
+Bˆ]™[˜XØÙ\
+
+B‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×È‚ˆ\HP\XØ][ÛŠŞ\Ë˜\™İŠBˆÚ[ˆHXZ[•Ú[™İÊ
+BˆÚ[‹œÚİÊ
+BˆŞ\Ë™^]
+\™^XÊ
+JB

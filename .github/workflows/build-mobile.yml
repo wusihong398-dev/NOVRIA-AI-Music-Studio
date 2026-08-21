@@ -1,10 +1,10 @@
 name: Build Juweier Music Android and iOS
-run-name: Juweier Music v3.2.8 Android + iOS · ${{ github.ref_name }}
+run-name: Juweier Music v3.3.0 Android + iOS · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.2.8"]
+    branches: ["main", "agent/juweier-v3.3.0"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-mobile.yml"
@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# v3.2.8 final mobile build trigger after remote source verification.
+# v3.3.0 server-published catalog mobile build.
 
 jobs:
   android:
@@ -59,7 +59,7 @@ jobs:
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.8-Android-Test-Pack
+          name: Juweier-Music-v3.3.0-Android-Test-Pack
           path: |
             mobile_build/build/app/outputs/flutter-apk/app-release.apk
             mobile_build/build/app/outputs/bundle/release/app-release.aab
@@ -111,7 +111,7 @@ jobs:
       - name: Upload iOS simulator package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.2.8-iOS-Simulator
+          name: Juweier-Music-v3.3.0-iOS-Simulator
           path: ios-simulator
           if-no-files-found: error
           retention-days: 30
