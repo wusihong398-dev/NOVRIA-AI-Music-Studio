@@ -5,11 +5,16 @@ on:
   workflow_dispatch:
   push:
     branches: ["main", "agent/juweier-v3.5.0"]
+    paths-ignore:
+      - ".github/workflows/build-mobile.yml"
+      - ".github/workflows/build-ios-testflight-package.yml"
+      - ".github/workflows/build-windows-exe.yml"
+      - ".github/workflows/package-server-upgrade.yml"
 
 permissions:
   contents: read
 
-# release trigger: v3.5.0 complete source
+# release trigger: v3.5.0 complete source (contents dispatch)
 
 jobs:
   source:
