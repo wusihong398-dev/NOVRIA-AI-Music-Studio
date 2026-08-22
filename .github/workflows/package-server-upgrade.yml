@@ -46,6 +46,8 @@ jobs:
           cp requirements-server.txt requirements-lyrics-server.txt server-upgrade/
           cp Start-Juweier-Server-v340.cmd Start-Juweier-Server-v340-Products.ps1 server-upgrade/
           cp RELEASE_NOTES_v3.4.0.md server-upgrade/
+          find server-upgrade -type d -name __pycache__ -prune -exec rm -rf {} +
+          find server-upgrade -type f -name '*.pyc' -delete
       - name: Upload server upgrade without nested archive
         uses: actions/upload-artifact@v4
         with:
