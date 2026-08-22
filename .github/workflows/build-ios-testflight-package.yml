@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.5.0 TestFlight project
+# release trigger: v3.5.0 TestFlight project (contents dispatch)
 
 jobs:
   ios-project:
