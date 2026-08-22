@@ -62,13 +62,19 @@ jobs:
           flutter analyze lib --no-fatal-infos --no-fatal-warnings
           flutter build apk --release
           flutter build appbundle --release
-      - name: Upload Android package
+      - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.4.0-Android
-          path: |
-            mobile_build/build/app/outputs/flutter-apk/app-release.apk
-            mobile_build/build/app/outputs/bundle/release/app-release.aab
+          name: Juweier-Music-v3.4.0-Android-APK
+          path: mobile_build/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Upload Android AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.4.0-Android-AAB
+          path: mobile_build/build/app/outputs/bundle/release/app-release.aab
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
