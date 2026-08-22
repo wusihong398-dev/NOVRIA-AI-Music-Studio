@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Install lightweight test dependencies
+        run: python -m pip install --disable-pip-version-check opencc-python-reimplemented pypinyin
       - name: Verify v3.4.0 source
         run: |
           python -m compileall -q app server tests tools
