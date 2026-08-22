@@ -17,6 +17,8 @@ on:
 permissions:
   contents: read
 
+# release trigger: v3.4.0 Windows server overlay
+
 jobs:
   server-upgrade:
     name: Windows server overlay
