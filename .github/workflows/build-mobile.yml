@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.5.0 Android, AAB and iOS Simulator
+# release trigger: v3.5.0 Android, AAB and iOS Simulator (contents dispatch)
 
 jobs:
   android:
