@@ -1,15 +1,15 @@
 name: Package Juweier Music v3 Source
-run-name: Juweier Music v3.4.0 Source · ${{ github.ref_name }}
+run-name: Juweier Music v3.4.1 Source · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.4.0"]
+    branches: ["main", "agent/juweier-v3.4.1"]
 
 permissions:
   contents: read
 
-# release trigger: v3.4.0 complete source
+# release trigger: v3.4.1 server source
 
 jobs:
   source:
@@ -20,16 +20,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install lightweight test dependencies
         run: python -m pip install --disable-pip-version-check opencc-python-reimplemented pypinyin numpy
-      - name: Verify v3.4.0 source
+      - name: Verify v3.4.1 source
         run: |
           python -m compileall -q app server tests tools
           python -m unittest discover -s tests -v
           grep -q 'VERSION = "3.4.0"' app/main.py
           grep -q 'VERSION = "3.4.0"' server/mobile_api.py
           grep -q 'version: 3.4.0+340' mobile/pubspec.yaml
+          grep -q 'VERSION = "3.4.1"' server/mobile_api.py
       - uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.4.0-Complete-Source
+          name: Juweier-Music-v3.4.1-Complete-Source
           path: |
             .
             !.git/**

@@ -1,23 +1,24 @@
 name: Package Juweier Music Windows Server Upgrade
-run-name: Juweier Music v3.4.0 Server Upgrade · ${{ github.ref_name }}
+run-name: Juweier Music v3.4.1 Server Upgrade · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.4.0"]
+    branches: ["main", "agent/juweier-v3.4.1"]
     paths:
       - "server/**"
       - "app/**"
       - "tools/**"
       - "requirements-server.txt"
-      - "Start-Juweier-Server-v340*"
-      - "RELEASE_NOTES_v3.4.0.md"
+      - "Start-Juweier-Server-v341*"
+      - "Start-H-Full-Batch-v341*"
+      - "RELEASE_NOTES_v3.4.1.md"
       - ".github/workflows/package-server-upgrade.yml"
 
 permissions:
   contents: read
 
-# release trigger: v3.4.0 Windows server overlay
+# release trigger: v3.4.1 G/F multi-disk Windows server overlay
 
 jobs:
   server-upgrade:
@@ -33,10 +34,12 @@ jobs:
           from pathlib import Path
 
           api = Path("server/mobile_api.py").read_text(encoding="utf-8")
-          launcher = Path("Start-Juweier-Server-v340-Products.ps1").read_text(encoding="utf-8")
-          assert 'VERSION = "3.4.0"' in api
+          launcher = Path("Start-Juweier-Server-v341-Multi-Disk.ps1").read_text(encoding="utf-8")
+          assert 'VERSION = "3.4.1"' in api
           assert r"H:\juweier-music" in launcher
           assert r"G:\JuweierMusicProcessed" in launcher
+          assert r"F:\JuweierMusicProcessed" in launcher
+          assert "JUWEIER_PROCESSED_ROOTS" in launcher
           PY
       - name: Stage single-layer upgrade
         shell: bash
@@ -44,14 +47,15 @@ jobs:
           mkdir -p server-upgrade
           cp -R app server tools server-upgrade/
           cp requirements-server.txt requirements-lyrics-server.txt server-upgrade/
-          cp Start-Juweier-Server-v340.cmd Start-Juweier-Server-v340-Products.ps1 server-upgrade/
-          cp RELEASE_NOTES_v3.4.0.md server-upgrade/
+          cp Start-Juweier-Server-v341.cmd Start-Juweier-Server-v341-Multi-Disk.ps1 server-upgrade/
+          cp Start-H-Full-Batch-v341.cmd Start-H-Full-Batch-v341.ps1 server-upgrade/
+          cp RELEASE_NOTES_v3.4.1.md server-upgrade/
           find server-upgrade -type d -name __pycache__ -prune -exec rm -rf {} +
           find server-upgrade -type f -name '*.pyc' -delete
       - name: Upload server upgrade without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.4.0-Windows-Server-Upgrade
+          name: Juweier-Music-v3.4.1-Windows-Server-Upgrade
           path: server-upgrade
           if-no-files-found: error
           retention-days: 30

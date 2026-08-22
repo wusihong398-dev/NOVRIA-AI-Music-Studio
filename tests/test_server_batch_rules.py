@@ -10,9 +10,33 @@ from app.server_batch_rules import (
     title_and_artist,
 )
 from tools.prepare_server_batch import discover
+from app.processed_storage import DiskUsage, configured_processed_roots, select_processed_root
 
 
 class ServerBatchRulesTests(unittest.TestCase):
+    def test_product_storage_prefers_g_then_f_and_preserves_reserve(self):
+        roots = configured_processed_roots(Path("G:/Products"), "G:/Products;F:/Products")
+        usages = {
+            "G:/Products": DiskUsage(1000, 860, 140),
+            "F:/Products": DiskUsage(1000, 300, 700),
+        }
+        selected, snapshot = select_processed_root(
+            roots, reserve_ratio=0.15, reserve_min_bytes=100, required_bytes=10,
+            usage_provider=lambda root: usages[root.as_posix()],
+        )
+        self.assertEqual(selected.as_posix(), "F:/Products")
+        self.assertFalse(snapshot[0]["eligible"])
+        self.assertTrue(snapshot[1]["eligible"])
+
+    def test_product_storage_returns_none_when_both_disks_reach_reserve(self):
+        roots = [Path("G:/Products"), Path("F:/Products")]
+        selected, snapshot = select_processed_root(
+            roots, reserve_ratio=0.15, reserve_min_bytes=100, required_bytes=10,
+            usage_provider=lambda _root: DiskUsage(1000, 855, 145),
+        )
+        self.assertIsNone(selected)
+        self.assertTrue(all(not item["eligible"] for item in snapshot))
+
     def test_single_song_pilot_limit_is_exposed(self):
         server = (Path(__file__).resolve().parents[1] / "server" / "mobile_api.py").read_text(
             encoding="utf-8"

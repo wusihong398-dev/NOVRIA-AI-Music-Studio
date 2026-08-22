@@ -17,7 +17,7 @@ class DesktopRegressionTests(unittest.TestCase):
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
         self.assertIn('VERSION = "3.4.0"', launcher)
         self.assertIn('version: 3.4.0+340', mobile_manifest)
-        self.assertIn('VERSION = "3.4.0"', server)
+        self.assertIn('VERSION = "3.4.1"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -80,7 +80,8 @@ class DesktopRegressionTests(unittest.TestCase):
         mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
         self.assertIn('publish_status="已发布"', server)
-        self.assertIn('LIBRARY_PATHS["processed"].resolve()', server)
+        self.assertIn('allowed_roots.extend(root.resolve() for root in PROCESSED_ROOTS)', server)
+        self.assertIn('JUWEIER_PROCESSED_ROOTS', server)
         self.assertIn('song.get("final_audio_path") or stored_artifacts.get("original_audio")', server)
         self.assertIn("label: '成品曲库'", mobile)
         self.assertNotIn("label: '流水线'", mobile)

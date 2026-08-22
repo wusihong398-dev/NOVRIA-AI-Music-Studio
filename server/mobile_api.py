@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.4.0 published-product catalog.
+"""Mobile API companion for 橘味儿音乐 v3.4.1 multi-disk product catalog.
 
 Run this on the Windows/GPU computer. The server prepares and publishes songs;
 Android, iOS and Windows clients consume only validated finished products.
@@ -55,6 +55,13 @@ from app.library_catalog import (
 )
 from app.library_taxonomy import artist_initial_for, taxonomy_payload
 from app.server_batch_rules import finished_song_dir
+from app.processed_storage import (
+    StorageCapacityError,
+    capacity_message,
+    configured_processed_roots,
+    select_processed_root,
+    storage_snapshot,
+)
 from app.chinese_normalization import (
     simplified_relative_path,
     simplify_published_tree,
@@ -63,7 +70,7 @@ from app.chinese_normalization import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -80,6 +87,20 @@ LIBRARY_PATHS = ensure_library_layout(default_library_root())
 if os.environ.get("JUWEIER_PROCESSED_DIR", "").strip():
     LIBRARY_PATHS["processed"] = Path(os.environ["JUWEIER_PROCESSED_DIR"].strip())
     LIBRARY_PATHS["processed"].mkdir(parents=True, exist_ok=True)
+PROCESSED_ROOTS = configured_processed_roots(
+    Path(LIBRARY_PATHS["processed"]),
+    os.environ.get("JUWEIER_PROCESSED_ROOTS", ""),
+)
+LIBRARY_PATHS["processed"] = PROCESSED_ROOTS[0]
+PROCESSED_RESERVE_RATIO = max(
+    0.0, min(float(os.environ.get("JUWEIER_MIN_FREE_RATIO", "0.15")), 0.95)
+)
+PROCESSED_RESERVE_MIN_BYTES = max(
+    0, int(float(os.environ.get("JUWEIER_MIN_FREE_GB", "30")) * 1024 ** 3)
+)
+PROCESSED_SONG_HEADROOM_BYTES = max(
+    0, int(float(os.environ.get("JUWEIER_PUBLISH_HEADROOM_GB", "3")) * 1024 ** 3)
+)
 LIBRARY_DB = Path(os.environ.get(
     "JUWEIER_LIBRARY_DB",
     LIBRARY_PATHS["database"] / "juweier_music_library.sqlite3",
@@ -123,7 +144,7 @@ batch_thread: threading.Thread | None = None
 batch_state = {
     "running": False, "paused": False, "current_track_id": 0,
     "current_job_id": "", "submitted": 0, "completed": 0, "failed": 0,
-    "limit": 0, "updated_at": 0.0,
+    "limit": 0, "pause_reason": "", "updated_at": 0.0,
 }
 
 
@@ -552,6 +573,26 @@ def _save_batch_state() -> None:
     atomic_write_json(BATCH_STATE_FILE, {**batch_state, "counts": _batch_counts()})
 
 
+def _processed_storage_status(required_bytes: int = 0) -> tuple[Path | None, list[dict]]:
+    return select_processed_root(
+        PROCESSED_ROOTS,
+        reserve_ratio=PROCESSED_RESERVE_RATIO,
+        reserve_min_bytes=PROCESSED_RESERVE_MIN_BYTES,
+        required_bytes=max(int(required_bytes), PROCESSED_SONG_HEADROOM_BYTES),
+    )
+
+
+def _pause_batch_for_storage(snapshot: list[dict]) -> str:
+    reason = capacity_message(snapshot)
+    with batch_lock:
+        batch_state.update(
+            running=False, paused=True, current_track_id=0, current_job_id="",
+            pause_reason=reason, updated_at=time.time(),
+        )
+        _save_batch_state()
+    return reason
+
+
 def _library_batch_loop() -> None:
     global batch_thread
     while True:
@@ -580,6 +621,10 @@ def _library_batch_loop() -> None:
                 batch_state.update(running=False, current_track_id=0, current_job_id="", updated_at=time.time())
                 _save_batch_state()
             break
+        _, storage = _processed_storage_status()
+        if not any(item.get("eligible") for item in storage):
+            _pause_batch_for_storage(storage)
+            break
         track_id = int(row["id"])
         _set_track_processing_status(track_id, "排队中")
         input_path = Path(str(row["working_path"] or row["source_path"] or ""))
@@ -603,10 +648,11 @@ def _library_batch_loop() -> None:
             time.sleep(2)
             with lock:
                 status = str(jobs.get(job_id, {}).get("status") or "")
-            if status in {"completed", "failed"}:
+            if status in {"completed", "failed", "paused"}:
                 with batch_lock:
-                    key = "completed" if status == "completed" else "failed"
-                    batch_state[key] = int(batch_state[key]) + 1
+                    if status in {"completed", "failed"}:
+                        key = "completed" if status == "completed" else "failed"
+                        batch_state[key] = int(batch_state[key]) + 1
                     batch_state.update(current_track_id=0, current_job_id="", updated_at=time.time())
                     _save_batch_state()
                 break
@@ -825,10 +871,17 @@ def _friendly_job_error(exc: Exception) -> str:
 @app.get("/api/v1/library/mobile/health")
 def health(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
+    product_storage = storage_snapshot(
+        PROCESSED_ROOTS,
+        reserve_ratio=PROCESSED_RESERVE_RATIO,
+        reserve_min_bytes=PROCESSED_RESERVE_MIN_BYTES,
+    )
     return {
         "status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name(),
         "server_library_root": str(SERVER_LIBRARY_ROOTS[0]),
         "server_library_roots": [str(root) for root in SERVER_LIBRARY_ROOTS],
+        "processed_library_roots": [str(root) for root in PROCESSED_ROOTS],
+        "processed_storage": product_storage,
         "catalog_count": _catalog_count(),
         "catalog_version": catalog_version(LIBRARY_DB),
         "catalog_stats": catalog_facets(LIBRARY_DB),
@@ -1192,10 +1245,8 @@ def library(
     # row is valid when either its published audio/artifacts or its original
     # source is inside one of these explicitly configured roots.
     allowed_roots = [root.resolve() for root in SERVER_LIBRARY_ROOTS]
-    allowed_roots.extend((
-        LIBRARY_PATHS["temp"].resolve(),
-        LIBRARY_PATHS["processed"].resolve(),
-    ))
+    allowed_roots.append(LIBRARY_PATHS["temp"].resolve())
+    allowed_roots.extend(root.resolve() for root in PROCESSED_ROOTS)
     filtered = []
     for song in songs:
         stored_artifacts = dict(song.get("artifacts") or {})
@@ -1410,7 +1461,8 @@ def process_library_song(track_id: int, payload: LibraryProcessPayload, _: None 
 @app.get("/api/v1/library/batch/status")
 def library_batch_status(_: None = Depends(authorize)) -> dict:
     with batch_lock:
-        return {**batch_state, "counts": _batch_counts()}
+        _, product_storage = _processed_storage_status()
+        return {**batch_state, "counts": _batch_counts(), "processed_storage": product_storage}
 
 
 @app.post("/api/v1/library/mobile/batch/start", status_code=202)
@@ -1439,7 +1491,7 @@ def library_batch_start(
         batch_state.update(
             running=True, paused=False, current_track_id=0, current_job_id="",
             submitted=0, completed=0, failed=0, limit=safe_limit,
-            updated_at=time.time(),
+            pause_reason="", updated_at=time.time(),
         )
         if batch_thread is None or not batch_thread.is_alive():
             batch_thread = threading.Thread(
@@ -1462,19 +1514,14 @@ def library_batch_pause(_: None = Depends(authorize)) -> dict:
 def _publish_validated_result(
     working_root: Path, song: dict, artifacts: dict[str, str],
 ) -> tuple[Path, dict[str, str]]:
-    """Copy one complete song to G: and expose it with one atomic rename."""
+    """Publish to the first safe product disk (G, then F) with one atomic rename."""
 
-    processed_root = Path(LIBRARY_PATHS["processed"])
-    processed_root.mkdir(parents=True, exist_ok=True)
     total_bytes = sum(
         path.stat().st_size for path in working_root.rglob("*") if path.is_file()
     )
-    disk = shutil.disk_usage(processed_root)
-    reserve_ratio = float(os.environ.get("JUWEIER_MIN_FREE_RATIO", "0.15"))
-    if disk.total and (disk.free - total_bytes) / disk.total < reserve_ratio:
-        raise RuntimeError(
-            f"G 盘剩余空间不足，发布后将低于 {reserve_ratio:.0%} 安全线，批处理已暂停"
-        )
+    processed_root, storage = _processed_storage_status(total_bytes)
+    if processed_root is None:
+        raise StorageCapacityError(capacity_message(storage))
 
     artist = to_simplified(catalog_artist_name(song))
     title = to_simplified(
@@ -1526,7 +1573,7 @@ def _run_job(job_id: str) -> None:
     job = jobs[job_id]
     input_path = Path(job["input_path"])
     # All heavy intermediate writes stay on the internal server disk.  Only a
-    # fully validated result is copied into G:\...\01_Ready atomically.
+    # fully validated result is copied into G: or F:\...\01_Ready atomically.
     output_root = OUTPUTS / job_id
     output_root.mkdir(parents=True, exist_ok=True)
     try:
@@ -1644,6 +1691,12 @@ def _run_job(job_id: str) -> None:
             finally:
                 connection.close()
         _update(job_id, status="completed", stage="校验通过并已发布到成品曲库", progress=100, artifacts=artifacts)
+    except StorageCapacityError:
+        if job.get("library_track_id"):
+            _set_track_processing_status(int(job["library_track_id"]), "待处理")
+        _, storage = _processed_storage_status()
+        reason = _pause_batch_for_storage(storage)
+        _update(job_id, status="paused", stage="等待增加成品硬盘", error=reason)
     except Exception as exc:
         if job.get("library_track_id"):
             _set_track_processing_status(int(job["library_track_id"]), "失败")
