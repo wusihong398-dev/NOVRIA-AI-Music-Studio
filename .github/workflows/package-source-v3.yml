@@ -9,6 +9,8 @@ on:
 permissions:
   contents: read
 
+# release trigger: v3.4.0 complete source
+
 jobs:
   source:
     name: Complete source archive
