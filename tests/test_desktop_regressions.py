@@ -15,9 +15,9 @@ class DesktopRegressionTests(unittest.TestCase):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
         mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.4.0"', launcher)
-        self.assertIn('version: 3.4.0+340', mobile_manifest)
-        self.assertIn('VERSION = "3.4.1"', server)
+        self.assertIn('VERSION = "3.5.0"', launcher)
+        self.assertIn('version: 3.5.0+350', mobile_manifest)
+        self.assertIn('VERSION = "3.5.0"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -65,17 +65,17 @@ class DesktopRegressionTests(unittest.TestCase):
     def test_published_product_library_is_global_and_processing_ui_is_hidden(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
         self.assertLess(desktop.index('橘味儿音乐成品分类库'), desktop.index('批量 AI 处理器'))
-        self.assertIn('当前服务器成品', desktop)
+        self.assertIn('我的演奏专辑', desktop)
         self.assertIn('def load_server_library_track', desktop)
         self.assertIn('self.main.load_server_library_track(tid, row)', desktop)
         self.assertIn('本次未读取、未扫描客户端 G 盘', desktop)
         self.assertIn('ServerLibraryClient', desktop)
-        self.assertIn('加入当前服务器成品', desktop)
+        self.assertIn('加入当前歌曲', desktop)
         self.assertIn('batch_box.hide()', desktop)
         self.assertIn('pipeline_box.hide()', desktop)
         self.assertIn('scheduler_box.hide()', desktop)
 
-    def test_v340_clients_consume_only_published_server_products(self):
+    def test_v350_clients_consume_only_published_products(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
         mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
@@ -83,14 +83,27 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('allowed_roots.extend(root.resolve() for root in PROCESSED_ROOTS)', server)
         self.assertIn('JUWEIER_PROCESSED_ROOTS', server)
         self.assertIn('song.get("final_audio_path") or stored_artifacts.get("original_audio")', server)
-        self.assertIn("label: '成品曲库'", mobile)
+        self.assertIn("label: '音乐库'", mobile)
         self.assertNotIn("label: '流水线'", mobile)
         self.assertNotIn('PipelinePage(store: widget.store)', mobile)
-        self.assertIn('服务器成品可用', mobile)
+        self.assertIn('橘味儿音乐库成品可用', mobile)
+        self.assertIn('activePerformanceJobId', mobile)
+        self.assertIn('void selectJob(String? value)', mobile)
+        self.assertIn('总音量', mobile)
+        self.assertIn('我的常用曲目', mobile)
         self.assertIn('逐音符歌词', mobile)
         self.assertIn('self.engine.load(folder)', desktop)
         self.assertIn('self.melody_reference=list(score.get("staff_notes") or [])', desktop)
         self.assertIn('self.lyric_reference=[', desktop)
+
+    def test_v350_server_recovers_migrated_product_artifacts(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('def _recover_published_artifacts', server)
+        self.assertIn('published_manifest.json', server)
+        self.assertIn('finished_song_dir(root, initial, artist, title)', server)
+        self.assertIn('_persist_recovered_artifacts(track_id, stored_artifacts)', server)
+        self.assertIn('processed_library_roots', server)
+        self.assertIn('processed_storage', server)
 
     def test_server_scores_share_one_synced_lyrics_timeline(self):
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')

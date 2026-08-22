@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
-Write-Host "=== Juweier Music v3.4.0 Published-Product Windows Build ==="
+Write-Host "=== Juweier Music v3.5.0 Performance Library Windows Build ==="
 
 python -m pip install --upgrade pip setuptools wheel
 

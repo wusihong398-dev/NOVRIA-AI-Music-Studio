@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v3.4.1 multi-disk product catalog.
+"""Mobile API companion for 橘味儿音乐 v3.5.0 multi-disk product catalog.
 
 Run this on the Windows/GPU computer. The server prepares and publishes songs;
 Android, iOS and Windows clients consume only validated finished products.
@@ -70,7 +70,7 @@ from app.chinese_normalization import (
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.4.1"
+VERSION = "3.5.0"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -898,7 +898,7 @@ def health(_: None = Depends(authorize)) -> dict:
 def app_config(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.4.0",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.5.0",
         "service": "online",
         "processing_ready": capabilities["processing_ready"],
         "lyrics_asr_available": capabilities["lyrics_asr_available"],
@@ -1216,6 +1216,122 @@ def _queue_job(
     return job_id
 
 
+_PUBLISHED_ARTIFACT_NAMES = {
+    "stem_vocals": "vocals.wav",
+    "stem_drums": "drums.wav",
+    "stem_bass": "bass.wav",
+    "stem_guitar": "guitar.wav",
+    "stem_guitar_combined": "guitar_combined.wav",
+    "stem_electric_guitar": "electric_guitar.wav",
+    "stem_piano": "piano.wav",
+    "stem_other": "other.wav",
+    "electric_guitar_report": "guitar_second_stage.json",
+    "chords": "chords.json",
+    "lead_sheet": "lead_sheet.html",
+    "guitar_tab": "guitar_tab.html",
+    "acoustic_guitar_tab": "acoustic_guitar_tab.html",
+    "electric_guitar_tab": "electric_guitar_tab.html",
+    "bass_score": "bass_score.html",
+    "drum_score": "drum_score.html",
+    "piano_score": "piano_score.html",
+    "musicxml": "lead_sheet.musicxml",
+    "score_data": "score_data.json",
+    "lyrics_timeline": "lyrics_timeline.json",
+    "arrangement_midi": "arrangement.mid",
+    "readiness_report": "publish_readiness.json",
+}
+
+
+def _published_product_candidates(song: dict) -> list[Path]:
+    """Return the standard product folders for a published catalog row.
+
+    v3.3.9 renamed Traditional-Chinese folders after some absolute paths had
+    already been stored in SQLite.  The products themselves remained intact,
+    but those stale paths made the public catalog expose an empty artifacts
+    object.  Rebuilding from the deterministic product layout keeps old and
+    future products directly playable without rescanning the originals.
+    """
+
+    candidates: list[Path] = []
+    final_audio = Path(str(song.get("final_audio_path") or ""))
+    if final_audio.name:
+        for parent in final_audio.parents:
+            if (parent / "published_manifest.json").is_file():
+                candidates.append(parent)
+                break
+    artist = catalog_artist_name(song)
+    title = str(song.get("title") or "未知歌曲")
+    initial = str(song.get("artist_initial") or _artist_initial(
+        artist, str(song.get("source_path") or ""),
+    ))
+    for root in PROCESSED_ROOTS:
+        candidate = finished_song_dir(root, initial, artist, title)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _recover_published_artifacts(song: dict) -> dict[str, str]:
+    """Return verified artifact paths, repairing stale migrated paths."""
+
+    stored = dict(song.get("artifacts") or {})
+    valid = {
+        str(key): str(value) for key, value in stored.items()
+        if Path(str(value)).is_file()
+    }
+    required = {"original_audio", "stem_vocals", "stem_drums", "score_data"}
+    if required.issubset(valid):
+        return valid
+
+    for product in _published_product_candidates(song):
+        if not product.is_dir():
+            continue
+        manifest_path = product / "published_manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                for key, value in dict(manifest.get("artifacts") or {}).items():
+                    path = Path(str(value))
+                    if path.is_file():
+                        valid[str(key)] = str(path)
+            except (OSError, ValueError, TypeError):
+                pass
+        by_name: dict[str, Path] = {}
+        for path in product.rglob("*"):
+            if path.is_file():
+                by_name.setdefault(path.name.casefold(), path)
+        for key, name in _PUBLISHED_ARTIFACT_NAMES.items():
+            path = by_name.get(name.casefold())
+            if path is not None:
+                valid[key] = str(path)
+        original = next(
+            (path for path in (product / "audio").glob("original.*") if path.is_file()),
+            None,
+        )
+        if original is not None:
+            valid["original_audio"] = str(original)
+        if required.issubset(valid):
+            break
+    return valid
+
+
+def _persist_recovered_artifacts(track_id: int, artifacts: dict[str, str]) -> None:
+    if not artifacts:
+        return
+    connection = connect_catalog(LIBRARY_DB)
+    try:
+        connection.execute(
+            "UPDATE tracks SET artifacts_json=?,final_audio_path=? WHERE id=?",
+            (
+                json.dumps(artifacts, ensure_ascii=False),
+                artifacts.get("original_audio", ""), int(track_id),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 @app.get("/api/v1/library/mobile/catalog")
 @app.get("/api/v1/library/catalog")
 @app.get("/api/v1/library")
@@ -1249,7 +1365,12 @@ def library(
     allowed_roots.extend(root.resolve() for root in PROCESSED_ROOTS)
     filtered = []
     for song in songs:
-        stored_artifacts = dict(song.get("artifacts") or {})
+        track_id = int(song["id"])
+        original_artifacts = dict(song.get("artifacts") or {})
+        stored_artifacts = _recover_published_artifacts(song)
+        if stored_artifacts != original_artifacts:
+            _persist_recovered_artifacts(track_id, stored_artifacts)
+            song["artifacts"] = stored_artifacts
         raw_path = str(
             song.get("final_audio_path") or stored_artifacts.get("original_audio")
             or song.get("working_path") or song.get("source_path") or ""
@@ -1275,7 +1396,7 @@ def library(
         song.pop("source_path", None)
         song.pop("working_path", None)
         song["audio_url"] = str(request.url_for("library_mobile_audio", track_id=track_id))
-        stored_artifacts = dict(song.get("artifacts") or {})
+        stored_artifacts = _recover_published_artifacts(song)
         audio_path = Path(str(
             song.get("final_audio_path") or stored_artifacts.get("original_audio")
             or source_path
@@ -1369,6 +1490,10 @@ def library_audio(track_id: int, _: None = Depends(authorize)):
         artifacts = json.loads(str(song.get("artifacts_json") or "{}")) if song else {}
     except Exception:
         artifacts = {}
+    if song:
+        recovered = _recover_published_artifacts(song)
+        if recovered:
+            artifacts = recovered
     path = Path(str(
         (song or {}).get("final_audio_path") or artifacts.get("original_audio")
         or (song or {}).get("working_path") or (song or {}).get("source_path") or ""
@@ -1397,6 +1522,10 @@ def library_lyrics(track_id: int, _: None = Depends(authorize)):
         artifacts = json.loads(str(song.get("artifacts_json") or "{}")) if song else {}
     except Exception:
         artifacts = {}
+    if song:
+        recovered = _recover_published_artifacts(song)
+        if recovered:
+            artifacts = recovered
     timeline_path = Path(str(artifacts.get("lyrics_timeline") or ""))
     if timeline_path.is_file():
         return FileResponse(timeline_path, filename="lyrics_timeline.json", media_type="application/json")
@@ -1423,6 +1552,10 @@ def library_catalog_artifact(track_id: int, artifact_key: str, _: None = Depends
         artifacts = json.loads(str(song.get("artifacts_json") or "{}")) if song else {}
     except Exception:
         artifacts = {}
+    if song:
+        recovered = _recover_published_artifacts(song)
+        if recovered:
+            artifacts = recovered
     path = Path(str(artifacts.get(artifact_key) or ""))
     if not path.is_file():
         raise HTTPException(status_code=404, detail="歌曲成果不存在")

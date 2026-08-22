@@ -106,7 +106,7 @@ def _ensure_demucs_model(
     notify(1, "首次使用：正在从 Demucs 官方服务器下载六轨模型")
     request = urllib.request.Request(
         DEMUCS_MODEL_URL,
-        headers={"User-Agent": "Juweier-Music/3.4.0"},
+        headers={"User-Agent": "Juweier-Music/3.5.0"},
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:

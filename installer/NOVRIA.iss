@@ -1,5 +1,5 @@
 #define MyAppName "橘味儿音乐"
-#define MyAppVersion "3.4.0"
+#define MyAppVersion "3.5.0"
 #define MyAppExeName "Juweier-Music.exe"
 
 [Setup]
@@ -9,12 +9,25 @@ AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\Juweier Music
 DefaultGroupName={#MyAppName}
 OutputDir=..\release
-OutputBaseFilename=Juweier_Music_v3.4.0_Setup_x64
+OutputBaseFilename=Juweier_Music_v3.5.0_Setup_x64
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+SetupIconFile=..\assets\novria_app_icon.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
+AppPublisher=橘味儿音乐
+AppPublisherURL=https://db0888.com
+AppSupportURL=https://db0888.com
+VersionInfoVersion=3.5.0.0
+VersionInfoCompany=橘味儿音乐
+VersionInfoDescription=橘味儿音乐多轨演奏工作站
+VersionInfoProductName=橘味儿音乐
+VersionInfoProductVersion=3.5.0
+
+[Languages]
+Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Files]
 ; PyTorch ships thousands of duplicate third-party licence copies in very deep

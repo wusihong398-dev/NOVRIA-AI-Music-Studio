@@ -8,7 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.4.0';
+const appVersion = '3.5.0';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -102,7 +102,7 @@ class PipelineJob {
 }
 
 class LibrarySong {
-  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl, required this.tags, required this.language, required this.genre, required this.processingStatus, required this.publishStatus, required this.musicalKey, required this.artifacts});
+  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl, required this.tags, required this.language, required this.genre, required this.processingStatus, required this.publishStatus, required this.stemsStatus, required this.musicalKey, required this.artifacts});
   final int id;
   final String title;
   final String artist;
@@ -117,9 +117,10 @@ class LibrarySong {
   final String genre;
   final String processingStatus;
   final String publishStatus;
+  final String stemsStatus;
   final String musicalKey;
   final Map<String, String> artifacts;
-  bool get isAiReady => processingStatus == '已完成' && artifacts.isNotEmpty;
+  bool get isAiReady => publishStatus == '已发布' && processingStatus == '已完成' && stemsStatus == '完成';
 
   factory LibrarySong.fromJson(Map<String, dynamic> json) => LibrarySong(
         id: (json['id'] as num?)?.toInt() ?? 0,
@@ -127,7 +128,7 @@ class LibrarySong {
         artist: '${json['artist'] ?? '未知歌手'}',
         album: '${json['album'] ?? ''}',
         artistInitial: '${json['artist_initial'] ?? '#'}'.toUpperCase(),
-        category: '${json['category'] ?? '服务器成品'}',
+        category: '${json['category'] ?? '橘味儿音乐库'}',
         audioUrl: '${json['audio_url'] ?? ''}',
         coverUrl: '${json['cover_url'] ?? ''}',
         lyricsUrl: '${json['lyrics_url'] ?? ''}',
@@ -136,6 +137,7 @@ class LibrarySong {
         genre: '${json['genre'] ?? '流行'}',
         processingStatus: '${json['processing_status'] ?? '待处理'}',
         publishStatus: '${json['publish_status'] ?? '已发布'}',
+        stemsStatus: '${json['stems_status'] ?? ''}',
         musicalKey: '${json['musical_key'] ?? 'C'}',
         artifacts: json['artifacts'] is Map
             ? (json['artifacts'] as Map).map((key, value) => MapEntry('$key', '$value'))
@@ -157,6 +159,7 @@ class LibrarySong {
         'genre': genre,
         'processing_status': processingStatus,
         'publish_status': publishStatus,
+        'stems_status': stemsStatus,
         'musical_key': musicalKey,
         'artifacts': artifacts,
       };
@@ -196,6 +199,8 @@ class AppStore extends ChangeNotifier {
   static const _catalogVersionKey = 'juweier_catalog_version_v330';
   static const _catalogCategoriesKey = 'juweier_catalog_categories_v330';
   static const _guestKey = 'juweier_guest_testing';
+  static const _accessKey = 'juweier_first_access_v350';
+  static const _albumsKey = 'juweier_performance_albums_v350';
 
   SharedPreferences? _prefs;
   final List<PipelineJob> jobs = [];
@@ -216,9 +221,12 @@ class AppStore extends ChangeNotifier {
   String address = '';
   String wechat = '';
   bool guestMode = false;
+  bool accessGranted = false;
+  final Map<String, List<int>> performanceAlbums = {'我的常用曲目': <int>[]};
+  String activePerformanceJobId = '';
   String accountState = '未登录';
   String serverState = '待检测';
-  String serverDetail = 'AI 服务由应用自动连接';
+  String serverDetail = '橘味儿音乐库由应用自动连接';
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
@@ -228,6 +236,16 @@ class AppStore extends ChangeNotifier {
     username = _prefs?.getString(_usernameKey) ?? '';
     nickname = _prefs?.getString(_nicknameKey) ?? '';
     guestMode = _prefs?.getBool(_guestKey) ?? false;
+    accessGranted = _prefs?.getBool(_accessKey) ?? false;
+    final rawAlbums = _prefs?.getString(_albumsKey);
+    if (rawAlbums != null && rawAlbums.isNotEmpty) {
+      try {
+        final decoded = Map<String, dynamic>.from(jsonDecode(rawAlbums) as Map);
+        performanceAlbums
+          ..clear()
+          ..addAll(decoded.map((key, value) => MapEntry(key, (value as List).map((id) => (id as num).toInt()).toList())));
+      } catch (_) {}
+    }
     accountState = accountToken.isEmpty ? '未登录' : '已登录';
     final rawCatalog = _prefs?.getString(_catalogKey);
     catalogVersion = _prefs?.getInt(_catalogVersionKey) ?? 0;
@@ -252,7 +270,7 @@ class AppStore extends ChangeNotifier {
           // has already opened.
           if (job.libraryId > 0 && job.artifacts.isNotEmpty) {
             job.status = '完成';
-            job.stage = '服务器成品可用';
+            job.stage = '橘味儿音乐库成品可用';
             job.progress = 1;
             jobs.add(job);
           }
@@ -272,16 +290,51 @@ class AppStore extends ChangeNotifier {
     await _prefs?.setString(_usernameKey, username);
     await _prefs?.setString(_nicknameKey, nickname);
     await _prefs?.setBool(_guestKey, guestMode);
+    await _prefs?.setBool(_accessKey, accessGranted);
+    await _prefs?.setString(_albumsKey, jsonEncode(performanceAlbums));
     await _prefs?.setString(_catalogKey, jsonEncode(catalog.map((e) => e.toJson()).toList()));
     await _prefs?.setInt(_catalogVersionKey, catalogVersion);
     await _prefs?.setStringList(_catalogCategoriesKey, catalogCategories);
+  }
+
+  Future<void> grantFirstAccess() async {
+    accessGranted = true;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> createPerformanceAlbum(String name) async {
+    final clean = name.trim();
+    if (clean.isEmpty || performanceAlbums.containsKey(clean)) return;
+    performanceAlbums[clean] = <int>[];
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> addSongToAlbum(String album, LibrarySong song) async {
+    final ids = performanceAlbums.putIfAbsent(album, () => <int>[]);
+    if (!ids.contains(song.id)) ids.add(song.id);
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> removeSongFromAlbum(String album, int songId) async {
+    performanceAlbums[album]?.remove(songId);
+    await _save();
+    notifyListeners();
+  }
+
+  List<LibrarySong> albumSongs(String album) {
+    final ids = performanceAlbums[album] ?? const <int>[];
+    final byId = <int, LibrarySong>{for (final song in catalog) song.id: song};
+    return [for (final id in ids) if (byId[id] != null) byId[id]!];
   }
 
   Future<void> saveServer(String base, String token) async {
     serverBase = mobileAiServer;
     apiToken = '';
     serverState = '待检测';
-    serverDetail = 'AI 服务由应用自动连接';
+    serverDetail = '橘味儿音乐库由应用自动连接';
     await _save();
     notifyListeners();
   }
@@ -325,7 +378,7 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>> importPublicLink(String url) async {
-    if (serverBase.isEmpty) throw const FormatException('请先配置 AI 服务器地址');
+    if (serverBase.isEmpty) throw const FormatException('请先配置音乐库服务地址');
     final client = ApiClient(serverBase, accountToken.isNotEmpty ? accountToken : apiToken);
     return client.importLink(url.trim());
   }
@@ -347,12 +400,13 @@ class AppStore extends ChangeNotifier {
     if (existing.isNotEmpty) {
       final job = existing.first;
       job.status = '完成';
-      job.stage = '服务器成品可用';
+      job.stage = '橘味儿音乐库成品可用';
       job.progress = 1;
       job.originalKey = song.musicalKey;
       job.artifacts
         ..clear()
         ..addAll(song.artifacts);
+      activePerformanceJobId = job.id;
       await _save();
       notifyListeners();
       return job;
@@ -364,10 +418,11 @@ class AppStore extends ChangeNotifier {
     );
     jobs.insert(0, job);
     job.status = '完成';
-    job.stage = '服务器成品可用';
+    job.stage = '橘味儿音乐库成品可用';
     job.progress = 1;
     job.originalKey = song.musicalKey;
     job.artifacts.addAll(song.artifacts);
+    activePerformanceJobId = job.id;
     await _save();
     notifyListeners();
     return job;
@@ -554,7 +609,7 @@ class AppStore extends ChangeNotifier {
       return '服务器缺少 FFmpeg，暂时不能读取或处理歌曲。';
     }
     if (lower.contains('origin web server') || lower.contains('cloudflare')) {
-      return 'AI 服务器暂时没有完整响应，请确认服务端和 Cloudflare Tunnel 均在线后重试。';
+      return '橘味儿音乐库暂时没有完整响应，请确认服务端和 Cloudflare Tunnel 均在线后重试。';
     }
     if (lower.contains('http 404') || lower.contains('"detail":"not found"')) {
       return 'AI 任务接口未连接到新版服务器，请检查 Cloudflare 曲库路由后重试。';
@@ -575,7 +630,7 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> authenticate({required String account, required String phoneValue, required String password, required bool register, String nicknameValue = '', String code = ''}) async {
-    if (serverBase.isEmpty) throw const FormatException('请先配置 AI 服务器地址');
+    if (serverBase.isEmpty) throw const FormatException('请先配置音乐库服务地址');
     accountState = register ? '注册中' : '登录中';
     notifyListeners();
     try {
@@ -870,9 +925,9 @@ class ApiClient {
     } catch (_) {
       final contentType = response.headers.contentType?.mimeType ?? '未知类型';
       if (body.toLowerCase().contains('cloudflare') || body.trimLeft().startsWith('<')) {
-        throw FormatException('AI 服务器返回了网页而不是数据（$contentType），请检查 Cloudflare Tunnel 与 Mobile API 路由。');
+        throw FormatException('音乐库服务返回了网页而不是数据（$contentType），请检查 Cloudflare Tunnel 与 Mobile API 路由。');
       }
-      throw FormatException('AI 服务器返回的数据格式不完整（$contentType），请稍后重试。');
+      throw FormatException('音乐库服务返回的数据格式不完整（$contentType），请稍后重试。');
     }
   }
 
@@ -926,9 +981,42 @@ class JuweierMusicApp extends StatelessWidget {
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
           ),
         ),
-        home: store.accountToken.isEmpty && !store.guestMode ? AuthGatePage(store: store) : MainShell(store: store),
+        home: !store.accessGranted
+            ? AccessAuthorizationPage(store: store)
+            : store.accountToken.isEmpty && !store.guestMode
+                ? AuthGatePage(store: store)
+                : MainShell(store: store),
       ),
   );
+}
+
+class AccessAuthorizationPage extends StatelessWidget {
+  const AccessAuthorizationPage({super.key, required this.store});
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(body: SafeArea(child: Padding(
+    padding: const EdgeInsets.all(24),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const Spacer(),
+      Center(child: Container(width: 96, height: 96, padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: const Color(0xFF2C1024), borderRadius: BorderRadius.circular(28)), child: Image.asset('assets/juweier_brand_mark_v322.png'))),
+      const SizedBox(height: 24),
+      const Text('欢迎使用橘味儿音乐', textAlign: TextAlign.center, style: TextStyle(fontSize: 30, fontWeight: FontWeight.w900)),
+      const SizedBox(height: 10),
+      const Text('首次使用授权', textAlign: TextAlign.center, style: TextStyle(color: accent, fontSize: 18, fontWeight: FontWeight.w800)),
+      const SizedBox(height: 22),
+      const Card(child: Padding(padding: EdgeInsets.all(18), child: Column(children: [
+        ListTile(leading: Icon(Icons.cloud_done_outlined, color: accent), title: Text('访问橘味儿音乐库'), subtitle: Text('联网读取已发布歌曲、分轨、谱面与同步歌词，不扫描手机硬盘。')),
+        ListTile(leading: Icon(Icons.headphones_outlined, color: accent), title: Text('播放与演奏'), subtitle: Text('播放音频并使用暂停、进度、音量、多轨混音和演奏谱面。')),
+        ListTile(leading: Icon(Icons.offline_pin_outlined, color: accent), title: Text('保存必要设置'), subtitle: Text('仅保存曲库索引、我的演奏专辑和播放偏好，便于下次直接使用。')),
+      ]))),
+      const SizedBox(height: 16),
+      FilledButton.icon(onPressed: store.grantFirstAccess, icon: const Icon(Icons.check_circle_outline), label: const Padding(padding: EdgeInsets.symmetric(vertical: 13), child: Text('同意授权并继续'))),
+      const SizedBox(height: 10),
+      const Text('橘味儿音乐不会在后台扫描本机音乐，也不会在手机上执行 AI 分轨。', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
+      const Spacer(),
+    ]),
+  )));
 }
 
 class AuthGatePage extends StatefulWidget {
@@ -1052,7 +1140,7 @@ class _AuthGatePageState extends State<AuthGatePage> {
               label: const Text('先进入测试（无需验证码）'),
             ),
             const SizedBox(height: 6),
-            const Text('测试模式可浏览服务器成品曲库、播放分轨并查看同步歌词和谱面；账号资料与内测群聊仍需正式登录。', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
+            const Text('测试模式可浏览橘味儿音乐库、播放分轨并查看同步歌词和谱面；账号资料与内测群聊仍需正式登录。', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
           ],
           const SizedBox(height: 12),
           const Text('验证码 60 秒内只能发送 1 次，5 分钟内有效。注册即表示同意用户协议与隐私政策。', style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
@@ -1091,7 +1179,7 @@ class _MainShellState extends State<MainShell> {
               onDestinationSelected: (value) => setState(() => index = value),
               destinations: const [
                 NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: '首页'),
-                NavigationDestination(icon: Icon(Icons.library_music_outlined), selectedIcon: Icon(Icons.library_music), label: '成品曲库'),
+                NavigationDestination(icon: Icon(Icons.library_music_outlined), selectedIcon: Icon(Icons.library_music), label: '音乐库'),
                 NavigationDestination(icon: Icon(Icons.piano_outlined), selectedIcon: Icon(Icons.piano), label: '演奏'),
                 NavigationDestination(icon: Icon(Icons.forum_outlined), selectedIcon: Icon(Icons.forum), label: '联机'),
                 NavigationDestination(icon: Icon(Icons.person_outline), selectedIcon: Icon(Icons.person), label: '我的'),
@@ -1128,7 +1216,7 @@ class DashboardPage extends StatelessWidget {
           const SizedBox(width: 14),
           const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(appName, style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)),
-            Text('AI 分轨 · 智能改编 · 乐手谱面', style: TextStyle(color: Color(0xFFBDAAB5))),
+            Text('成品多轨 · 同步歌词 · 乐手谱面', style: TextStyle(color: Color(0xFFBDAAB5))),
           ])),
           IconButton.filledTonal(
             tooltip: '个人资料', icon: const Icon(Icons.person),
@@ -1136,16 +1224,14 @@ class DashboardPage extends StatelessWidget {
           ),
         ]),
         const SizedBox(height: 18),
-        ServerCard(store: store),
-        const SizedBox(height: 12),
         Card(child: Padding(
           padding: const EdgeInsets.all(18),
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            const Text('服务器成品曲库', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+            const Text('橘味儿音乐库', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
             const SizedBox(height: 6),
             const Text('打开即可播放。分轨、歌词、五线谱和六线谱均由服务器提前生成。', style: TextStyle(color: Color(0xFFBDAAB5))),
             const SizedBox(height: 14),
-            FilledButton.icon(onPressed: () => onNavigate(1), icon: const Icon(Icons.library_music), label: const Text('浏览全部成品歌曲')),
+            FilledButton.icon(onPressed: () => onNavigate(1), icon: const Icon(Icons.library_music), label: const Text('浏览全部歌曲')),
             const SizedBox(height: 8),
             OutlinedButton.icon(onPressed: store.jobs.isEmpty ? null : () => onNavigate(2), icon: const Icon(Icons.piano), label: const Text('继续演奏与查看谱面')),
             const SizedBox(height: 8),
@@ -1162,13 +1248,13 @@ class DashboardPage extends StatelessWidget {
           const SizedBox(width: 10),
           Expanded(child: MetricCard(label: '歌手', value: '$artists', icon: Icons.person)),
           const SizedBox(width: 10),
-          Expanded(child: MetricCard(label: 'AI成品', value: '$ready', icon: Icons.task_alt)),
+          Expanded(child: MetricCard(label: '可演奏', value: '$ready', icon: Icons.task_alt)),
         ]),
         const SizedBox(height: 14),
         const Text('核心能力', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
         const SizedBox(height: 10),
         const Wrap(spacing: 10, runSpacing: 10, children: [
-          FeatureChip(icon: Icons.multitrack_audio, text: 'AI 六轨+电吉他'),
+          FeatureChip(icon: Icons.multitrack_audio, text: '七轨独立混音'),
           FeatureChip(icon: Icons.music_note, text: '自动和弦与段落'),
           FeatureChip(icon: Icons.queue_music, text: '五线谱 / 六线谱'),
           FeatureChip(icon: Icons.tune, text: '升降调与 Capo'),
@@ -1194,7 +1280,6 @@ class LibraryPage extends StatefulWidget {
 
 class _LibraryPageState extends State<LibraryPage> {
   final search = TextEditingController();
-  final previewPlayer = AudioPlayer();
   String category = '全部';
   String initial = '全部';
   String discoveryTab = '乐库';
@@ -1209,22 +1294,7 @@ class _LibraryPageState extends State<LibraryPage> {
   @override
   void dispose() {
     search.dispose();
-    unawaited(previewPlayer.dispose());
     super.dispose();
-  }
-
-  Future<void> playSong(LibrarySong song) async {
-    if (song.audioUrl.isEmpty) return;
-    try {
-      final token = widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken;
-      await previewPlayer.setUrl(
-        song.audioUrl,
-        headers: token.isEmpty ? null : {'Authorization': 'Bearer $token'},
-      );
-      await previewPlayer.play();
-    } catch (error) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('歌曲播放失败：$error')));
-    }
   }
 
   Future<void> refresh() async {
@@ -1252,9 +1322,45 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> openProduct(LibrarySong song) async {
     if (!song.isAiReady) return;
+    if (song.artifacts.isEmpty) {
+      await refresh();
+      final refreshed = widget.store.catalog.where((item) => item.id == song.id);
+      if (refreshed.isEmpty || refreshed.first.artifacts.isEmpty) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('歌曲成果索引正在恢复，请稍后刷新再试')));
+        return;
+      }
+      song = refreshed.first;
+    }
     await widget.store.addLibrarySong(song);
     if (!mounted) return;
     widget.onOpenProduct();
+  }
+
+  Future<void> createAlbum() async {
+    final controller = TextEditingController();
+    final name = await showDialog<String>(context: context, builder: (context) => AlertDialog(
+      title: const Text('新建我的演奏专辑'),
+      content: TextField(controller: controller, autofocus: true, decoration: const InputDecoration(labelText: '专辑名称', hintText: '例如：周末演出')),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')), FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('创建'))],
+    ));
+    controller.dispose();
+    if (name != null && name.isNotEmpty) await widget.store.createPerformanceAlbum(name);
+  }
+
+  Future<void> addToAlbum(LibrarySong song) async {
+    final album = await showModalBottomSheet<String>(context: context, showDragHandle: true, builder: (context) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const ListTile(title: Text('添加到我的演奏专辑', style: TextStyle(fontWeight: FontWeight.w900))),
+      for (final name in widget.store.performanceAlbums.keys) ListTile(leading: const Icon(Icons.album_outlined), title: Text(name), subtitle: Text('${widget.store.albumSongs(name).length} 首'), onTap: () => Navigator.pop(context, name)),
+      ListTile(leading: const Icon(Icons.add, color: accent), title: const Text('新建专辑'), onTap: () => Navigator.pop(context, '__new__')),
+    ])));
+    if (album == '__new__') {
+      await createAlbum();
+      return;
+    }
+    if (album != null) {
+      await widget.store.addSongToAlbum(album, song);
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已添加到“$album”')));
+    }
   }
 
   void openArtist(MapEntry<String, List<LibrarySong>> group) {
@@ -1273,8 +1379,8 @@ class _LibraryPageState extends State<LibraryPage> {
             return ListTile(
               leading: CircleAvatar(backgroundColor: accent.withValues(alpha: .16), child: Text('${index + 1}')),
               title: Text(song.title), subtitle: Text('${song.language} · ${song.genre} · ${song.processingStatus}'),
-              onTap: () => unawaited(playSong(song)),
-              trailing: FilledButton.tonal(onPressed: song.isAiReady ? () { Navigator.pop(context); unawaited(openProduct(song)); } : null, child: Text(song.isAiReady ? '打开' : '未发布')),
+              onTap: song.isAiReady ? () { Navigator.pop(context); unawaited(openProduct(song)); } : null,
+              trailing: IconButton(onPressed: song.isAiReady ? () => unawaited(addToAlbum(song)) : null, icon: const Icon(Icons.playlist_add), tooltip: '加入我的演奏专辑'),
             );
           })),
         ]),
@@ -1305,12 +1411,12 @@ class _LibraryPageState extends State<LibraryPage> {
         PageHeader(title: '橘味儿乐库', subtitle: '${widget.store.catalog.length} 首已发布歌曲 · 打开即播、成果即用', action: IconButton(onPressed: refresh, icon: const Icon(Icons.sync))),
         SizedBox(height: 48, child: ListView(
           padding: const EdgeInsets.symmetric(horizontal: 16), scrollDirection: Axis.horizontal,
-          children: [for (final value in const ['推荐','乐库','歌单','歌手','分类','AI成果'])
+          children: [for (final value in const ['推荐','乐库','我的演奏','歌手','分类','成果'])
             Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(
               label: Text(value), selected: discoveryTab == value,
               onSelected: (_) => setState(() {
                 discoveryTab = value;
-                category = value == 'AI成果' ? 'AI已完成' : value == '推荐' ? '推荐' : '全部';
+                category = value == '成果' ? 'AI已完成' : value == '推荐' ? '推荐' : '全部';
               }),
             )),
           ],
@@ -1338,7 +1444,7 @@ class _LibraryPageState extends State<LibraryPage> {
           const SizedBox(height: 8),
           Wrap(spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
             SizedBox(width: 190, child: DropdownButtonFormField<String>(initialValue: widget.store.catalogCategories.contains(category) ? category : '全部', decoration: const InputDecoration(labelText: '歌曲分类'), items: widget.store.catalogCategories.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) setState(() => category = value); })),
-            OutlinedButton.icon(onPressed: refresh, icon: const Icon(Icons.sync), label: const Text('同步成品索引')),
+            OutlinedButton.icon(onPressed: refresh, icon: const Icon(Icons.sync), label: const Text('同步音乐库')),
           ]),
         ])),
         if (loading) const LinearProgressIndicator(minHeight: 2),
@@ -1363,7 +1469,20 @@ class _LibraryPageState extends State<LibraryPage> {
           )),
         ],
         Expanded(
-          child: widget.store.catalog.isEmpty
+          child: discoveryTab == '我的演奏'
+              ? ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 24), children: [
+                  Row(children: [const Expanded(child: Text('我的演奏专辑', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900))), FilledButton.icon(onPressed: createAlbum, icon: const Icon(Icons.add), label: const Text('新建'))]),
+                  const SizedBox(height: 10),
+                  for (final album in widget.store.performanceAlbums.entries) Card(child: ExpansionTile(
+                    leading: const Icon(Icons.album, color: accent), title: Text(album.key, style: const TextStyle(fontWeight: FontWeight.w800)), subtitle: Text('${widget.store.albumSongs(album.key).length} 首常用演奏歌曲'),
+                    children: [for (final song in widget.store.albumSongs(album.key)) ListTile(
+                      leading: const Icon(Icons.play_circle_fill, color: accent), title: Text(song.title), subtitle: Text(song.artist),
+                      onTap: () => unawaited(openProduct(song)),
+                      trailing: IconButton(icon: const Icon(Icons.remove_circle_outline), onPressed: () => widget.store.removeSongFromAlbum(album.key, song.id)),
+                    )],
+                  )),
+                ])
+              : widget.store.catalog.isEmpty
               ? EmptyState(icon: Icons.library_music, title: '暂时没有已发布歌曲', detail: 'App 不会扫描手机或电脑硬盘。服务器管理员发布曲库后会自动同步；离线时仍保留上次歌曲索引。', action: refresh)
               : discoveryTab == '歌手' ? ListView.builder(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
@@ -1384,7 +1503,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   itemBuilder: (context, index) {
                     final song = songs[index];
                     return Card(child: ListTile(
-                      onTap: () => unawaited(playSong(song)),
+                      onTap: song.isAiReady ? () => unawaited(openProduct(song)) : null,
                       leading: CircleAvatar(
                         backgroundColor: accent.withValues(alpha: .16),
                         foregroundImage: artistImage(song),
@@ -1392,10 +1511,7 @@ class _LibraryPageState extends State<LibraryPage> {
                       ),
                       title: Text(song.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800)),
                       subtitle: Text('${song.artist} · ${song.language} · ${song.genre}'),
-                      trailing: FilledButton.tonal(
-                        onPressed: song.isAiReady ? () => unawaited(openProduct(song)) : null,
-                        child: Text(song.isAiReady ? '播放/谱面' : '未发布'),
-                      ),
+                      trailing: IconButton(onPressed: song.isAiReady ? () => unawaited(addToAlbum(song)) : null, icon: Icon(song.isAiReady ? Icons.playlist_add : Icons.hourglass_empty), tooltip: song.isAiReady ? '加入我的演奏专辑' : '成果尚未发布'),
                     ));
                   },
                 ),
@@ -1526,6 +1642,7 @@ class _PerformancePageState extends State<PerformancePage> {
   String? selectedId;
   String scoreType = '和弦谱';
   final levels = <String, double>{'人声': .9, '鼓': .82, '贝斯': .8, '木吉他': .84, '电吉他': .84, '钢琴': .76, '其他': .65};
+  double masterVolume = .9;
   final players = <String, AudioPlayer>{};
   StreamSubscription<Duration>? positionSub;
   StreamSubscription<Duration?>? durationSub;
@@ -1538,7 +1655,16 @@ class _PerformancePageState extends State<PerformancePage> {
 
   PipelineJob? get selected {
     if (widget.store.jobs.isEmpty) return null;
-    return widget.store.jobs.firstWhere((e) => e.id == selectedId, orElse: () => widget.store.jobs.first);
+    final target = widget.store.activePerformanceJobId.isNotEmpty
+        ? widget.store.activePerformanceJobId
+        : selectedId;
+    return widget.store.jobs.firstWhere((e) => e.id == target, orElse: () => widget.store.jobs.first);
+  }
+
+  void selectJob(String? value) {
+    if (value == null || value.isEmpty) return;
+    widget.store.activePerformanceJobId = value;
+    setState(() => selectedId = value);
   }
 
   Future<void> loadPlayers(PipelineJob job) async {
@@ -1556,7 +1682,7 @@ class _PerformancePageState extends State<PerformancePage> {
       final player = AudioPlayer();
       try {
         await player.setUrl(url, headers: token.isEmpty ? null : {'Authorization': 'Bearer $token'});
-        await player.setVolume(levels[entry.key] ?? .8);
+        await player.setVolume((levels[entry.key] ?? .8) * masterVolume);
         players[entry.key] = player;
       } catch (_) {
         await player.dispose();
@@ -1623,10 +1749,11 @@ class _PerformancePageState extends State<PerformancePage> {
     if (job == null) {
       return const Column(children: [
         PageHeader(title: '成品演奏', subtitle: '升降调、服务器分轨混音与乐手谱面'),
-        Expanded(child: EmptyState(icon: Icons.piano, title: '请先从成品曲库选择歌曲', detail: '服务器已发布歌曲可直接进入演奏，不在手机端进行 AI 处理。')),
+        Expanded(child: EmptyState(icon: Icons.piano, title: '请先从橘味儿音乐库选择歌曲', detail: '已发布歌曲可直接进入演奏，不在手机端进行 AI 处理。')),
       ]);
     }
-    selectedId ??= job.id;
+    selectedId = job.id;
+    widget.store.activePerformanceJobId = job.id;
     if (loadedJobId != job.id && job.isDone) {
       WidgetsBinding.instance.addPostFrameCallback((_) => loadPlayers(job));
     }
@@ -1636,12 +1763,12 @@ class _PerformancePageState extends State<PerformancePage> {
     final artifact = job.artifacts[artifactKey];
     const trackKeys = {'人声': 'stem_vocals', '鼓': 'stem_drums', '贝斯': 'stem_bass', '木吉他': 'stem_guitar', '电吉他': 'stem_electric_guitar', '钢琴': 'stem_piano', '其他': 'stem_other'};
     return Column(children: [
-      const PageHeader(title: '成品演奏', subtitle: '服务器音轨、和弦、逐音符歌词和谱面同步播放'),
+      const PageHeader(title: '成品演奏', subtitle: '已发布音轨、和弦、逐音符歌词和谱面同步播放'),
       Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 30), children: [
         DropdownButtonFormField<String>(
           initialValue: selectedId,
           items: widget.store.jobs.map((e) => DropdownMenuItem(value: e.id, child: Text(e.fileName, overflow: TextOverflow.ellipsis))).toList(),
-          onChanged: (value) => setState(() => selectedId = value),
+          onChanged: selectJob,
           decoration: const InputDecoration(labelText: '当前歌曲'),
         ),
         const SizedBox(height: 12),
@@ -1673,6 +1800,18 @@ class _PerformancePageState extends State<PerformancePage> {
             Text('${position.inMinutes}:${(position.inSeconds % 60).toString().padLeft(2, '0')} / ${duration.inMinutes}:${(duration.inSeconds % 60).toString().padLeft(2, '0')}'),
           ]),
           const Text('拖动后会同步定位所有音轨，不再自动跳回原播放位置。', style: TextStyle(color: Color(0xFFBDAAB5))),
+          Row(children: [
+            const Icon(Icons.volume_up_outlined, color: accent),
+            const SizedBox(width: 8),
+            const Text('总音量', style: TextStyle(fontWeight: FontWeight.w800)),
+            Expanded(child: Slider(value: masterVolume, onChanged: (value) {
+              setState(() => masterVolume = value);
+              for (final entry in players.entries) {
+                entry.value.setVolume((levels[entry.key] ?? .8) * masterVolume);
+              }
+            })),
+            Text('${(masterVolume * 100).round()}%'),
+          ]),
         ]))),
         const SizedBox(height: 12),
         const Text('六轨基础 + 电吉他二次分离混音', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
@@ -1682,7 +1821,7 @@ class _PerformancePageState extends State<PerformancePage> {
             ListTile(
               leading: Icon(entry.key == '鼓' ? Icons.album : Icons.multitrack_audio, color: accent),
               title: Text(entry.key),
-              subtitle: Slider(value: entry.value, onChanged: (value) { setState(() => levels[entry.key] = value); players[entry.key]?.setVolume(value); }),
+              subtitle: Slider(value: entry.value, onChanged: (value) { setState(() => levels[entry.key] = value); players[entry.key]?.setVolume(value * masterVolume); }),
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 Text('${(entry.value * 100).round()}%'),
                 if (job.artifacts[trackKeys[entry.key]] != null)
@@ -1705,7 +1844,7 @@ class _PerformancePageState extends State<PerformancePage> {
         Card(child: Padding(padding: const EdgeInsets.all(18), child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Text(scoreType, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
           const SizedBox(height: 8),
-          Text(artifact == null ? '这首成品暂未发布$scoreType，请等待服务器管理员补齐。' : '服务器谱面已就绪，可直接查看或复制地址。', style: const TextStyle(color: Color(0xFFBDAAB5))),
+          Text(artifact == null ? '这首成品暂未发布$scoreType，请等待音乐库补齐。' : '谱面已就绪，可直接查看或复制地址。', style: const TextStyle(color: Color(0xFFBDAAB5))),
           if (job.artifacts['score_data'] != null) ...[
             const SizedBox(height: 12),
             ScorePreview(url: job.artifacts['score_data']!, token: widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken, tablature: scoreType == '六线谱' || scoreType == '木吉他谱' || scoreType == '电吉他谱', positionSeconds: position.inMilliseconds / 1000),
@@ -1724,7 +1863,7 @@ class _PerformancePageState extends State<PerformancePage> {
               leading: CircleAvatar(backgroundColor: i == 0 ? accent : const Color(0xFF432B39), child: Text('${i + 1}')),
               title: Text(widget.store.jobs[i].fileName, maxLines: 1, overflow: TextOverflow.ellipsis),
               subtitle: Text(widget.store.jobs[i].isDone ? '六轨、电吉他与谱面就绪' : widget.store.jobs[i].stage),
-              trailing: IconButton(onPressed: () => setState(() => selectedId = widget.store.jobs[i].id), icon: const Icon(Icons.play_arrow)),
+              trailing: IconButton(onPressed: () => selectJob(widget.store.jobs[i].id), icon: const Icon(Icons.play_arrow)),
             ),
         ])),
       ])),
@@ -1993,7 +2132,7 @@ class _CommunityPageState extends State<CommunityPage> {
           const SizedBox(height: 14),
           FilledButton.icon(onPressed: busy ? null : submitAccount, icon: const Icon(Icons.login), label: Text(registerMode ? '注册并登录' : '登录')),
           const SizedBox(height: 10),
-          const Text('AI 服务：应用自动连接，无需手动设置', style: TextStyle(color: Color(0xFFBDAAB5))),
+          const Text('橘味儿音乐库：应用自动连接，无需手动设置', style: TextStyle(color: Color(0xFFBDAAB5))),
         ]))),
       ]);
 
@@ -2203,7 +2342,7 @@ const openSourceNotice = '''
 const privacyPolicy = '''
 我们为完成用户选择的 AI 分轨、谱面、歌词初稿和编配任务，会处理用户主动导入的音频、任务参数及生成结果。账号功能会保存账号、昵称、加密密码摘要和会话令牌；反馈功能会保存用户主动填写的内容、联系方式与设备信息。
 
-手机端会把需要 AI 处理的音频上传到配置的橘味儿 AI 服务。未经用户操作，不会自动读取其他文件。用户可在应用内删除本地任务，并通过“帮助与反馈”申请查询或删除服务端资料。
+手机端默认只读取橘味儿音乐库已发布的歌曲、分轨、歌词和谱面；仅在用户主动导入测试音频时上传。未经用户操作，不会扫描或读取手机中的其他文件。用户可在应用内删除本地任务，并通过“帮助与反馈”申请查询或删除服务端资料。
 ''';
 
 const userAgreement = '''
@@ -2215,10 +2354,10 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.4.0
-服务器成品音乐客户端·Android / iOS / Windows
+橘味儿音乐 v3.5.0
+成品音乐演奏客户端·Android / iOS / Windows
 
-核心功能：打开服务器成品曲库即可播放；直接使用预生成的人声、鼓、贝斯、木吉他、电吉他、钢琴与其他音轨；五线谱、六线谱及歌词按音符同步高亮。
+核心功能：打开橘味儿音乐库即可播放；直接使用预生成的人声、鼓、贝斯、木吉他、电吉他、钢琴与其他音轨；五线谱、六线谱及歌词按音符同步高亮。
 
 本软件目前仅供学习与研究使用，不提供歌曲下载服务。
 ''';
@@ -2257,7 +2396,7 @@ class _FeedbackPageState extends State<FeedbackPage> {
   @override Widget build(BuildContext context)=>Scaffold(body:SafeArea(child:Column(children:[
     PageHeader(title:'帮助与反馈',subtitle:'问题、建议与隐私请求',action:IconButton(onPressed:()=>Navigator.pop(context),icon:const Icon(Icons.close))),
     Expanded(child:ListView(padding:const EdgeInsets.all(16),children:[
-      const Card(child:Padding(padding:EdgeInsets.all(16),child:Text('常见问题：手机端需要网络连接 AI 服务；谱面和歌词为 AI 识别/生成结果，请在演出前复核。\n\n本软件目前仅供学习与研究使用，不提供歌曲下载服务。'))),
+      const Card(child:Padding(padding:EdgeInsets.all(16),child:Text('常见问题：手机端需要网络连接橘味儿音乐库；谱面和歌词为预处理结果，请在演出前复核。\n\n本软件目前仅供学习与研究使用，不提供歌曲下载服务。'))),
       const SizedBox(height:12),
       DropdownButtonFormField(value:category,items:const ['功能建议','故障反馈','账号问题','隐私/删除请求'].map((e)=>DropdownMenuItem(value:e,child:Text(e))).toList(),onChanged:(v)=>setState(()=>category=v!)),
       const SizedBox(height:10),TextField(controller:content,minLines:5,maxLines:10,decoration:const InputDecoration(labelText:'详细内容')),
@@ -2290,7 +2429,7 @@ class _SettingsPageState extends State<SettingsPage> {
         Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 30), children: [
           Card(child: ListTile(
             leading: const Icon(Icons.cloud_done_outlined, color: accent),
-            title: Text('AI 服务·${widget.store.serverState}'),
+            title: Text('橘味儿音乐库·${widget.store.serverState}'),
             subtitle: const Text('移动端自动连接，无需填写服务器地址'),
             trailing: IconButton(onPressed: widget.store.testServer, icon: const Icon(Icons.refresh)),
           )),
@@ -2321,7 +2460,7 @@ class ServerCard extends StatelessWidget {
     final online = store.serverState == '在线';
     return Card(child: ListTile(
       leading: Container(width: 12, height: 12, decoration: BoxDecoration(shape: BoxShape.circle, color: online ? Colors.greenAccent : Colors.orangeAccent)),
-      title: Text('AI 服务器 · ${store.serverState}', style: const TextStyle(fontWeight: FontWeight.w800)),
+      title: Text('橘味儿音乐库 · ${store.serverState}', style: const TextStyle(fontWeight: FontWeight.w800)),
       subtitle: Text(store.serverDetail, maxLines: 2, overflow: TextOverflow.ellipsis),
       trailing: IconButton(onPressed: store.testServer, icon: const Icon(Icons.refresh)),
     ));

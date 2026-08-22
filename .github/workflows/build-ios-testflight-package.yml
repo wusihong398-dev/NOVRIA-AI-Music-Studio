@@ -1,10 +1,10 @@
 name: Build Juweier Music iOS TestFlight Package
-run-name: Juweier Music v3.4.0 iOS TestFlight · ${{ github.ref_name }}
+run-name: Juweier Music v3.5.0 iOS TestFlight · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.4.0"]
+    branches: ["main", "agent/juweier-v3.5.0"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-ios-testflight-package.yml"
@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.4.0 TestFlight project
+# release trigger: v3.5.0 TestFlight project
 
 jobs:
   ios-project:
@@ -55,7 +55,7 @@ jobs:
           cat > mobile_ios/README_TESTFLIGHT_MAC.md <<'EOF'
           # 橘味儿音乐 iOS TestFlight 上传说明
 
-          这是未签名的 v3.4.0 Flutter/Xcode 工程。请在 Mac 上执行：
+          这是未签名的 v3.5.0 Flutter/Xcode 工程。请在 Mac 上执行：
 
           ```bash
           cd mobile_ios
@@ -72,7 +72,7 @@ jobs:
       - name: Upload TestFlight Xcode project without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.4.0-iOS-TestFlight-Xcode-Project
+          name: Juweier-Music-v3.5.0-iOS-TestFlight-Xcode-Project
           path: mobile_ios
           if-no-files-found: error
           retention-days: 30
