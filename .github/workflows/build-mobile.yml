@@ -53,7 +53,7 @@ jobs:
       - name: Verify product-only mobile source
         shell: bash
         run: |
-          grep -q 'appVersion = "3.4.0"' mobile/lib/main.dart
+          grep -q "appVersion = '3.4.0'" mobile/lib/main.dart
           grep -q '成品曲库' mobile/lib/main.dart
           ! grep -q 'file_picker' mobile/pubspec.yaml
       - name: Build release APK and AAB
