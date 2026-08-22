@@ -29,9 +29,15 @@ jobs:
       - name: Verify server source
         run: |
           python -m compileall -q app server tools
-          grep -q 'VERSION = "3.4.0"' server/mobile_api.py
-          grep -q "H:\\juweier-music" Start-Juweier-Server-v340-Products.ps1
-          grep -q "G:\\JuweierMusicProcessed" Start-Juweier-Server-v340-Products.ps1
+          python - <<'PY'
+          from pathlib import Path
+
+          api = Path("server/mobile_api.py").read_text(encoding="utf-8")
+          launcher = Path("Start-Juweier-Server-v340-Products.ps1").read_text(encoding="utf-8")
+          assert 'VERSION = "3.4.0"' in api
+          assert r"H:\juweier-music" in launcher
+          assert r"G:\JuweierMusicProcessed" in launcher
+          PY
       - name: Stage single-layer upgrade
         shell: bash
         run: |
