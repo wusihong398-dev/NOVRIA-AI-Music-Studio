@@ -12,6 +12,8 @@ on:
 permissions:
   contents: read
 
+# release trigger: v3.4.0 TestFlight project
+
 jobs:
   ios-project:
     name: iOS Xcode project for TestFlight
