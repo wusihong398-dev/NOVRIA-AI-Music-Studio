@@ -19,6 +19,8 @@ on:
 permissions:
   contents: read
 
+# release trigger: v3.4.0 Windows installer and portable client
+
 jobs:
   build-windows:
     runs-on: windows-latest
