@@ -1,0 +1,17 @@
+橘味儿音乐服务器 v3.3.9
+
+更新内容：
+1. 新增成品发布前强制繁体转简体。
+2. 歌手、歌名、成品目录、内部文件名、歌词、HTML 乐谱、MusicXML、JSON 清单统一使用简体。
+3. 数据库和 App 展示字段同步转换；搜索索引立即更新。
+4. D 盘原始歌曲与 source_path 不改名，避免源文件失联。
+5. 自动备份数据库，并迁移当前已经发布的成品。
+
+安装：
+1. 确认当前没有正在处理的歌曲。
+2. 解压升级包到 E:\Dongba-Music-Server，选择覆盖同名文件。
+3. 双击 Install-Simplified-Chinese-Publishing-v339.cmd。
+4. 安装完成后双击 Start-Juweier-Server-v339.cmd。
+5. 健康检查必须显示 version=3.3.9、modules.opencc=true。
+
+单曲测试使用 Start-1-Song-Pilot-v339.cmd。

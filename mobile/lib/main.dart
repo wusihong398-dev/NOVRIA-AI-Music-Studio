@@ -2,14 +2,13 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
 const appName = '橘味儿音乐';
-const appVersion = '3.3.0';
+const appVersion = '3.4.0';
 const mobileAiServer = 'https://api.db0888.com';
 const accent = Color(0xFFFF7A18);
 const orangeSoft = Color(0xFFFFA23D);
@@ -103,7 +102,7 @@ class PipelineJob {
 }
 
 class LibrarySong {
-  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl, required this.tags, required this.language, required this.genre, required this.processingStatus, required this.publishStatus, required this.artifacts});
+  const LibrarySong({required this.id, required this.title, required this.artist, required this.album, required this.artistInitial, required this.category, required this.audioUrl, required this.coverUrl, required this.lyricsUrl, required this.tags, required this.language, required this.genre, required this.processingStatus, required this.publishStatus, required this.musicalKey, required this.artifacts});
   final int id;
   final String title;
   final String artist;
@@ -118,6 +117,7 @@ class LibrarySong {
   final String genre;
   final String processingStatus;
   final String publishStatus;
+  final String musicalKey;
   final Map<String, String> artifacts;
   bool get isAiReady => processingStatus == '已完成' && artifacts.isNotEmpty;
 
@@ -127,7 +127,7 @@ class LibrarySong {
         artist: '${json['artist'] ?? '未知歌手'}',
         album: '${json['album'] ?? ''}',
         artistInitial: '${json['artist_initial'] ?? '#'}'.toUpperCase(),
-        category: '${json['category'] ?? '本地导入'}',
+        category: '${json['category'] ?? '服务器成品'}',
         audioUrl: '${json['audio_url'] ?? ''}',
         coverUrl: '${json['cover_url'] ?? ''}',
         lyricsUrl: '${json['lyrics_url'] ?? ''}',
@@ -136,6 +136,7 @@ class LibrarySong {
         genre: '${json['genre'] ?? '流行'}',
         processingStatus: '${json['processing_status'] ?? '待处理'}',
         publishStatus: '${json['publish_status'] ?? '已发布'}',
+        musicalKey: '${json['musical_key'] ?? 'C'}',
         artifacts: json['artifacts'] is Map
             ? (json['artifacts'] as Map).map((key, value) => MapEntry('$key', '$value'))
             : <String, String>{},
@@ -156,6 +157,7 @@ class LibrarySong {
         'genre': genre,
         'processing_status': processingStatus,
         'publish_status': publishStatus,
+        'musical_key': musicalKey,
         'artifacts': artifacts,
       };
 }
@@ -245,11 +247,15 @@ class AppStore extends ChangeNotifier {
         final rows = jsonDecode(raw) as List<dynamic>;
         for (final row in rows) {
           final job = PipelineJob.fromJson(Map<String, dynamic>.from(row as Map));
-          if (job.isRunning) {
-            job.status = '等待继续';
-            job.stage = '上次任务中断，可重新提交或继续查询';
+          // v3.4 is a published-product client.  Discard legacy local upload
+          // and processing cards while preserving server products the user
+          // has already opened.
+          if (job.libraryId > 0 && job.artifacts.isNotEmpty) {
+            job.status = '完成';
+            job.stage = '服务器成品可用';
+            job.progress = 1;
+            jobs.add(job);
           }
-          jobs.add(job);
         }
       } catch (_) {
         jobs.clear();
@@ -278,36 +284,6 @@ class AppStore extends ChangeNotifier {
     serverDetail = 'AI 服务由应用自动连接';
     await _save();
     notifyListeners();
-  }
-
-  Future<ImportReport> addFiles(List<PlatformFile> files) async {
-    final existing = jobs.map((e) => e.path.toLowerCase()).toSet();
-    var added = 0;
-    var skipped = 0;
-    for (final file in files) {
-      final path = file.path;
-      if (path == null || path.isEmpty || existing.contains(path.toLowerCase())) {
-        skipped++;
-        continue;
-      }
-      final now = DateTime.now().microsecondsSinceEpoch;
-      final fileSize = await file.length();
-      jobs.insert(
-        0,
-        PipelineJob(
-          id: 'local-$now-$added',
-          fileName: file.name,
-          path: path,
-          size: fileSize,
-          createdAt: DateTime.now().millisecondsSinceEpoch,
-        ),
-      );
-      existing.add(path.toLowerCase());
-      added++;
-    }
-    await _save();
-    notifyListeners();
-    return ImportReport(added, skipped);
   }
 
   Future<void> refreshCatalog({String query = '', String category = '全部', bool silent = false}) async {
@@ -368,13 +344,30 @@ class AppStore extends ChangeNotifier {
 
   Future<PipelineJob> addLibrarySong(LibrarySong song) async {
     final existing = jobs.where((job) => job.libraryId == song.id);
-    if (existing.isNotEmpty) return existing.first;
+    if (existing.isNotEmpty) {
+      final job = existing.first;
+      job.status = '完成';
+      job.stage = '服务器成品可用';
+      job.progress = 1;
+      job.originalKey = song.musicalKey;
+      job.artifacts
+        ..clear()
+        ..addAll(song.artifacts);
+      await _save();
+      notifyListeners();
+      return job;
+    }
     final job = PipelineJob(
       id: 'library-${song.id}-${DateTime.now().microsecondsSinceEpoch}',
       fileName: '${song.artist} - ${song.title}', path: '', size: 0,
       createdAt: DateTime.now().millisecondsSinceEpoch, libraryId: song.id,
     );
     jobs.insert(0, job);
+    job.status = '完成';
+    job.stage = '服务器成品可用';
+    job.progress = 1;
+    job.originalKey = song.musicalKey;
+    job.artifacts.addAll(song.artifacts);
     await _save();
     notifyListeners();
     return job;
@@ -1059,7 +1052,7 @@ class _AuthGatePageState extends State<AuthGatePage> {
               label: const Text('先进入测试（无需验证码）'),
             ),
             const SizedBox(height: 6),
-            const Text('测试模式可体验曲库、导入、AI 流水线和谱面；账号资料与内测群聊仍需正式登录。', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
+            const Text('测试模式可浏览服务器成品曲库、播放分轨并查看同步歌词和谱面；账号资料与内测群聊仍需正式登录。', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
           ],
           const SizedBox(height: 12),
           const Text('验证码 60 秒内只能发送 1 次，5 分钟内有效。注册即表示同意用户协议与隐私政策。', style: TextStyle(color: Color(0xFFBDAAB5), fontSize: 12)),
@@ -1080,26 +1073,16 @@ class MainShell extends StatefulWidget {
 class _MainShellState extends State<MainShell> {
   int index = 0;
 
-  Future<void> pickAudio() async {
-    final files = await FilePicker.pickFiles(type: FileType.audio);
-    if (files.isEmpty || !mounted) return;
-    final report = await widget.store.addFiles(files);
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已导入 ${report.added} 首${report.skipped > 0 ? '，跳过重复/无路径 ${report.skipped} 首' : ''}')),
-    );
-  }
-
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
         animation: widget.store,
         builder: (context, _) {
           final pages = [
-            DashboardPage(store: widget.store, onImport: pickAudio, onNavigate: (i) => setState(() => index = i)),
-            LibraryPage(store: widget.store, onImport: pickAudio, onOpenPipeline: () => setState(() => index = 2)),
-            PipelinePage(store: widget.store),
+            DashboardPage(store: widget.store, onNavigate: (i) => setState(() => index = i)),
+            LibraryPage(store: widget.store, onOpenProduct: () => setState(() => index = 2)),
             PerformancePage(store: widget.store),
             CommunityPage(store: widget.store),
+            SettingsPage(store: widget.store),
           ];
           return Scaffold(
             body: SafeArea(child: pages[index]),
@@ -1108,10 +1091,10 @@ class _MainShellState extends State<MainShell> {
               onDestinationSelected: (value) => setState(() => index = value),
               destinations: const [
                 NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: '首页'),
-                NavigationDestination(icon: Icon(Icons.library_music_outlined), selectedIcon: Icon(Icons.library_music), label: '音乐库'),
-                NavigationDestination(icon: Icon(Icons.auto_awesome_outlined), selectedIcon: Icon(Icons.auto_awesome), label: '流水线'),
-                NavigationDestination(icon: Icon(Icons.piano_outlined), selectedIcon: Icon(Icons.piano), label: '演出'),
-                NavigationDestination(icon: Icon(Icons.forum_outlined), selectedIcon: Icon(Icons.forum), label: '内测群'),
+                NavigationDestination(icon: Icon(Icons.library_music_outlined), selectedIcon: Icon(Icons.library_music), label: '成品曲库'),
+                NavigationDestination(icon: Icon(Icons.piano_outlined), selectedIcon: Icon(Icons.piano), label: '演奏'),
+                NavigationDestination(icon: Icon(Icons.forum_outlined), selectedIcon: Icon(Icons.forum), label: '联机'),
+                NavigationDestination(icon: Icon(Icons.person_outline), selectedIcon: Icon(Icons.person), label: '我的'),
               ],
             ),
           );
@@ -1120,15 +1103,14 @@ class _MainShellState extends State<MainShell> {
 }
 
 class DashboardPage extends StatelessWidget {
-  const DashboardPage({super.key, required this.store, required this.onImport, required this.onNavigate});
+  const DashboardPage({super.key, required this.store, required this.onNavigate});
   final AppStore store;
-  final VoidCallback onImport;
   final ValueChanged<int> onNavigate;
 
   @override
   Widget build(BuildContext context) {
-    final running = store.jobs.where((e) => e.isRunning).length;
-    final done = store.jobs.where((e) => e.isDone).length;
+    final ready = store.catalog.where((song) => song.isAiReady).length;
+    final artists = store.catalog.map((song) => song.artist).toSet().length;
     return ListView(
       padding: const EdgeInsets.fromLTRB(18, 18, 18, 30),
       children: [
@@ -1159,38 +1141,28 @@ class DashboardPage extends StatelessWidget {
         Card(child: Padding(
           padding: const EdgeInsets.all(18),
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            const Text('开始制作', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+            const Text('服务器成品曲库', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
             const SizedBox(height: 6),
-            const Text('一次可导入多首，重复文件会自动跳过。', style: TextStyle(color: Color(0xFFBDAAB5))),
+            const Text('打开即可播放。分轨、歌词、五线谱和六线谱均由服务器提前生成。', style: TextStyle(color: Color(0xFFBDAAB5))),
             const SizedBox(height: 14),
-            FilledButton.icon(onPressed: onImport, icon: const Icon(Icons.add_to_photos), label: const Text('导入本地音乐')),
+            FilledButton.icon(onPressed: () => onNavigate(1), icon: const Icon(Icons.library_music), label: const Text('浏览全部成品歌曲')),
             const SizedBox(height: 8),
-            OutlinedButton.icon(onPressed: () => onNavigate(2), icon: const Icon(Icons.play_arrow), label: const Text('进入自动流水线')),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => LyricsStudioPage(store: store))),
-              icon: const Icon(Icons.lyrics_outlined),
-              label: const Text('AI 歌词创作（普通话 / 粤语 / 英语）'),
-            ),
+            OutlinedButton.icon(onPressed: store.jobs.isEmpty ? null : () => onNavigate(2), icon: const Icon(Icons.piano), label: const Text('继续演奏与查看谱面')),
             const SizedBox(height: 8),
             Row(children: [
-              Expanded(child: OutlinedButton.icon(onPressed: () => onNavigate(4), icon: const Icon(Icons.forum), label: const Text('内测群聊'))),
+              Expanded(child: OutlinedButton.icon(onPressed: () => onNavigate(3), icon: const Icon(Icons.forum), label: const Text('联机与群聊'))),
               const SizedBox(width: 8),
-              Expanded(child: OutlinedButton.icon(
-                onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(body: SafeArea(child: SettingsPage(store: store))))),
-                icon: const Icon(Icons.settings),
-                label: const Text('设置'),
-              )),
+              Expanded(child: OutlinedButton.icon(onPressed: () => onNavigate(4), icon: const Icon(Icons.person), label: const Text('我的'))),
             ]),
           ]),
         )),
         const SizedBox(height: 12),
         Row(children: [
-          Expanded(child: MetricCard(label: '音乐', value: '${store.jobs.length}', icon: Icons.library_music)),
+          Expanded(child: MetricCard(label: '已发布', value: '${store.catalog.length}', icon: Icons.library_music)),
           const SizedBox(width: 10),
-          Expanded(child: MetricCard(label: '处理中', value: '$running', icon: Icons.graphic_eq)),
+          Expanded(child: MetricCard(label: '歌手', value: '$artists', icon: Icons.person)),
           const SizedBox(width: 10),
-          Expanded(child: MetricCard(label: '已完成', value: '$done', icon: Icons.task_alt)),
+          Expanded(child: MetricCard(label: 'AI成品', value: '$ready', icon: Icons.task_alt)),
         ]),
         const SizedBox(height: 14),
         const Text('核心能力', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
@@ -1212,10 +1184,9 @@ class DashboardPage extends StatelessWidget {
 }
 
 class LibraryPage extends StatefulWidget {
-  const LibraryPage({super.key, required this.store, required this.onImport, required this.onOpenPipeline});
+  const LibraryPage({super.key, required this.store, required this.onOpenProduct});
   final AppStore store;
-  final VoidCallback onImport;
-  final VoidCallback onOpenPipeline;
+  final VoidCallback onOpenProduct;
 
   @override
   State<LibraryPage> createState() => _LibraryPageState();
@@ -1268,40 +1239,6 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  Future<void> importLink() async {
-    final controller = TextEditingController();
-    final url = await showDialog<String>(context: context, builder: (context) => AlertDialog(
-      title: const Text('导入本人有权使用的链接'),
-      content: TextField(
-        controller: controller,
-        minLines: 2,
-        maxLines: 5,
-        decoration: const InputDecoration(
-          hintText: '粘贴本人有权使用的公开音频直链',
-          helperText: '本软件目前仅供学习与研究使用，不提供歌曲下载服务。',
-        ),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
-        FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('导入授权音频')),
-      ],
-    ));
-    controller.dispose();
-    if (url == null || url.isEmpty) return;
-    setState(() => loading = true);
-    try {
-      await widget.store.importPublicLink(url);
-      if (!mounted) return;
-      setState(() => category = '临时歌曲库');
-      await refresh();
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('歌曲已导入服务器临时歌曲库')));
-    } catch (error) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('链接导入失败：$error')));
-    } finally {
-      if (mounted) setState(() => loading = false);
-    }
-  }
-
   String artistInitial(LibrarySong song) {
     final value = song.artistInitial.trim().toUpperCase();
     return RegExp(r'^[A-Z]$').hasMatch(value) ? value : '#';
@@ -1313,27 +1250,11 @@ class _LibraryPageState extends State<LibraryPage> {
     return NetworkImage(song.coverUrl, headers: token.isEmpty ? null : {'Authorization': 'Bearer $token'});
   }
 
-  Future<void> processSong(LibrarySong song) async {
-    if (song.isAiReady) {
-      final job = await widget.store.addLibrarySong(song);
-      job.status = '完成';
-      job.stage = '服务器成果可用';
-      job.progress = 1;
-      job.artifacts
-        ..clear()
-        ..addAll(song.artifacts);
-      await widget.store._save();
-      widget.store.notifyListeners();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: const Text('已打开服务器预处理成果：分轨、歌词和乐谱可直接使用'),
-        action: SnackBarAction(label: '查看', onPressed: widget.onOpenPipeline),
-      ));
-      return;
-    }
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('这首歌曲正在等待服务器管理员预处理，完成后会自动显示歌词、乐谱和独立乐器轨。'),
-    ));
+  Future<void> openProduct(LibrarySong song) async {
+    if (!song.isAiReady) return;
+    await widget.store.addLibrarySong(song);
+    if (!mounted) return;
+    widget.onOpenProduct();
   }
 
   void openArtist(MapEntry<String, List<LibrarySong>> group) {
@@ -1353,7 +1274,7 @@ class _LibraryPageState extends State<LibraryPage> {
               leading: CircleAvatar(backgroundColor: accent.withValues(alpha: .16), child: Text('${index + 1}')),
               title: Text(song.title), subtitle: Text('${song.language} · ${song.genre} · ${song.processingStatus}'),
               onTap: () => unawaited(playSong(song)),
-              trailing: FilledButton.tonal(onPressed: () { Navigator.pop(context); unawaited(processSong(song)); }, child: Text(song.isAiReady ? '打开成果' : '处理中')),
+              trailing: FilledButton.tonal(onPressed: song.isAiReady ? () { Navigator.pop(context); unawaited(openProduct(song)); } : null, child: Text(song.isAiReady ? '打开' : '未发布')),
             );
           })),
         ]),
@@ -1417,8 +1338,7 @@ class _LibraryPageState extends State<LibraryPage> {
           const SizedBox(height: 8),
           Wrap(spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
             SizedBox(width: 190, child: DropdownButtonFormField<String>(initialValue: widget.store.catalogCategories.contains(category) ? category : '全部', decoration: const InputDecoration(labelText: '歌曲分类'), items: widget.store.catalogCategories.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(), onChanged: (value) { if (value != null) setState(() => category = value); })),
-            OutlinedButton.icon(onPressed: widget.onImport, icon: const Icon(Icons.audio_file), label: const Text('本地导入')),
-            OutlinedButton.icon(onPressed: importLink, icon: const Icon(Icons.link), label: const Text('链接导入')),
+            OutlinedButton.icon(onPressed: refresh, icon: const Icon(Icons.sync), label: const Text('同步成品索引')),
           ]),
         ])),
         if (loading) const LinearProgressIndicator(minHeight: 2),
@@ -1473,8 +1393,8 @@ class _LibraryPageState extends State<LibraryPage> {
                       title: Text(song.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800)),
                       subtitle: Text('${song.artist} · ${song.language} · ${song.genre}'),
                       trailing: FilledButton.tonal(
-                        onPressed: () => unawaited(processSong(song)),
-                        child: Text(song.isAiReady ? '打开成果' : '处理中'),
+                        onPressed: song.isAiReady ? () => unawaited(openProduct(song)) : null,
+                        child: Text(song.isAiReady ? '播放/谱面' : '未发布'),
                       ),
                     ));
                   },
@@ -1702,8 +1622,8 @@ class _PerformancePageState extends State<PerformancePage> {
     final job = selected;
     if (job == null) {
       return const Column(children: [
-        PageHeader(title: '现场演出', subtitle: '升降调、分轨混音与乐手谱面'),
-        Expanded(child: EmptyState(icon: Icons.piano, title: '请先导入歌曲', detail: '完成分析后即可进入演出模式。')),
+        PageHeader(title: '成品演奏', subtitle: '升降调、服务器分轨混音与乐手谱面'),
+        Expanded(child: EmptyState(icon: Icons.piano, title: '请先从成品曲库选择歌曲', detail: '服务器已发布歌曲可直接进入演奏，不在手机端进行 AI 处理。')),
       ]);
     }
     selectedId ??= job.id;
@@ -1716,7 +1636,7 @@ class _PerformancePageState extends State<PerformancePage> {
     final artifact = job.artifacts[artifactKey];
     const trackKeys = {'人声': 'stem_vocals', '鼓': 'stem_drums', '贝斯': 'stem_bass', '木吉他': 'stem_guitar', '电吉他': 'stem_electric_guitar', '钢琴': 'stem_piano', '其他': 'stem_other'};
     return Column(children: [
-      const PageHeader(title: '现场演出', subtitle: '所有音轨、和弦和谱面同步变调'),
+      const PageHeader(title: '成品演奏', subtitle: '服务器音轨、和弦、逐音符歌词和谱面同步播放'),
       Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 30), children: [
         DropdownButtonFormField<String>(
           initialValue: selectedId,
@@ -1785,7 +1705,7 @@ class _PerformancePageState extends State<PerformancePage> {
         Card(child: Padding(padding: const EdgeInsets.all(18), child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Text(scoreType, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
           const SizedBox(height: 8),
-          Text(artifact == null ? '流水线完成后，这里会显示服务器生成的$scoreType。' : '谱面已生成，可复制地址后打开或下载。', style: const TextStyle(color: Color(0xFFBDAAB5))),
+          Text(artifact == null ? '这首成品暂未发布$scoreType，请等待服务器管理员补齐。' : '服务器谱面已就绪，可直接查看或复制地址。', style: const TextStyle(color: Color(0xFFBDAAB5))),
           if (job.artifacts['score_data'] != null) ...[
             const SizedBox(height: 12),
             ScorePreview(url: job.artifacts['score_data']!, token: widget.store.accountToken.isNotEmpty ? widget.store.accountToken : widget.store.apiToken, tablature: scoreType == '六线谱' || scoreType == '木吉他谱' || scoreType == '电吉他谱', positionSeconds: position.inMilliseconds / 1000),
@@ -2295,10 +2215,10 @@ const userAgreement = '''
 ''';
 
 const aboutSoftware = '''
-橘味儿音乐 v3.3.0
-AI 音乐工作站·Android / iOS / Windows
+橘味儿音乐 v3.4.0
+服务器成品音乐客户端·Android / iOS / Windows
 
-核心功能：六轨基础分离与电吉他二次识别、五线谱/六线谱/歌词同步、AI 歌词初稿、智能编配、乐手练习与现场演出。
+核心功能：打开服务器成品曲库即可播放；直接使用预生成的人声、鼓、贝斯、木吉他、电吉他、钢琴与其他音轨；五线谱、六线谱及歌词按音符同步高亮。
 
 本软件目前仅供学习与研究使用，不提供歌曲下载服务。
 ''';

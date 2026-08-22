@@ -15,9 +15,9 @@ class DesktopRegressionTests(unittest.TestCase):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
         mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "3.3.0"', launcher)
-        self.assertIn('version: 3.3.0+330', mobile_manifest)
-        self.assertIn('VERSION = "3.3.0"', server)
+        self.assertIn('VERSION = "3.4.0"', launcher)
+        self.assertIn('version: 3.4.0+340', mobile_manifest)
+        self.assertIn('VERSION = "3.4.0"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
 
     def test_sidebar_pages_are_real_and_server_library_isolated(self):
@@ -62,15 +62,34 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn('提交 AI 处理任务', mobile)
         self.assertIn('服务器未安装 AI 分轨运行环境', mobile)
 
-    def test_g_drive_library_is_global_and_visible_before_processors(self):
+    def test_published_product_library_is_global_and_processing_ui_is_hidden(self):
         desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
-        self.assertLess(desktop.index('G 盘歌手歌曲库'), desktop.index('批量 AI 处理器'))
-        self.assertIn('全局 G 盘歌曲', desktop)
+        self.assertLess(desktop.index('橘味儿音乐成品分类库'), desktop.index('批量 AI 处理器'))
+        self.assertIn('当前服务器成品', desktop)
         self.assertIn('def load_server_library_track', desktop)
         self.assertIn('self.main.load_server_library_track(tid, row)', desktop)
         self.assertIn('本次未读取、未扫描客户端 G 盘', desktop)
         self.assertIn('ServerLibraryClient', desktop)
-        self.assertIn('加入当前 G 盘歌曲', desktop)
+        self.assertIn('加入当前服务器成品', desktop)
+        self.assertIn('batch_box.hide()', desktop)
+        self.assertIn('pipeline_box.hide()', desktop)
+        self.assertIn('scheduler_box.hide()', desktop)
+
+    def test_v340_clients_consume_only_published_server_products(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('publish_status="已发布"', server)
+        self.assertIn('LIBRARY_PATHS["processed"].resolve()', server)
+        self.assertIn('song.get("final_audio_path") or stored_artifacts.get("original_audio")', server)
+        self.assertIn("label: '成品曲库'", mobile)
+        self.assertNotIn("label: '流水线'", mobile)
+        self.assertNotIn('PipelinePage(store: widget.store)', mobile)
+        self.assertIn('服务器成品可用', mobile)
+        self.assertIn('逐音符歌词', mobile)
+        self.assertIn('self.engine.load(folder)', desktop)
+        self.assertIn('self.melody_reference=list(score.get("staff_notes") or [])', desktop)
+        self.assertIn('self.lyric_reference=[', desktop)
 
     def test_server_scores_share_one_synced_lyrics_timeline(self):
         server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
@@ -137,7 +156,7 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn("catalogVersion", mobile)
         self.assertIn("result['not_modified'] == true", mobile)
         self.assertIn('since and since == current_version', server)
-        self.assertIn('JUWEIER_AUTO_SCAN_LIBRARY", "1"', server)
+        self.assertIn('JUWEIER_AUTO_SCAN_LIBRARY", "0"', server)
         self.assertIn('_catalog_watch_loop', server)
         self.assertIn("先显示本地缓存，再后台同步增量索引", desktop)
         self.assertNotIn("把歌曲放进 G:", mobile)
@@ -150,7 +169,7 @@ class DesktopRegressionTests(unittest.TestCase):
         mobile = (ROOT / "mobile/lib/main.dart").read_text(encoding="utf-8")
         self.assertIn('"stem_electric_guitar"', server)
         self.assertIn('"lyrics_note_aligned": lyric_aligned', server)
-        self.assertIn('二阶段电吉他识别没有生成有效', uvr)
+        self.assertIn('真实电吉他 UVR 二阶段模型', uvr)
         self.assertIn("positionSeconds >= noteStart", mobile)
         self.assertIn("positionSeconds >= ((unit['start']", mobile)
 
@@ -161,19 +180,25 @@ class DesktopRegressionTests(unittest.TestCase):
         build_requirements = (ROOT / 'requirements-build.txt').read_text(encoding='utf-8')
         self.assertIn('from audio_separator.separator import Separator', uvr)
         self.assertIn('htdemucs_6s.yaml', uvr)
-        self.assertIn('electric_guitar.wav', (ROOT / 'app/project_utils.py').read_text(encoding='utf-8'))
+        self.assertIn('electric_guitar.wav', uvr)
+        self.assertNotIn('electric-acoustic-spectral-mask', uvr)
         self.assertIn('audio-separator>=0.44.5', server_requirements)
         self.assertIn('onnxruntime>=1.17', server_requirements)
         self.assertIn('onnxruntime>=1.17', build_requirements)
         self.assertIn('matplotlib>=3.8', build_requirements)
         self.assertIn('_seed_offline_uvr_catalog', uvr)
-        self.assertIn('demucs/htdemucs_6s-offline-fallback', uvr)
-        self.assertIn('guitar_combined.part.wav', (ROOT / 'app/project_utils.py').read_text(encoding='utf-8'))
+        self.assertIn('demucs/htdemucs_6s-direct-pcm-wav', uvr)
+        self.assertIn('returned = _run_demucs_fallback', uvr)
+        self.assertIn('"--output_format", "wav_float32"', uvr)
+        self.assertIn('bs-roformer-mega53-runner-ready.json', uvr)
+        self.assertIn('guitar_combined.part.wav', uvr)
         self.assertIn('QCheckBox("显示歌词")', desktop)
         self.assertIn('score/show_lyrics', desktop)
         self.assertIn('lyrics_url', desktop)
 
     def test_actions_do_not_create_nested_delivery_archives(self):
+        if not (ROOT / '.github/workflows/build-mobile.yml').is_file():
+            self.skipTest('source delivery intentionally excludes repository-only workflow metadata')
         mobile_workflow = (ROOT / '.github/workflows/build-mobile.yml').read_text(encoding='utf-8')
         ios_workflow = (ROOT / '.github/workflows/build-ios-testflight-package.yml').read_text(encoding='utf-8')
         windows_workflow = (ROOT / '.github/workflows/build-windows-exe.yml').read_text(encoding='utf-8')
@@ -184,7 +209,10 @@ class DesktopRegressionTests(unittest.TestCase):
     def test_frozen_worker_is_verified_in_windows_ci(self):
         worker = (ROOT / 'app/separation_worker_process.py').read_text(encoding='utf-8')
         spec = (ROOT / 'NOVRIA.spec').read_text(encoding='utf-8')
-        workflow = (ROOT / '.github/workflows/build-windows-exe.yml').read_text(encoding='utf-8')
+        workflow_path = ROOT / '.github/workflows/build-windows-exe.yml'
+        if not workflow_path.is_file():
+            self.skipTest('source delivery intentionally excludes repository-only workflow metadata')
+        workflow = workflow_path.read_text(encoding='utf-8')
         self.assertIn('--self-test', worker)
         self.assertIn("('audio-separator', 'demucs')", spec.replace('"', "'"))
         self.assertIn('copy_metadata(distribution', spec)

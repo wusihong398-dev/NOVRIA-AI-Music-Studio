@@ -27,7 +27,6 @@ from app.project_utils import (
     safe_file_stem,
     unique_import_candidates,
     load_synced_lyrics,
-    split_guitar_stem,
 )
 from app.uvr_separator import run_uvr_separation
 from app.library_catalog import (
@@ -61,7 +60,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -157,7 +156,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/3.3.0"}
+            headers={"User-Agent": "Juweier-Music/3.4.0"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -569,7 +568,7 @@ class StudioPage(QWidget):
         self.main = main
         layout = QVBoxLayout(self)
 
-        title = QLabel("AI 六轨分离 + 电吉他二次分离 / 多轨工作台")
+        title = QLabel("服务器成品多轨演奏 / 乐器工作台")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
@@ -580,6 +579,8 @@ class StudioPage(QWidget):
         self.btn_split = QPushButton(QIcon(icon_path("split")), "AI 六轨分离 + 电吉他二次分离")
         apply_button_accent(self.btn_split, "primary")
         self.btn_split.clicked.connect(main.start_separation)
+        btn_import.hide()
+        self.btn_split.hide()
         file_row.addWidget(self.file_label, 1)
         file_row.addWidget(btn_import)
         file_row.addWidget(self.btn_split)
@@ -613,6 +614,7 @@ class StudioPage(QWidget):
         self.key_label = QLabel("调性：未分析")
         analyze_btn = QPushButton("分析 BPM / 调性")
         analyze_btn.clicked.connect(main.analyze_music)
+        analyze_btn.hide()
         add_marker_btn = QPushButton("当前位置添加 Marker")
         add_marker_btn.clicked.connect(main.add_marker)
         analysis_row.addWidget(self.bpm_label)
@@ -643,6 +645,7 @@ class StudioPage(QWidget):
         model_l.addWidget(self.model_status)
         model_l.addWidget(self.model_progress)
         layout.addWidget(model_box)
+        model_box.hide()
 
         split_box = QGroupBox("六轨基础分离与电吉他二次识别进度")
         split_l = QVBoxLayout(split_box)
@@ -654,6 +657,7 @@ class StudioPage(QWidget):
         split_l.addWidget(self.split_status)
         split_l.addWidget(self.split_progress)
         layout.addWidget(split_box)
+        split_box.hide()
 
         self.log = QLabel("等待任务...")
         self.log.setWordWrap(True)
@@ -804,7 +808,7 @@ class SettingsPage(QWidget):
         ll.addWidget(self.prevent_sleep)
         layout.addWidget(live_box)
 
-        server_box = QGroupBox("AI 服务器（服务器 G 盘曲库来源）")
+        server_box = QGroupBox("橘味儿服务器（已发布成品来源）")
         server_layout = QGridLayout(server_box)
         server_config = load_desktop_server_config(DESKTOP_SERVER_CONFIG)
         self.server_edit = QLineEdit(server_config["server"])
@@ -823,7 +827,7 @@ class SettingsPage(QWidget):
         server_layout.addWidget(self.server_token_edit, 1, 1, 1, 3)
         server_layout.addWidget(save_server, 2, 1)
         server_layout.addWidget(test_server, 2, 2)
-        server_layout.addWidget(QLabel("曲库必须由服务器 API 读取，不会扫描客户端 G 盘。"), 3, 0, 1, 4)
+        server_layout.addWidget(QLabel("只读取服务器已发布成品索引；客户端不会扫描任何本地硬盘。"), 3, 0, 1, 4)
         layout.addWidget(server_box)
 
         legal_box = QGroupBox("协议、帮助与关于")
@@ -833,7 +837,7 @@ class SettingsPage(QWidget):
             "隐私政策": "软件仅在用户主动操作时处理导入的音频、任务参数、账号与反馈信息。手机 AI 任务会上传至配置的 AI 服务器。",
             "用户协议": "本软件目前仅供学习与研究使用，不提供歌曲下载服务。只能导入自己创作、已获授权或依法可使用的音频；AI 结果须人工复核。",
             "帮助与反馈": "如遇到分轨、谱面、歌词或连接问题，请记录软件版本、歌曲格式、操作步骤和错误信息后反馈。",
-            "关于软件": f"{APP_NAME} v{VERSION}\nAI 六轨+电吉他、五线谱/六线谱/歌词同步、AI 歌词与现场演出工作站。",
+            "关于软件": f"{APP_NAME} v{VERSION}\n打开服务器成品曲库即可使用七轨、五线谱、六线谱和逐音符同步歌词。",
         }
         for name, text in documents.items():
             button = QPushButton(name)
@@ -852,7 +856,7 @@ class SettingsPage(QWidget):
         self.server_edit.setText(server)
         if hasattr(self.main, "music_library"):
             self.main.music_library.refresh_library()
-        QMessageBox.information(self, "AI 服务器", "服务器地址已保存，已刷新服务器 G 盘曲库。")
+        QMessageBox.information(self, "橘味儿服务器", "服务器地址已保存，正在同步已发布成品曲库。")
 
     def test_server(self):
         try:
@@ -866,12 +870,12 @@ class SettingsPage(QWidget):
             QMessageBox.information(
                 self, "服务器曲库连接成功",
                 f"服务状态：{health.get('status', 'online')}\n"
-                f"服务器曲库：{root}\n"
-                f"已入库歌曲：{catalog.get('count', 0)} 首\n"
+                f"成品存储：{root}\n"
+                f"已发布成品：{catalog.get('count', 0)} 首\n"
                 f"歌词识别模型：{lyric_asr}",
             )
         except Exception as exc:
-            QMessageBox.critical(self, "服务器曲库连接失败", str(exc))
+            QMessageBox.critical(self, "服务器成品曲库连接失败", str(exc))
 
     def show_document(self, title, text):
         dialog = QDialog(self)
@@ -1121,11 +1125,12 @@ class SetlistPage(QWidget):
         layout.addWidget(title)
 
         bar = QHBoxLayout()
-        add_current_btn = QPushButton("加入当前 G 盘歌曲")
+        add_current_btn = QPushButton("加入当前服务器成品")
         apply_button_accent(add_current_btn, "primary")
         add_current_btn.clicked.connect(self.add_current_song)
         add_btn = QPushButton("添加本地文件")
         add_btn.clicked.connect(self.add_song)
+        add_btn.hide()
         remove_btn = QPushButton("删除所选")
         remove_btn.clicked.connect(self.remove_selected)
         up_btn = QPushButton("上移")
@@ -2417,7 +2422,7 @@ class InstrumentExperiencePage(QWidget):
 
     def save_instrument_profile(self):
         if not self.main.song_file:
-            QMessageBox.warning(self,"提示","请先导入歌曲。")
+            QMessageBox.warning(self,"提示","请先从成品曲库选择歌曲。")
             return
         song=Path(self.main.song_file).stem
         folder=BASE_DIR/"instrument_profiles"
@@ -2778,7 +2783,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.3.0"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.4.0"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -2937,7 +2942,7 @@ class MusicLibraryPage(QWidget):
         analyze.clicked.connect(self.batch_analyze)
         stems.clicked.connect(self.enqueue_stems)
         refresh.clicked.connect(self.refresh_library)
-        for b in [scan,choose_root,import_local,import_link,analyze,stems,refresh]:
+        for b in [choose_root,refresh]:
             top.addWidget(b)
         top.addStretch(1)
         layout.addLayout(top)
@@ -2997,7 +3002,7 @@ class MusicLibraryPage(QWidget):
         self.library_scan_status.setWordWrap(True)
         layout.addWidget(self.library_scan_status)
 
-        library_box=QGroupBox("橘味儿音乐分类库 / G 盘歌手歌曲库（歌手默认折叠，展开后按需显示歌曲）")
+        library_box=QGroupBox("橘味儿音乐成品分类库（歌手默认折叠，展开后按需显示歌曲）")
         library_layout=QHBoxLayout(library_box)
         self.tree=QTreeWidget()
         self.tree.setHeaderLabels(["歌手分类 / 歌曲","数量 · 分类 · 专辑 · 音质"])
@@ -3069,6 +3074,7 @@ class MusicLibraryPage(QWidget):
         bgl.addWidget(QLabel("总进度"),3,0)
         bgl.addWidget(self.total_progress,3,1,1,4)
         layout.addWidget(batch_box)
+        batch_box.hide()
 
         pipeline_box=QGroupBox("服务器批量生产中心")
         pgl=QGridLayout(pipeline_box)
@@ -3133,6 +3139,7 @@ class MusicLibraryPage(QWidget):
         pgl.addWidget(self.pipeline_table,4,0,1,6)
 
         layout.addWidget(pipeline_box)
+        pipeline_box.hide()
 
         scheduler_box=QGroupBox("专业任务调度")
         sgl=QGridLayout(scheduler_box)
@@ -3189,6 +3196,7 @@ class MusicLibraryPage(QWidget):
         sgl.addWidget(self.scheduler_status,2,1,1,6)
 
         layout.addWidget(scheduler_box)
+        scheduler_box.hide()
 
         self.progress=QProgressBar()
         self.progress.setRange(0,100)
@@ -3700,7 +3708,7 @@ class MusicLibraryPage(QWidget):
             return
         suffix = "；当前继续显示已缓存歌曲" if self.remote_rows else ""
         self.library_scan_status.setText(
-            f"服务器曲库读取失败：{error}{suffix} · 已禁止回退扫描客户端 G 盘"
+            f"服务器成品曲库读取失败：{error}{suffix} · 不会回退扫描客户端硬盘"
         )
 
     def _render_library_rows(self, all_rows, status_prefix=""):
@@ -3753,7 +3761,7 @@ class MusicLibraryPage(QWidget):
             prefix = f"{status_prefix} · " if status_prefix else ""
             self.library_scan_status.setText(
                 f"{prefix}当前显示 {len(artists)} 位歌手、{len(rows)} 首服务器歌曲 · "
-                f"服务器目录：{self.server_library_root} · 未扫描客户端 G 盘"
+                f"服务器索引：{self.server_library_root} · 未扫描客户端硬盘"
             )
         self.tree.setUpdatesEnabled(True)
 
@@ -3821,7 +3829,7 @@ class MusicLibraryPage(QWidget):
         br=f'{bitrate/1000:.0f} kbps' if bitrate else "-"
         sr=f'{samplerate/1000:.1f} kHz' if samplerate else "-"
         self.detail.setText(
-            f'来源：服务器 G 盘\n歌曲：{row.get("title", "")}\n'
+            f'来源：服务器已发布成品\n歌曲：{row.get("title", "")}\n'
             f'歌手：{row.get("artist", "未知歌手")}\n专辑：{row.get("album") or "未分类专辑"}\n'
             f'时长：{dur}\n格式：{row.get("format") or "-"}\n码率：{br}\n采样率：{sr}\n'
             f'声道：{row.get("channels") or "-"}\n音质：{row.get("quality") or "待检测"}\n'
@@ -3830,7 +3838,7 @@ class MusicLibraryPage(QWidget):
             f'六轨：{row.get("stems_status") or "未分轨"}'
         )
         self.cover.setPixmap(QPixmap())
-        self.cover.setText("服务器曲库")
+        self.cover.setText("服务器成品")
 
     def batch_analyze(self):
         if not self.remote_rows:
@@ -5315,9 +5323,9 @@ class MainWindow(QMainWindow):
         self.nav.setObjectName("NavList")
         self.nav.setIconSize(QSize(30,30))
         nav_items = [
-            ("统一音乐导入","import"),
-            ("音乐库","projects"),
-            ("AI 六轨+电吉他","split"),
+            ("管理员导入（隐藏）","import"),
+            ("成品曲库","projects"),
+            ("多轨演奏","split"),
             ("AI 改编 / 乐谱","arrange"),
             ("演出谱面","arrange"),
             ("乐手演奏中心","live"),
@@ -5331,10 +5339,11 @@ class MainWindow(QMainWindow):
         ]
         for text, ico in nav_items:
             QListWidgetItem(QIcon(icon_path(ico)), text, self.nav)
-        self.nav.setCurrentRow(2)
+        self.nav.item(0).setHidden(True)
+        self.nav.setCurrentRow(1)
         side.addWidget(self.nav, 1)
 
-        song_context=QGroupBox("全局 G 盘歌曲")
+        song_context=QGroupBox("当前服务器成品")
         song_context_layout=QVBoxLayout(song_context)
         self.current_song_label=QLabel("尚未选择歌曲")
         self.current_song_label.setWordWrap(True)
@@ -5411,7 +5420,7 @@ class MainWindow(QMainWindow):
     def open_g_drive_library(self):
         self.nav.setCurrentRow(1)
         self.music_library.tree.setFocus()
-        self.statusBar().showMessage("请按歌手展开歌曲，双击歌曲后即可供左侧所有功能共同处理")
+        self.statusBar().showMessage("请按歌手展开并双击歌曲，可直接使用服务器分轨、歌词和谱面")
 
     def load_library_track(self,track_id):
         con=self.music_library._db()
@@ -5484,7 +5493,45 @@ class MainWindow(QMainWindow):
             "vocals","drums","bass","guitar","electric_guitar","piano","other"
         )):
             self.stem_dir=folder
-        self.statusBar().showMessage("服务器 AI 成果已缓存：七轨、歌词和乐谱可以直接使用")
+            self.base_stem_dir=folder
+            try:
+                self.engine.load(folder)
+                self.load_waveform_if_ready()
+                self.sync_mix_controls()
+            except Exception as exc:
+                self.statusBar().showMessage(f"服务器音轨已缓存，但混音器载入失败：{exc}")
+                return
+
+        score_path=Path(str(self.selected_server_artifacts.get("score_data") or folder/"score_data.json"))
+        if score_path.is_file():
+            try:
+                score=json.loads(score_path.read_text(encoding="utf-8"))
+                self.analysis_result={
+                    "bpm": float(score.get("bpm",120) or 120),
+                    "key": str(score.get("key") or "C"),
+                    "duration": float(score.get("duration",0) or 0),
+                }
+                self.chord_timeline=list(score.get("bars") or [])
+                self.melody_reference=list(score.get("staff_notes") or [])
+                lyric_units=list(score.get("lyric_units") or [])
+                lyric_rows=list(score.get("lyrics") or [])
+                self.lyric_reference=[
+                    {
+                        "start": float(row.get("start",row.get("time",0)) or 0),
+                        "end": float(row.get("end",row.get("start",row.get("time",0))) or 0),
+                        "text": str(row.get("text") or row.get("word") or ""),
+                    }
+                    for row in (lyric_units or lyric_rows)
+                    if str(row.get("text") or row.get("word") or "").strip()
+                ]
+                self.studio.bpm_label.setText(f"BPM：{self.analysis_result['bpm']:.1f}")
+                self.studio.key_label.setText(f"调性：{self.analysis_result['key']}")
+            except Exception as exc:
+                self.statusBar().showMessage(f"音轨可用，但服务器谱面数据读取失败：{exc}")
+                return
+        if hasattr(self,"score_performance"):
+            self.score_performance.refresh_score()
+        self.statusBar().showMessage("服务器成品已就绪：七轨、逐音符歌词和乐谱可直接使用")
 
     def _release_server_artifact_worker(self, worker):
         if worker in getattr(self,"server_artifact_workers",[]):
@@ -5544,7 +5591,7 @@ class MainWindow(QMainWindow):
 
     def start_separation(self):
         if not self.song_file:
-            QMessageBox.warning(self, "提示", "请先导入歌曲。")
+            QMessageBox.warning(self, "提示", "请先从成品曲库选择歌曲。")
             return
         if self.worker and self.worker.isRunning():
             return
@@ -5846,7 +5893,7 @@ class MainWindow(QMainWindow):
 
     def analyze_full_score(self):
         if not self.song_file:
-            QMessageBox.warning(self, "提示", "请先导入歌曲。")
+            QMessageBox.warning(self, "提示", "请先从成品曲库选择歌曲。")
             return
         try:
             import librosa
@@ -7481,7 +7528,7 @@ class MainWindow(QMainWindow):
 
     def export_melody_reference(self):
         if not self.song_file:
-            QMessageBox.warning(self, "提示", "请先导入歌曲。")
+            QMessageBox.warning(self, "提示", "请先从成品曲库选择歌曲。")
             return
         try:
             import librosa
@@ -7768,7 +7815,7 @@ class MainWindow(QMainWindow):
     def analyze_music(self):
         """轻量本地分析。优先 librosa；没有时给出明确提示。"""
         if not self.song_file:
-            QMessageBox.warning(self, "提示", "请先导入歌曲。")
+            QMessageBox.warning(self, "提示", "请先从成品曲库选择歌曲。")
             return
         try:
             import librosa

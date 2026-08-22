@@ -1,9 +1,10 @@
-"""Headless Ultimate Vocal Remover compatible six-stem separation.
+"""Headless six-stem and dedicated-guitar separation.
 
-The desktop and mobile server use ``audio-separator`` as the maintained
-headless runner for models distributed through the UVR ecosystem.  The base
-model produces the real guitar stem; a deterministic second stage then divides
-that guitar signal into acoustic and electric outputs for the seven-channel UI.
+The base stage runs the official Demucs ``htdemucs_6s`` API directly and writes
+validated PCM WAV files atomically.  This avoids the audio-separator WAV writer
+that produced unreadable files on the target Windows 10 server.  A second
+MVSep Mega 53-Stems model must then produce explicit acoustic-guitar and
+electric-guitar outputs.  No spectral-mask or EQ approximation is accepted.
 """
 
 from __future__ import annotations
@@ -12,12 +13,11 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Callable
-
-from app.project_utils import split_guitar_stem
-
 
 DEFAULT_UVR_MODEL = "htdemucs_6s.yaml"
 STANDARD_STEMS = ("vocals", "drums", "bass", "guitar", "piano", "other")
@@ -106,7 +106,7 @@ def _ensure_demucs_model(
     notify(1, "首次使用：正在从 Demucs 官方服务器下载六轨模型")
     request = urllib.request.Request(
         DEMUCS_MODEL_URL,
-        headers={"User-Agent": "Juweier-Music/3.3.0"},
+        headers={"User-Agent": "Juweier-Music/3.4.0"},
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
@@ -167,6 +167,273 @@ def _clear_stale_outputs(stem_dir: Path) -> None:
         (stem_dir / f"{name}.wav").unlink(missing_ok=True)
         (stem_dir / f"{name}.part.wav").unlink(missing_ok=True)
     (stem_dir / "guitar_second_stage.json").unlink(missing_ok=True)
+    shutil.rmtree(stem_dir / "_electric_uvr", ignore_errors=True)
+    shutil.rmtree(stem_dir / "_mega53_input", ignore_errors=True)
+    shutil.rmtree(stem_dir / "_mega53_output", ignore_errors=True)
+
+
+def _run_electric_guitar_uvr(
+    stem_dir: Path,
+    model_dir: Path,
+    selected_device: str,
+    base_engine: str,
+    base_model: str,
+    notify: Callable[[int, str], None],
+) -> dict:
+    """Run a real UVR two-stem guitar model against the combined Guitar stem."""
+
+    electric_engine = os.environ.get(
+        "JUWEIER_ELECTRIC_GUITAR_ENGINE", "audio-separator",
+    ).strip().casefold()
+    model = os.environ.get("JUWEIER_ELECTRIC_GUITAR_MODEL", "").strip()
+    if not model:
+        raise RuntimeError(
+            "尚未配置真实电吉他二阶段模型；系统不会用频谱遮罩伪造电吉他轨。"
+        )
+    primary = os.environ.get("JUWEIER_ELECTRIC_GUITAR_PRIMARY_STEM", "Guitar").strip() or "Guitar"
+    complement = os.environ.get(
+        "JUWEIER_ELECTRIC_GUITAR_COMPLEMENT_STEM", "Instrumental",
+    ).strip() or "Instrumental"
+    guitar = stem_dir / "guitar.wav"
+    if not _valid_wav(guitar):
+        raise RuntimeError("基础六轨没有生成有效 Guitar stem，不能执行电吉他二次分离")
+    combined = stem_dir / "guitar_combined.wav"
+    combined_temp = stem_dir / "guitar_combined.part.wav"
+    combined_temp.unlink(missing_ok=True)
+    shutil.copy2(guitar, combined_temp)
+    if not _valid_wav(combined_temp):
+        combined_temp.unlink(missing_ok=True)
+        raise RuntimeError("基础 Guitar stem 格式无效，不能执行电吉他二次分离")
+    os.replace(combined_temp, combined)
+
+    if electric_engine == "mvsep-mega53":
+        return _run_mvsep_mega53_electric(
+            combined, stem_dir, selected_device, base_engine, base_model, model, notify,
+        )
+
+    try:
+        from audio_separator.separator import Separator
+    except ImportError as exc:
+        raise RuntimeError("缺少 audio-separator，无法运行真实电吉他 UVR 模型") from exc
+
+    second_dir = stem_dir / "_electric_uvr"
+    shutil.rmtree(second_dir, ignore_errors=True)
+    second_dir.mkdir(parents=True, exist_ok=True)
+    notify(96, f"加载真实电吉他 UVR 二阶段模型：{model}")
+    separator = Separator(
+        output_dir=str(second_dir), output_format="WAV",
+        model_file_dir=str(model_dir), use_soundfile=True,
+        use_autocast=selected_device == "cuda",
+    )
+    try:
+        separator.load_model(model_filename=model)
+        returned = [
+            str(item) for item in separator.separate(
+                str(combined), {primary: "electric_guitar", complement: "acoustic_guitar"},
+            )
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            f"真实电吉他 UVR 模型运行失败：{model}。请确认模型已下载完整，且主 stem={primary}、"
+            f"补集 stem={complement}。原始错误：{exc}"
+        ) from exc
+
+    electric = _resolve_output(second_dir, returned, "electric_guitar")
+    acoustic = _resolve_output(second_dir, returned, "acoustic_guitar")
+    if electric is None or not _valid_wav(electric):
+        raise RuntimeError(f"模型 {model} 没有输出有效的独立 Electric Guitar stem")
+    if acoustic is None or not _valid_wav(acoustic):
+        raise RuntimeError(f"模型 {model} 没有输出有效的 Guitar 补集 stem")
+    electric_target = stem_dir / "electric_guitar.wav"
+    acoustic_target = stem_dir / "guitar.wav"
+    electric_target.unlink(missing_ok=True)
+    acoustic_target.unlink(missing_ok=True)
+    shutil.move(str(electric), electric_target)
+    shutil.move(str(acoustic), acoustic_target)
+    shutil.rmtree(second_dir, ignore_errors=True)
+
+    import soundfile as sf
+    import numpy as np
+
+    electric_audio, sample_rate = sf.read(str(electric_target), always_2d=True, dtype="float32")
+    combined_audio, combined_rate = sf.read(str(combined), always_2d=True, dtype="float32")
+    if sample_rate != combined_rate or abs(len(electric_audio) - len(combined_audio)) > sample_rate:
+        raise RuntimeError("电吉他二阶段输出与原曲时长或采样率不一致，禁止发布")
+    electric_rms = float(np.sqrt(np.mean(np.square(electric_audio))) if electric_audio.size else 0.0)
+    combined_rms = float(np.sqrt(np.mean(np.square(combined_audio))) if combined_audio.size else 0.0)
+    activity = min(1.0, electric_rms / max(combined_rms, 1e-9))
+    diagnostics = {
+        "method": "audio-separator/UVR-real-two-stage",
+        "engine": base_engine,
+        "base_model": base_model,
+        "electric_model": model,
+        "primary_stem": primary,
+        "complement_stem": complement,
+        "sample_rate": int(sample_rate),
+        "duration": float(len(electric_audio) / max(sample_rate, 1)),
+        "electric_activity": round(activity, 4),
+        "outputs": ["guitar.wav", "electric_guitar.wav", "guitar_combined.wav"],
+    }
+    (stem_dir / "guitar_second_stage.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return diagnostics
+
+
+def _run_mvsep_mega53_electric(
+    combined: Path,
+    stem_dir: Path,
+    selected_device: str,
+    base_engine: str,
+    base_model: str,
+    model: str,
+    notify: Callable[[int, str], None],
+) -> dict:
+    """Extract explicit acoustic/electric guitar stems with MVSep Mega 53-Stems.
+
+    The upstream checkpoint exposes separate ``acoustic-guitar`` and
+    ``electric-guitar`` outputs.  The patched runner keeps only the active
+    inference chunk on CUDA and performs overlap-add in system RAM.  CPU
+    fallback is deliberately forbidden because one song can otherwise run for
+    many hours without completing.
+    """
+
+    try:
+        import bs_roformer  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 bs-roformer-infer，无法运行 MVSep Mega 53-Stems 独立电吉他模型"
+        ) from exc
+
+    model_slug = model or "roformer-model-bs-roformer-mvsep-mega-53-stems"
+    input_dir = stem_dir / "_mega53_input"
+    output_dir = stem_dir / "_mega53_output"
+    shutil.rmtree(input_dir, ignore_errors=True)
+    shutil.rmtree(output_dir, ignore_errors=True)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(combined, input_dir / "guitar_combined.wav")
+    models_dir = Path(os.environ.get(
+        "JUWEIER_BS_ROFORMER_MODEL_DIR",
+        str(stem_dir.parents[2] / "bs_roformer_models"),
+    )).resolve()
+    models_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_name = "mvsep_mega_model_bs_roformer_53_stems_v1.ckpt"
+    config_name = "mvsep_mega_model_bs_roformer_53_stems.yaml"
+    checkpoint = Path(os.environ.get(
+        "JUWEIER_BS_ROFORMER_MODEL_PATH", str(models_dir / checkpoint_name),
+    )).resolve()
+    config = Path(os.environ.get(
+        "JUWEIER_BS_ROFORMER_CONFIG_PATH", str(models_dir / config_name),
+    )).resolve()
+    if not checkpoint.is_file() or checkpoint.stat().st_size != 1_368_919_887:
+        raise RuntimeError(
+            "MVSep Mega 53-Stems 官方权重不存在或不完整；请运行 Install-MVSep-Mega53-v335.cmd"
+        )
+    if not config.is_file() or config.stat().st_size != 4_184:
+        raise RuntimeError(
+            "MVSep Mega 53-Stems 官方配置不存在或不完整；请运行 Install-MVSep-Mega53-v335.cmd"
+        )
+    runner_marker = models_dir / "bs-roformer-mega53-runner-ready.json"
+    if not runner_marker.is_file():
+        raise RuntimeError(
+            "BS-RoFormer Mega53 运行器未通过架构兼容检查；"
+            "请运行 Install-BS-RoFormer-Mega53-v336.cmd"
+        )
+    tail_marker = models_dir / "bs-roformer-tail-chunk-v337-ready.json"
+    if not tail_marker.is_file():
+        raise RuntimeError(
+            "BS-RoFormer Mega53 尾块长度修复尚未安装；"
+            "请运行 Install-BS-RoFormer-Tail-Fix-v337.cmd"
+        )
+    low_vram_marker = models_dir / "bs-roformer-low-vram-v338-ready.json"
+    if not low_vram_marker.is_file():
+        raise RuntimeError(
+            "RTX 3060 低显存运行修复尚未安装；"
+            "请运行 Install-BS-RoFormer-Low-VRAM-v338.cmd"
+        )
+    if not selected_device.startswith("cuda"):
+        raise RuntimeError(
+            "MVSep Mega 53-Stems 必须使用 CUDA；已禁止自动切换 CPU，"
+            "避免单首歌曲运行数小时"
+        )
+
+    device = selected_device
+    shutil.rmtree(output_dir, ignore_errors=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    notify(96, "MVSep Mega 53-Stems 低显存 CUDA 分块处理中（最长 120 分钟）")
+    command = [
+        sys.executable, "-m", "bs_roformer.inference",
+        "--model_path", str(checkpoint),
+        "--config_path", str(config),
+        "--input_folder", str(input_dir),
+        "--store_dir", str(output_dir),
+        "--device", device,
+        "--output_format", "wav_float32",
+    ]
+    timeout_seconds = max(
+        600, int(os.environ.get("JUWEIER_MEGA53_TIMEOUT_SECONDS", "7200"))
+    )
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = ((exc.stderr or exc.stdout or "")[-2000:] if isinstance(
+            exc.stderr or exc.stdout or "", str
+        ) else "")
+        raise RuntimeError(
+            f"MVSep Mega 53-Stems CUDA 超过 {timeout_seconds // 60} 分钟，"
+            f"已自动终止且不会切换 CPU。{detail}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error")[-6000:]
+        raise RuntimeError(
+            "MVSep Mega 53-Stems CUDA 运行失败，已禁止 CPU 回退：" + detail
+        )
+    used_device = device
+
+    electric = next(output_dir.glob("*_electric-guitar.wav"), None)
+    acoustic = next(output_dir.glob("*_acoustic-guitar.wav"), None)
+    if electric is None or not _valid_wav(electric):
+        raise RuntimeError("MVSep Mega 53-Stems 没有生成有效 electric-guitar stem")
+    if acoustic is None or not _valid_wav(acoustic):
+        raise RuntimeError("MVSep Mega 53-Stems 没有生成有效 acoustic-guitar stem")
+    electric_target = stem_dir / "electric_guitar.wav"
+    acoustic_target = stem_dir / "guitar.wav"
+    electric_target.unlink(missing_ok=True)
+    acoustic_target.unlink(missing_ok=True)
+    shutil.move(str(electric), electric_target)
+    shutil.move(str(acoustic), acoustic_target)
+    shutil.rmtree(input_dir, ignore_errors=True)
+    shutil.rmtree(output_dir, ignore_errors=True)
+
+    import numpy as np
+    import soundfile as sf
+
+    electric_audio, sample_rate = sf.read(str(electric_target), always_2d=True, dtype="float32")
+    combined_audio, combined_rate = sf.read(str(combined), always_2d=True, dtype="float32")
+    if sample_rate != combined_rate or abs(len(electric_audio) - len(combined_audio)) > sample_rate:
+        raise RuntimeError("MVSep 电吉他输出与 Guitar stem 时长或采样率不一致，禁止发布")
+    electric_rms = float(np.sqrt(np.mean(np.square(electric_audio))) if electric_audio.size else 0.0)
+    combined_rms = float(np.sqrt(np.mean(np.square(combined_audio))) if combined_audio.size else 0.0)
+    diagnostics = {
+        "method": "MVSep-Mega-53-Stems/BS-RoFormer",
+        "engine": base_engine,
+        "base_model": base_model,
+        "electric_model": model_slug,
+        "device": used_device,
+        "separate_outputs": ["acoustic-guitar", "electric-guitar"],
+        "sample_rate": int(sample_rate),
+        "duration": float(len(electric_audio) / max(sample_rate, 1)),
+        "electric_activity": round(electric_rms / max(combined_rms, 1e-9), 4),
+        "outputs": ["guitar.wav", "electric_guitar.wav", "guitar_combined.wav"],
+    }
+    (stem_dir / "guitar_second_stage.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return diagnostics
 
 
 def _run_demucs_fallback(
@@ -273,50 +540,11 @@ def run_uvr_separation(
     _seed_offline_uvr_catalog(model_dir)
     _ensure_demucs_model(model_dir, notify)
 
-    separator = None
-    load_error: Exception | None = None
-    try:
-        from audio_separator.separator import Separator
-
-        notify(7, f"正在从本地缓存加载 UVR 模型：{model}")
-        separator = Separator(
-            output_dir=str(stem_dir),
-            output_format="WAV",
-            model_file_dir=str(model_dir),
-            use_soundfile=True,
-            use_autocast=selected_device == "cuda",
-            demucs_params={
-                "segment_size": "Default",
-                "shifts": 2,
-                "overlap": 0.25,
-                "segments_enabled": True,
-            },
-        )
-        separator.load_model(model_filename=model)
-    except Exception as exc:
-        load_error = exc
-        separator = None
-
-    notify(8, f"UVR 六轨分离中（{selected_device.upper()}）")
-    output_names = {
-        "Vocals": "vocals",
-        "Drums": "drums",
-        "Bass": "bass",
-        "Guitar": "guitar",
-        "Piano": "piano",
-        "Other": "other",
-    }
-    if separator is not None:
-        returned = [str(item) for item in separator.separate(str(source), output_names)]
-        engine = "audio-separator/UVR"
-    else:
-        if load_error is not None:
-            missing = getattr(load_error, "name", "") or str(load_error)
-            notify(8, f"UVR 加载失败（{missing}），自动启用本地六轨兜底")
-        returned = _run_demucs_fallback(
-            source, stem_dir, model_dir, selected_device, notify,
-        )
-        engine = "demucs/htdemucs_6s-offline-fallback"
+    notify(8, f"Demucs htdemucs_6s 直接六轨分离中（{selected_device.upper()}）")
+    returned = _run_demucs_fallback(
+        source, stem_dir, model_dir, selected_device, notify,
+    )
+    engine = "demucs/htdemucs_6s-direct-pcm-wav"
 
     missing: list[str] = []
     for stem in STANDARD_STEMS:
@@ -332,11 +560,9 @@ def run_uvr_separation(
     if missing:
         raise RuntimeError("UVR 分轨结果缺少：" + "、".join(missing))
 
-    notify(96, "UVR 吉他轨完成，正在识别木吉他与电吉他")
-    diagnostics = split_guitar_stem(
-        stem_dir,
-        engine=engine,
-        model=model,
+    notify(96, "UVR Guitar stem 完成，开始真实电吉他二阶段模型")
+    diagnostics = _run_electric_guitar_uvr(
+        stem_dir, model_dir, selected_device, engine, model, notify,
     )
     electric = stem_dir / "electric_guitar.wav"
     if not _valid_wav(electric):

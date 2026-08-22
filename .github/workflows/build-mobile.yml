@@ -1,10 +1,10 @@
 name: Build Juweier Music Android and iOS
-run-name: Juweier Music v3.3.0 Android + iOS · ${{ github.ref_name }}
+run-name: Juweier Music v3.4.0 Android + iOS · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.3.0"]
+    branches: ["main", "agent/juweier-v3.4.0"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-mobile.yml"
@@ -12,11 +12,9 @@ on:
 permissions:
   contents: read
 
-# v3.3.0 final server-published catalog mobile build.
-
 jobs:
   android:
-    name: Android APK
+    name: Android APK and AAB
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -50,16 +48,22 @@ jobs:
           s=s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
           manifest.write_text(s)
           PY
-      - name: Build release APK
+      - name: Verify product-only mobile source
+        shell: bash
+        run: |
+          grep -q 'appVersion = "3.4.0"' mobile/lib/main.dart
+          grep -q '成品曲库' mobile/lib/main.dart
+          ! grep -q 'file_picker' mobile/pubspec.yaml
+      - name: Build release APK and AAB
         working-directory: mobile_build
         run: |
           flutter analyze lib --no-fatal-infos --no-fatal-warnings
           flutter build apk --release
           flutter build appbundle --release
-      - name: Upload Android APK
+      - name: Upload Android package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.3.0-Android-Test-Pack
+          name: Juweier-Music-v3.4.0-Android
           path: |
             mobile_build/build/app/outputs/flutter-apk/app-release.apk
             mobile_build/build/app/outputs/bundle/release/app-release.aab
@@ -68,7 +72,7 @@ jobs:
           compression-level: 0
 
   ios:
-    name: iOS unsigned app
+    name: iOS Simulator app
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -97,12 +101,14 @@ jobs:
           PY
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
-          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接橘味儿音乐成品服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
       - name: Build iOS simulator validation app
         working-directory: mobile_build
-        run: flutter build ios --simulator --debug
+        run: |
+          flutter analyze lib --no-fatal-infos --no-fatal-warnings
+          flutter build ios --simulator --debug
       - name: Stage iOS simulator app without nested archive
         shell: bash
         run: |
@@ -111,7 +117,7 @@ jobs:
       - name: Upload iOS simulator package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.3.0-iOS-Simulator
+          name: Juweier-Music-v3.4.0-iOS-Simulator
           path: ios-simulator
           if-no-files-found: error
           retention-days: 30

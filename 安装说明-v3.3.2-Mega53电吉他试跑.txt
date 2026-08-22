@@ -1,0 +1,22 @@
+橘味儿音乐 v3.3.2 MVSep 独立电吉他三首试跑
+================================================
+
+确认结果：UVR 自带目录只有 htdemucs_6s，它只能输出合并 Guitar，不能作为独立电吉他。
+
+本版第二阶段改用 MVSep Mega 53-Stems（BS-RoFormer）。该模型明确输出：
+
+- acoustic-guitar
+- electric-guitar
+
+注意：模型官方建议至少 16GB 显存。服务器 RTX 3060 只有 12GB，所以程序会先尝试 CUDA；如果显存不足，会自动切换 CPU 完成三首试跑。CPU 会明显更慢，试跑会记录实际耗时。
+
+执行顺序：
+
+1. 关闭旧的 8001 服务器窗口。
+2. 将本包内容覆盖到 E:\Dongba-Music-Server。
+3. 双击 Install-MVSep-Electric-Guitar-v332.cmd。
+4. 等待运行器和模型下载、SHA-256 校验完成；模型较大，不要关闭窗口。
+5. 右键 Start-Juweier-Server-v332-Mega53-Pilot.ps1，选择“使用 PowerShell 运行”。
+6. 健康检查显示 version=3.3.2、processing_ready=true、electric_engine=mvsep-mega53 后，双击 Start-3-Song-Pilot-v332.cmd。
+
+三首完成前不要开始剩余歌曲。只有独立木吉他、电吉他、其他 Stem、歌词与乐谱均通过校验，才会写入 G:\JuweierMusicProcessed\01_Ready。

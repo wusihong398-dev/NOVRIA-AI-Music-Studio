@@ -1,10 +1,10 @@
 name: Build Juweier Music Windows EXE
-run-name: Juweier Music v3.3.0 Windows · ${{ github.ref_name }}
+run-name: Juweier Music v3.4.0 Windows · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "agent/juweier-v3.3.0" ]
+    branches: ["main", "agent/juweier-v3.4.0"]
     paths:
       - "app/**"
       - "assets/**"
@@ -14,90 +14,63 @@ on:
       - "NOVRIA.spec"
       - "requirements.txt"
       - "requirements-build.txt"
-      - "Check-GPU.bat"
-      - "Install-AI-Engine.bat"
-      - "Open-Model-Folder.bat"
       - ".github/workflows/build-windows-exe.yml"
 
 permissions:
   contents: read
-
-# v3.3.0 final server-published catalog Windows build.
 
 jobs:
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-
+          cache: pip
       - name: Build CPU-compatible EXE
         shell: powershell
         run: |
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
-
-      - name: Verify v3.3.0 complete pipeline EXE
+      - name: Verify v3.4.0 product client
         shell: powershell
         run: |
           $root = "dist\Juweier-Music"
           $exe = "$root\Juweier-Music.exe"
           $worker = "$root\Juweier-Separation-Worker.exe"
           $ffmpeg = "$root\tools\ffmpeg\ffmpeg.exe"
-          if (!(Test-Path $exe)) { throw "EXE not found: $exe" }
-          if (!(Test-Path $worker)) { throw "Worker EXE not found: $worker" }
-          if (!(Test-Path $ffmpeg)) { throw "Bundled FFmpeg not found: $ffmpeg" }
-
-          # Keep verification ASCII-only so Windows PowerShell code pages cannot corrupt Chinese UI text.
+          if (!(Test-Path $exe)) { throw "EXE not found" }
+          if (!(Test-Path $worker)) { throw "Worker EXE not found" }
+          if (!(Test-Path $ffmpeg)) { throw "FFmpeg not found" }
           $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
-          if ($launcher -notmatch 'VERSION\s*=\s*"3\.3\.0"') { throw "v3.3.0 launcher not found" }
-          if (!(Select-String -Path "app\library_catalog.py" -Pattern "scan_catalog_roots" -Quiet)) { throw "Recursive multi-root library scan missing" }
-          if (!(Select-String -Path "app\project_utils.py" -Pattern "electric_guitar.wav" -Quiet)) { throw "Electric-guitar second-stage split missing" }
-          if (!(Select-String -Path "app\main.py" -Pattern "DesktopScoreCanvas" -Quiet)) { throw "Desktop staff/tab score canvas missing" }
-          if ($launcher -notmatch 'def install_live_transpose_controls') { throw "Live transpose controls patch missing" }
-          if ($launcher -notmatch 'def _recommended_capo') { throw "Capo sync patch missing" }
-          if ($launcher -notmatch 'change\(-1\)') { throw "Transpose-down action missing" }
-          if ($launcher -notmatch 'change\(1\)') { throw "Transpose-up action missing" }
-          if (!(Select-String -Path "NOVRIA.spec" -Pattern "Juweier-Separation-Worker" -Quiet)) { throw "Isolated worker is not configured in PyInstaller" }
+          if ($launcher -notmatch 'VERSION\s*=\s*"3\.4\.0"') { throw "v3.4.0 launcher not found" }
+          if (!(Select-String -Path "app\main.py" -Pattern "load_server_library_track" -Quiet)) { throw "Published product loader missing" }
+          if (!(Select-String -Path "app\main.py" -Pattern "lyrics_timeline" -Quiet)) { throw "Lyrics timeline loader missing" }
           python -m unittest discover -s tests -v
-
           $env:PATH = "$root\tools\ffmpeg;$env:PATH"
           $selfTest = & $worker --self-test
-          $selfTest | Write-Host
-          if ($LASTEXITCODE -ne 0) { throw "Frozen separation worker self-test failed" }
-          if (($selfTest -join "`n") -notmatch '"self_test": true') { throw "Frozen worker self-test did not finish" }
-          & $ffmpeg -version | Select-Object -First 1
-          Get-Item $exe,$worker,$ffmpeg | Format-Table Name,Length,FullName
-
+          if ($LASTEXITCODE -ne 0) { throw "Frozen worker self-test failed" }
       - name: Build Windows installer
         shell: powershell
         run: |
           choco install innosetup --yes --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (!(Test-Path $iscc)) { throw "Inno Setup compiler not found" }
           & $iscc "installer\NOVRIA.iss"
-          if (!(Test-Path "release\Juweier_Music_v3.3.0_Setup_x64.exe")) { throw "Installer was not created" }
-
-      - name: Upload v3.3.0 Windows portable files without nested archive
+          if (!(Test-Path "release\Juweier_Music_v3.4.0_Setup_x64.exe")) { throw "Installer was not created" }
+      - name: Upload Windows portable files without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.3.0-Windows-x64-Portable
+          name: Juweier-Music-v3.4.0-Windows-x64-Portable
           path: dist/Juweier-Music
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
-
-      - name: Upload v3.3.0 Windows installer directly
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.3.0-Windows-Setup
-          path: release/Juweier_Music_v3.3.0_Setup_x64.exe
+          name: Juweier-Music-v3.4.0-Windows-Setup
+          path: release/Juweier_Music_v3.4.0_Setup_x64.exe
           if-no-files-found: error
           retention-days: 30

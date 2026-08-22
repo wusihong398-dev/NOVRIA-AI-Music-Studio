@@ -101,7 +101,7 @@ def generate_lyrics(theme: str, language: str = "普通话", style: str = "流�
 def lyrics_to_lrc(text: str, bpm: float = 72.0) -> str:
     seconds = 0.0
     step = max(2.0, 240.0 / max(40.0, min(float(bpm), 240.0)))
-    rows = ["[ar:橘味儿音乐 AI 初稿]", "[by:Juweier Music v3.3.0]"]
+    rows = ["[ar:橘味儿音乐 AI 初稿]", "[by:Juweier Music v3.4.0]"]
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("["):

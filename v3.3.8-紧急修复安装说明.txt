@@ -1,0 +1,57 @@
+橘味儿音乐服务器 v3.3.8 紧急修复
+
+修复原因
+========
+v3.3.7 的 MVSep Mega 53-Stems 会把整首歌的 53 轨拼接缓存放在 RTX 3060
+显存中，显存接近 12 GB 后 CUDA 失败，并自动切换 CPU，所以一首歌可能运行
+9 小时仍不结束。
+
+v3.3.8 改为：
+1. RTX 3060 只保存模型和当前分块。
+2. 53 轨整曲拼接缓存放到电脑 32 GB 内存。
+3. 禁止失败后自动切换 CPU。
+4. 单曲最长 120 分钟，超时自动失败，不再无限等待。
+5. 首次只试跑 1 首，成功后再放开其余歌曲。
+
+安装步骤
+========
+1. 在旧的 v3.3.7 服务器窗口按 Ctrl+C，等到出现 Application shutdown complete，
+   然后关闭窗口。不要在旧任务继续运行时覆盖文件。
+
+2. 把本压缩包里面的所有文件复制到：
+   E:\Dongba-Music-Server
+   出现同名文件时选择“替换目标中的文件”。不会覆盖 D:\MP3 原歌、G 盘成品、
+   CUDA PyTorch 或 1.37 GB 模型。
+
+3. 双击：Install-BS-RoFormer-Low-VRAM-v338.cmd
+   看到“v3.3.8 low-VRAM runner is ready”后按回车关闭。
+
+4. 双击：Start-Juweier-Server-v338.cmd
+   它会清理旧版遗留的本项目 Python 推理进程，再启动新版服务。
+   保持新弹出的服务器窗口打开。
+
+5. 新开 CMD，检查：
+   curl.exe http://127.0.0.1:8001/api/v1/library/mobile/health
+
+   必须看到：
+   "version":"3.3.8"
+   "gpu":"NVIDIA GeForce RTX 3060"
+   "processing_ready":true
+   "low_vram_cuda":true
+   "cpu_fallback":false
+
+6. 双击：Start-1-Song-Pilot-v338.cmd
+   这次只处理 1 首。不要点旧版的三首试跑脚本。
+
+查看状态
+========
+curl.exe http://127.0.0.1:8001/api/v1/library/batch/status
+
+如果 running=true，再用返回的 current_job_id 检查：
+curl.exe http://127.0.0.1:8001/api/v1/library/jobs/这里换成current_job_id
+
+注意
+====
+- v3.3.8 首次试跑期间，服务器窗口必须保持打开。
+- 若 CUDA 出错，任务会直接失败并显示真实错误，不会再悄悄切到 CPU。
+- 单首测试成功前，不要启动批量处理。

@@ -1,0 +1,31 @@
+橘味儿音乐 v3.3.5 Mega 53 官方模型路径热修复
+
+一、覆盖服务器程序
+1. 先按 Ctrl+C 停止旧服务器窗口。
+2. 把本升级包内所有文件复制到 E:\Dongba-Music-Server，选择覆盖。
+
+二、安装并校验模型
+1. 双击 E:\Dongba-Music-Server\Install-MVSep-Mega53-v335.cmd。
+2. 安装器会自动尝试断点续传官方模型（约 1.37 GB）。
+3. 如果自动下载失败，请用浏览器分别下载以下两个文件到 D:\anzhuang：
+
+mvsep_mega_model_bs_roformer_53_stems_v1.ckpt
+https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.21/mvsep_mega_model_bs_roformer_53_stems_v1.ckpt
+
+mvsep_mega_model_bs_roformer_53_stems.yaml
+https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.21/mvsep_mega_model_bs_roformer_53_stems.yaml
+
+4. 下载完后重新双击安装器。只有文件大小和 SHA-256 全部正确才会显示 READY。
+
+三、三首试跑
+1. 右键 Start-Juweier-Server-v335-Demucs-Mega53-Pilot.ps1，选择“使用 PowerShell 运行”。
+2. 保持服务器窗口打开。
+3. 新开 CMD，检查：
+   curl.exe http://127.0.0.1:8001/api/v1/library/mobile/health
+4. 必须看到 version=3.3.5、processing_ready=true。
+5. 双击 Start-3-Song-Pilot-v335.cmd。
+6. 查询状态：
+   curl.exe http://127.0.0.1:8001/api/v1/library/batch/status
+
+说明：RTX 3060 12GB 低于该模型上游建议的 16GB 显存。程序先用 CUDA；
+若显存不足会退回 CPU。三首没有全部成功前，不启动一万首批处理。

@@ -1,7 +1,7 @@
-"""Mobile API companion for 橘味儿音乐 v3.3.0.
+"""Mobile API companion for 橘味儿音乐 v3.4.0 published-product catalog.
 
-Run this on the Windows/GPU computer. Android and iOS clients upload source
-audio here; Demucs and the analysis pipeline remain on the capable computer.
+Run this on the Windows/GPU computer. The server prepares and publishes songs;
+Android, iOS and Windows clients consume only validated finished products.
 """
 
 from __future__ import annotations
@@ -54,10 +54,16 @@ from app.library_catalog import (
     download_public_audio,
 )
 from app.library_taxonomy import artist_initial_for, taxonomy_payload
+from app.server_batch_rules import finished_song_dir
+from app.chinese_normalization import (
+    simplified_relative_path,
+    simplify_published_tree,
+    to_simplified,
+)
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
@@ -94,7 +100,7 @@ _configured_roots = [
 SERVER_LIBRARY_ROOTS = list(dict.fromkeys(
     _configured_roots or (SERVER_LIBRARY_ROOT, SERVER_LIBRARY_FLAC_ROOT)
 ))
-AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "1").strip().lower() not in {
+AUTO_SCAN_LIBRARY = os.environ.get("JUWEIER_AUTO_SCAN_LIBRARY", "0").strip().lower() not in {
     "0", "false", "no", "off",
 }
 CATALOG_WATCH_INTERVAL = max(60, int(os.environ.get("JUWEIER_CATALOG_WATCH_INTERVAL", "900")))
@@ -117,7 +123,7 @@ batch_thread: threading.Thread | None = None
 batch_state = {
     "running": False, "paused": False, "current_track_id": 0,
     "current_job_id": "", "submitted": 0, "completed": 0, "failed": 0,
-    "updated_at": 0.0,
+    "limit": 0, "updated_at": 0.0,
 }
 
 
@@ -552,11 +558,19 @@ def _library_batch_loop() -> None:
         with batch_lock:
             if not batch_state["running"] or batch_state["paused"]:
                 break
+            limit = int(batch_state.get("limit") or 0)
+            if limit > 0 and int(batch_state["submitted"]) >= limit:
+                batch_state.update(
+                    running=False, current_track_id=0, current_job_id="",
+                    updated_at=time.time(),
+                )
+                _save_batch_state()
+                break
         connection = connect_catalog(LIBRARY_DB)
         try:
             row = connection.execute(
                 "SELECT id,source_path,working_path FROM tracks "
-                "WHERE publish_status='已发布' AND processing_status='待处理' "
+                "WHERE publish_status='待发布' AND processing_status='待处理' "
                 "ORDER BY is_featured DESC,sort_order,id LIMIT 1"
             ).fetchone()
         finally:
@@ -635,20 +649,134 @@ def _runtime_capabilities() -> dict:
         "torch": importlib.util.find_spec("torch") is not None,
         "demucs": importlib.util.find_spec("demucs") is not None,
         "audio_separator": importlib.util.find_spec("audio_separator") is not None,
+        "bs_roformer": importlib.util.find_spec("bs_roformer") is not None,
         "librosa": importlib.util.find_spec("librosa") is not None,
         "mido": importlib.util.find_spec("mido") is not None,
+        "opencc": importlib.util.find_spec("opencc") is not None,
     }
     ffmpeg = shutil.which("ffmpeg") is not None
-    required_modules = ("torch", "demucs", "librosa", "mido")
+    required_modules = ("torch", "demucs", "librosa", "mido", "opencc")
     missing = [name for name in required_modules if not modules[name]]
     if not ffmpeg:
         missing.append("ffmpeg")
     lyrics_asr = importlib.util.find_spec("faster_whisper") is not None
+    electric_model = os.environ.get("JUWEIER_ELECTRIC_GUITAR_MODEL", "").strip()
+    electric_engine = os.environ.get("JUWEIER_ELECTRIC_GUITAR_ENGINE", "audio-separator").strip().casefold()
+    low_vram_verified = False
     issues = []
     if missing:
         issues.append("AI 处理环境缺少：" + "、".join(missing))
-    if not modules["audio_separator"]:
-        issues.append("UVR 包装器不可用，将自动使用 Demucs htdemucs_6s 离线六轨引擎")
+    if electric_engine == "mvsep-mega53":
+        if not modules["bs_roformer"]:
+            missing.append("bs_roformer")
+            issues.append("MVSep Mega 53-Stems 运行器未安装")
+        model_dir = Path(os.environ.get(
+            "JUWEIER_BS_ROFORMER_MODEL_DIR", ROOT / "models" / "bs-roformer",
+        ))
+        checkpoint = Path(os.environ.get(
+            "JUWEIER_BS_ROFORMER_MODEL_PATH",
+            model_dir / "mvsep_mega_model_bs_roformer_53_stems_v1.ckpt",
+        ))
+        config = Path(os.environ.get(
+            "JUWEIER_BS_ROFORMER_CONFIG_PATH",
+            model_dir / "mvsep_mega_model_bs_roformer_53_stems.yaml",
+        ))
+        marker = model_dir / "mvsep-mega53-ready.json"
+        runner_marker = model_dir / "bs-roformer-mega53-runner-ready.json"
+        tail_marker = model_dir / "bs-roformer-tail-chunk-v337-ready.json"
+        low_vram_marker = model_dir / "bs-roformer-low-vram-v338-ready.json"
+        if not checkpoint.is_file() or checkpoint.stat().st_size != 1_368_919_887:
+            missing.append("mvsep-mega53-checkpoint")
+            issues.append("MVSep Mega 53-Stems 官方权重缺失或不完整")
+        if not config.is_file() or config.stat().st_size != 4_184:
+            missing.append("mvsep-mega53-config")
+            issues.append("MVSep Mega 53-Stems 官方配置缺失或不完整")
+        marker_verified = False
+        if marker.is_file():
+            try:
+                marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+                marker_verified = (
+                    marker_payload.get("verified") is True
+                    and marker_payload.get("model") == electric_model
+                    and marker_payload.get("checkpoint", {}).get("sha256")
+                    == "c62820893bbf86d4e734f966bd142d9157cfc8bb8e79e9d8f9ea553f3ff3519f"
+                    and marker_payload.get("config", {}).get("sha256")
+                    == "7e198062a251587088adb91215a4f44ab59e67bd62fcc805cf54d6e7dfc51103"
+                )
+            except (OSError, json.JSONDecodeError):
+                marker_verified = False
+        if not marker_verified:
+            missing.append("mvsep-mega53-verification")
+            issues.append("MVSep Mega 53-Stems 尚未通过 SHA-256 校验，旧就绪标记已拒绝")
+        runner_verified = False
+        if runner_marker.is_file():
+            try:
+                runner_payload = json.loads(runner_marker.read_text(encoding="utf-8"))
+                runner_verified = (
+                    runner_payload.get("verified") is True
+                    and runner_payload.get("model") == electric_model
+                    and runner_payload.get("pinned_source_commit")
+                    == "b0f1386fcced25f559f3e61c9f08a73cd9bddf80"
+                    and runner_payload.get("registry_category") == "mega-stem"
+                    and runner_payload.get("mlp_expansion_factor_probe") == [8, 4]
+                    and set(runner_payload.get("outputs", []))
+                    == {"acoustic-guitar", "electric-guitar"}
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                runner_verified = False
+        if not runner_verified:
+            missing.append("bs-roformer-mega53-runner")
+            issues.append(
+                "BS-RoFormer 运行器过旧或未通过 Mega53 架构探针；"
+                "请运行 Install-BS-RoFormer-Mega53-v336.cmd"
+            )
+        tail_verified = False
+        if tail_marker.is_file():
+            try:
+                tail_payload = json.loads(tail_marker.read_text(encoding="utf-8"))
+                tail_verified = (
+                    tail_payload.get("verified") is True
+                    and tail_payload.get("patch_version") == "juweier-tail-chunk-v337"
+                    and tail_payload.get("observed_input_samples") == 882000
+                    and tail_payload.get("observed_output_samples") == 881664
+                    and tail_payload.get("strategy")
+                    == "crop-overlap-add-to-usable-length"
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                tail_verified = False
+        if not tail_verified:
+            missing.append("bs-roformer-tail-chunk-v337")
+            issues.append(
+                "BS-RoFormer Mega53 尾块长度修复未安装；"
+                "请运行 Install-BS-RoFormer-Tail-Fix-v337.cmd"
+            )
+        low_vram_verified = False
+        if low_vram_marker.is_file():
+            try:
+                low_vram_payload = json.loads(low_vram_marker.read_text(encoding="utf-8"))
+                low_vram_verified = (
+                    low_vram_payload.get("verified") is True
+                    and low_vram_payload.get("patch_version")
+                    == "juweier-low-vram-v338"
+                    and low_vram_payload.get("gpu_resident")
+                    == "model-and-active-chunk-only"
+                    and low_vram_payload.get("accumulator_device") == "cpu"
+                    and low_vram_payload.get("cpu_fallback") is False
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                low_vram_verified = False
+        if not low_vram_verified:
+            missing.append("bs-roformer-low-vram-v338")
+            issues.append(
+                "RTX 3060 低显存 CUDA 修复未安装；"
+                "请运行 Install-BS-RoFormer-Low-VRAM-v338.cmd"
+            )
+    elif not modules["audio_separator"]:
+        missing.append("audio_separator")
+        issues.append("UVR 包装器不可用，无法运行真实电吉他二阶段模型")
+    if not electric_model:
+        missing.append("electric-guitar-uvr-model")
+        issues.append("尚未配置真实电吉他 UVR 二阶段模型")
     if not lyrics_asr:
         issues.append("AI 歌词转写模型未安装：faster-whisper")
     return {
@@ -656,6 +784,10 @@ def _runtime_capabilities() -> dict:
         "lyrics_asr_available": lyrics_asr,
         "modules": modules,
         "ffmpeg": ffmpeg,
+        "electric_guitar_model": electric_model,
+        "electric_guitar_engine": electric_engine,
+        "low_vram_cuda": low_vram_verified,
+        "cpu_fallback": False if electric_engine == "mvsep-mega53" else None,
         "issues": issues,
     }
 
@@ -678,6 +810,8 @@ def _friendly_job_error(exc: Exception) -> str:
         return "AI 处理环境未安装 PyTorch（torch），请安装 requirements-server.txt 后重启服务器。"
     if "no module named 'demucs'" in lowered:
         return "AI 六轨分离模型未安装（demucs），请安装 requirements-server.txt 后重启服务器。"
+    if "电吉他 uvr" in lowered or "electric guitar" in lowered or "electric-guitar" in lowered:
+        return text
     if "audio_separator" in lowered or "audio-separator" in lowered:
         return "UVR 分轨运行环境未安装（audio-separator），请重新运行 Install-AI-Engine.bat 后重启服务器。"
     if "ffmpeg" in lowered and ("not found" in lowered or "找不到" in text):
@@ -711,7 +845,7 @@ def health(_: None = Depends(authorize)) -> dict:
 def app_config(_: None = Depends(authorize)) -> dict:
     capabilities = _runtime_capabilities()
     return {
-        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.3.0",
+        "app": APP_NAME, "version": VERSION, "minimum_mobile_version": "3.4.0",
         "service": "online",
         "processing_ready": capabilities["processing_ready"],
         "lyrics_asr_available": capabilities["lyrics_asr_available"],
@@ -1053,11 +1187,22 @@ def library(
         publish_status="已发布", offset=offset,
         since_revision=since if incremental else 0,
     )
+    # Published products live under JUWEIER_PROCESSED_DIR/01_Ready, while the
+    # immutable originals may live on a different disk.  A consumer catalog
+    # row is valid when either its published audio/artifacts or its original
+    # source is inside one of these explicitly configured roots.
     allowed_roots = [root.resolve() for root in SERVER_LIBRARY_ROOTS]
-    allowed_roots.append(LIBRARY_PATHS["temp"].resolve())
+    allowed_roots.extend((
+        LIBRARY_PATHS["temp"].resolve(),
+        LIBRARY_PATHS["processed"].resolve(),
+    ))
     filtered = []
     for song in songs:
-        raw_path = str(song.get("source_path") or song.get("working_path") or "")
+        stored_artifacts = dict(song.get("artifacts") or {})
+        raw_path = str(
+            song.get("final_audio_path") or stored_artifacts.get("original_audio")
+            or song.get("working_path") or song.get("source_path") or ""
+        )
         try:
             candidate = Path(raw_path).resolve()
             if not any(candidate == root or root in candidate.parents for root in allowed_roots):
@@ -1079,17 +1224,21 @@ def library(
         song.pop("source_path", None)
         song.pop("working_path", None)
         song["audio_url"] = str(request.url_for("library_mobile_audio", track_id=track_id))
-        audio_path = Path(source_path)
+        stored_artifacts = dict(song.get("artifacts") or {})
+        audio_path = Path(str(
+            song.get("final_audio_path") or stored_artifacts.get("original_audio")
+            or source_path
+        ))
         lyric_path = next(
             (candidate for candidate in (audio_path.with_suffix(".lrc"), audio_path.with_suffix(".LRC")) if candidate.is_file()),
             None,
         )
-        if lyric_path is not None:
+        timeline_path = Path(str(stored_artifacts.get("lyrics_timeline") or ""))
+        if lyric_path is not None or timeline_path.is_file():
             song["lyrics_url"] = str(request.url_for("library_mobile_lyrics", track_id=track_id))
             song["lyrics_status"] = "完成"
         if song.get("cover_path"):
             song["cover_url"] = str(request.url_for("library_mobile_cover", track_id=track_id))
-        stored_artifacts = dict(song.get("artifacts") or {})
         song["artifacts"] = {
             key: str(request.url_for(
                 "library_catalog_artifact", track_id=track_id, artifact_key=key,
@@ -1164,7 +1313,15 @@ def import_library_url(payload: LinkImportPayload, _: None = Depends(authorize))
 @app.get("/api/v1/library/{track_id}/audio", name="library_audio")
 def library_audio(track_id: int, _: None = Depends(authorize)):
     song = catalog_track(LIBRARY_DB, track_id)
-    path = Path(str(song.get("working_path") or song.get("source_path"))) if song else None
+    artifacts = {}
+    try:
+        artifacts = json.loads(str(song.get("artifacts_json") or "{}")) if song else {}
+    except Exception:
+        artifacts = {}
+    path = Path(str(
+        (song or {}).get("final_audio_path") or artifacts.get("original_audio")
+        or (song or {}).get("working_path") or (song or {}).get("source_path") or ""
+    )) if song else None
     if not path or not path.is_file():
         raise HTTPException(status_code=404, detail="歌曲文件不存在")
     return FileResponse(path, filename=path.name)
@@ -1185,6 +1342,13 @@ def library_cover(track_id: int, _: None = Depends(authorize)):
 @app.get("/api/v1/library/{track_id}/lyrics", name="library_legacy_lyrics")
 def library_lyrics(track_id: int, _: None = Depends(authorize)):
     song = catalog_track(LIBRARY_DB, track_id)
+    try:
+        artifacts = json.loads(str(song.get("artifacts_json") or "{}")) if song else {}
+    except Exception:
+        artifacts = {}
+    timeline_path = Path(str(artifacts.get("lyrics_timeline") or ""))
+    if timeline_path.is_file():
+        return FileResponse(timeline_path, filename="lyrics_timeline.json", media_type="application/json")
     audio_path = Path(str(song.get("working_path") or song.get("source_path"))) if song else None
     if not audio_path:
         raise HTTPException(status_code=404, detail="歌词不存在")
@@ -1251,7 +1415,11 @@ def library_batch_status(_: None = Depends(authorize)) -> dict:
 
 @app.post("/api/v1/library/mobile/batch/start", status_code=202)
 @app.post("/api/v1/library/batch/start", status_code=202)
-def library_batch_start(retry_failed: bool = False, _: None = Depends(authorize)) -> dict:
+def library_batch_start(
+    retry_failed: bool = False,
+    limit: int = 0,
+    _: None = Depends(authorize),
+) -> dict:
     global batch_thread
     if retry_failed:
         connection = connect_catalog(LIBRARY_DB)
@@ -1267,7 +1435,12 @@ def library_batch_start(retry_failed: bool = False, _: None = Depends(authorize)
         finally:
             connection.close()
     with batch_lock:
-        batch_state.update(running=True, paused=False, updated_at=time.time())
+        safe_limit = max(0, min(int(limit), 100_000))
+        batch_state.update(
+            running=True, paused=False, current_track_id=0, current_job_id="",
+            submitted=0, completed=0, failed=0, limit=safe_limit,
+            updated_at=time.time(),
+        )
         if batch_thread is None or not batch_thread.is_alive():
             batch_thread = threading.Thread(
                 target=_library_batch_loop, name="library-batch", daemon=True,
@@ -1286,13 +1459,75 @@ def library_batch_pause(_: None = Depends(authorize)) -> dict:
         return {**batch_state, "counts": _batch_counts(), "message": "当前歌曲完成后暂停"}
 
 
+def _publish_validated_result(
+    working_root: Path, song: dict, artifacts: dict[str, str],
+) -> tuple[Path, dict[str, str]]:
+    """Copy one complete song to G: and expose it with one atomic rename."""
+
+    processed_root = Path(LIBRARY_PATHS["processed"])
+    processed_root.mkdir(parents=True, exist_ok=True)
+    total_bytes = sum(
+        path.stat().st_size for path in working_root.rglob("*") if path.is_file()
+    )
+    disk = shutil.disk_usage(processed_root)
+    reserve_ratio = float(os.environ.get("JUWEIER_MIN_FREE_RATIO", "0.15"))
+    if disk.total and (disk.free - total_bytes) / disk.total < reserve_ratio:
+        raise RuntimeError(
+            f"G 盘剩余空间不足，发布后将低于 {reserve_ratio:.0%} 安全线，批处理已暂停"
+        )
+
+    artist = to_simplified(catalog_artist_name(song))
+    title = to_simplified(
+        str(song.get("title") or Path(str(song.get("source_path") or "歌曲")).stem)
+    )
+    initial = str(song.get("artist_initial") or _artist_initial(artist, str(song.get("source_path") or "")))
+    target = finished_song_dir(processed_root, initial, artist, title)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}.publishing")
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.copytree(working_root, staging)
+    simplify_published_tree(staging)
+
+    remapped: dict[str, str] = {}
+    working_text = str(working_root.resolve())
+    for key, value in artifacts.items():
+        source = Path(str(value))
+        try:
+            relative = simplified_relative_path(
+                source.resolve().relative_to(working_root.resolve())
+            )
+            remapped[key] = str(target / relative)
+        except (ValueError, OSError):
+            remapped[key] = str(value)
+    atomic_write_json(staging / "published_manifest.json", {
+        "version": VERSION,
+        "artist": artist,
+        "title": title,
+        "artist_initial": initial,
+        "source_path": str(song.get("source_path") or ""),
+        "published_at": time.time(),
+        "artifacts": remapped,
+        "working_root": working_text,
+    })
+
+    if target.exists():
+        backup = (
+            processed_root / "04_Backup" / initial / safe_file_stem(artist, "未知歌手")
+            / f"{safe_file_stem(title, '未知歌曲')}_{int(time.time())}"
+        )
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(target), str(backup))
+    os.replace(staging, target)
+    shutil.rmtree(working_root, ignore_errors=True)
+    return target, remapped
+
+
 def _run_job(job_id: str) -> None:
     job = jobs[job_id]
     input_path = Path(job["input_path"])
-    output_root = (
-        LIBRARY_PATHS["processed"] / f"{safe_file_stem(input_path.stem)}_{job_id[:8]}"
-        if job.get("library_track_id") else OUTPUTS / job_id
-    )
+    # All heavy intermediate writes stay on the internal server disk.  Only a
+    # fully validated result is copied into G:\...\01_Ready atomically.
+    output_root = OUTPUTS / job_id
     output_root.mkdir(parents=True, exist_ok=True)
     try:
         _update(job_id, status="processing", stage="检查 AI 处理环境", progress=5)
@@ -1348,6 +1583,11 @@ def _run_job(job_id: str) -> None:
             raise RuntimeError(last_error or f"分轨 Worker 退出码 {code}")
 
         artifacts = {f"stem_{p.stem}": str(p) for p in Path(stem_dir).glob("*.wav")}
+        original_folder = output_root / "audio"
+        original_folder.mkdir(parents=True, exist_ok=True)
+        original_copy = original_folder / f"original{input_path.suffix.casefold()}"
+        shutil.copy2(input_path, original_copy)
+        artifacts["original_audio"] = str(original_copy)
         guitar_report = Path(stem_dir) / "guitar_second_stage.json"
         if guitar_report.is_file():
             artifacts["electric_guitar_report"] = str(guitar_report)
@@ -1362,20 +1602,39 @@ def _run_job(job_id: str) -> None:
         artifacts["arrangement_midi"] = str(midi)
         readiness = _validate_publish_artifacts(artifacts)
         artifacts["readiness_report"] = str(readiness["report_path"])
-        _update(job_id, status="completed", stage="全部完成", progress=100, artifacts=artifacts)
         if job.get("library_track_id"):
             connection = connect_catalog(LIBRARY_DB)
             try:
+                song_row = connection.execute(
+                    "SELECT * FROM tracks WHERE id=?", (int(job["library_track_id"]),),
+                ).fetchone()
+                if not song_row:
+                    raise RuntimeError("待发布歌曲已从服务器索引删除")
+                if not readiness["ready"]:
+                    raise RuntimeError(
+                        "成果校验未通过，禁止进入 App 成品曲库：" + "、".join(readiness["issues"])
+                    )
+                published_root, artifacts = _publish_validated_result(
+                    output_root, dict(song_row), artifacts,
+                )
+                published_artist = to_simplified(catalog_artist_name(dict(song_row)))
+                published_title = to_simplified(
+                    str(song_row["title"] or Path(str(song_row["source_path"] or "歌曲")).stem)
+                )
+                published_initial = _artist_initial(
+                    published_artist, str(song_row["source_path"] or "")
+                )
                 revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
                 connection.execute(
                     """UPDATE tracks SET bpm=?, musical_key=?, analysis_status='完成',
                        stems_status='完成', chords_status='完成', score_status='完成',
-                       arrangement_status='完成',processing_status=?,publish_status='已发布',
-                       lyrics_status=?,
+                       arrangement_status='完成',processing_status='已完成',publish_status='已发布',
+                       lyrics_status=?,final_audio_path=?,title=?,artist=?,source_group=?,artist_initial=?,
                        artifacts_json=?,catalog_updated_at=?,catalog_revision=? WHERE id=?""",
                     (
-                        analysis.get("bpm"), analysis.get("key"), readiness["processing_status"],
-                        readiness["lyrics_status"],
+                        analysis.get("bpm"), analysis.get("key"), readiness["lyrics_status"],
+                        artifacts["original_audio"], published_title, published_artist,
+                        published_artist, published_initial,
                         json.dumps(artifacts, ensure_ascii=False), time.time(), revision,
                         int(job["library_track_id"]),
                     ),
@@ -1384,6 +1643,7 @@ def _run_job(job_id: str) -> None:
                 connection.commit()
             finally:
                 connection.close()
+        _update(job_id, status="completed", stage="校验通过并已发布到成品曲库", progress=100, artifacts=artifacts)
     except Exception as exc:
         if job.get("library_track_id"):
             _set_track_processing_status(int(job["library_track_id"]), "失败")
@@ -1457,6 +1717,8 @@ def _validate_publish_artifacts(artifacts: dict[str, str]) -> dict:
     }
     atomic_write_json(report_path, report)
     return {
+        "ready": not missing,
+        "issues": list(dict.fromkeys(missing)),
         "processing_status": "已完成" if not missing else "成果待校验",
         "lyrics_status": "完成" if lyric_aligned else "待校对",
         "report_path": report_path,

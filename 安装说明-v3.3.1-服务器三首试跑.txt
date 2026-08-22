@@ -1,0 +1,51 @@
+橘味儿音乐 v3.3.1 Windows 服务器三首试跑版
+================================================
+
+一、目录约定
+
+原版测试歌曲：D:\MP3
+服务器程序：E:\Dongba-Music-Server
+AI 成品：G:\JuweierMusicProcessed\01_Ready
+失败记录：G:\JuweierMusicProcessed\02_Failed
+处理清单：G:\JuweierMusicProcessed\03_Manifests
+旧成品备份：G:\JuweierMusicProcessed\04_Backup
+
+二、覆盖升级
+
+1. 先关闭正在运行的旧服务器命令窗口。
+2. 把本升级包内的文件复制到 E:\Dongba-Music-Server，选择合并文件夹并覆盖同名程序文件。
+3. 不要删除 .venv-mobile-api、database、models、ffmpeg、accounts.sqlite3 和 jobs.json。
+
+三、先生成扫描清单
+
+双击：Prepare-3-Song-Pilot-v331.cmd
+
+程序会递归扫描 D:\MP3 下所有层级。无论歌手下面有专辑、CD 或 DEMO 文件夹，只要是支持的音频就会进入清单；图片会忽略。
+
+扫描结果保存在：E:\Dongba-Music-Server\manifests
+命令窗口会直接列出三首试跑、人工复核和跳过项目。
+
+四、电吉他模型检查
+
+双击：Prepare-Electric-Guitar-Model-v331.cmd
+
+该步骤只列出官方模型目录中带 Guitar 的候选模型，不会擅自把 htdemucs_6s 当作独立电吉他模型。
+只有官方明确标注 Electric Guitar 或 E.Guitar 的模型才能启用。
+
+如果没有合格模型，先把命令窗口的模型列表截图发回，不要开始三首 AI 处理。这样可以避免生成假的电吉他轨。
+
+五、启动服务器与三首任务
+
+确认模型已合格并安装后：
+
+1. 右键 Start-Juweier-Server-v331-Pilot.ps1，选择“使用 PowerShell 运行”。
+2. 等服务器窗口显示 8001 正常监听。
+3. 双击 Start-3-Song-Pilot-v331.cmd。
+
+只有当原音频、真实电吉他轨、其他 Stem、歌词和乐谱都通过完整性检查时，歌曲才会发布到 G 盘成品库。
+
+六、张雨生深层目录示例
+
+D:\MP3\张雨生\2008 如燕盘旋而来的思念 张雨生全创作精选典藏[台湾]\张雨生-如燕盘旋而来的思念(DEMO)3\02 如燕盘旋而来的思念.mp3
+
+该歌曲能够被扫描到。由于上级目录含 DEMO，会显示为“人工复核”，不会直接发布。

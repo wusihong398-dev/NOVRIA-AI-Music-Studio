@@ -15,15 +15,6 @@ from app.project_utils import (
     load_synced_lyrics,
 )
 
-try:
-    import numpy as np
-    import soundfile as sf
-    from app.project_utils import split_guitar_stem
-    HAS_AUDIO_STACK = True
-except ImportError:
-    HAS_AUDIO_STACK = False
-
-
 class ProjectUtilsTests(unittest.TestCase):
     def test_lyrics_expand_per_character_and_align_to_notes(self):
         units = expand_lyric_units([{"start": 0, "end": 2, "text": "你好吗"}])
@@ -79,45 +70,6 @@ class ProjectUtilsTests(unittest.TestCase):
             self.assertEqual(rows[0]["text"], "第一句")
             self.assertEqual(rows[0]["start"], 1.0)
             self.assertEqual(rows[0]["end"], 3.5)
-
-    @unittest.skipUnless(HAS_AUDIO_STACK, "soundfile/librosa audio test dependencies are not installed")
-    def test_guitar_second_stage_creates_distinct_aligned_tracks(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp)
-            sample_rate = 8000
-            t = np.arange(sample_rate, dtype=np.float32) / sample_rate
-            signal = (0.2 * np.sin(2 * np.pi * 220 * t) + 0.08 * np.sin(2 * np.pi * 1800 * t)).astype(np.float32)
-            sf.write(folder / "guitar.wav", np.column_stack((signal, signal)), sample_rate)
-            info = split_guitar_stem(folder)
-            acoustic, _ = sf.read(folder / "guitar.wav", always_2d=True)
-            electric, _ = sf.read(folder / "electric_guitar.wav", always_2d=True)
-            combined, _ = sf.read(folder / "guitar_combined.wav", always_2d=True)
-            self.assertEqual(acoustic.shape, combined.shape)
-            self.assertEqual(electric.shape, combined.shape)
-            self.assertGreater(float(np.max(np.abs(electric))), 0.001)
-            self.assertLess(float(np.max(np.abs((acoustic + electric) - combined))), 0.01)
-            self.assertEqual(info["base_model"], "htdemucs_6s")
-
-    @unittest.skipUnless(HAS_AUDIO_STACK, "soundfile/librosa audio test dependencies are not installed")
-    def test_guitar_retry_replaces_corrupt_combined_wav(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp)
-            sample_rate = 8000
-            signal = np.zeros((sample_rate, 2), dtype=np.float32)
-            signal[:, 0] = 0.1
-            signal[:, 1] = -0.1
-            sf.write(folder / "guitar.wav", signal, sample_rate)
-            (folder / "guitar_combined.wav").write_bytes(b"partial failed output")
-
-            split_guitar_stem(folder)
-
-            repaired, repaired_rate = sf.read(
-                folder / "guitar_combined.wav", always_2d=True,
-            )
-            self.assertEqual(repaired_rate, sample_rate)
-            self.assertEqual(repaired.shape, signal.shape)
-            self.assertFalse((folder / "guitar_combined.part.wav").exists())
-
 
 if __name__ == '__main__':
     unittest.main()

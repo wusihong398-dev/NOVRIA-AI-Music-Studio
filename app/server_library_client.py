@@ -34,7 +34,7 @@ class ServerLibraryClient:
             raise ServerLibraryError("AI 服务器地址必须以 http:// 或 https:// 开头")
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        headers = {"Accept": "application/json", "User-Agent": "Juweier-Music/3.3.0"}
+        headers = {"Accept": "application/json", "User-Agent": "Juweier-Music/3.4.0"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         body = None
@@ -131,7 +131,7 @@ class ServerLibraryClient:
 
     def download(self, url: str, destination: Path) -> Path:
         absolute = urllib.parse.urljoin(self.base_url + "/", url)
-        headers = {"Accept": "*/*", "User-Agent": "Juweier-Music/3.3.0"}
+        headers = {"Accept": "*/*", "User-Agent": "Juweier-Music/3.4.0"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         destination.parent.mkdir(parents=True, exist_ok=True)

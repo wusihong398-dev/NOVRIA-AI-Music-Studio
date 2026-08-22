@@ -1,0 +1,41 @@
+橘味儿音乐 v3.3.6 Mega53 运行器热修复
+
+本次不重新下载 1.37GB 模型。现有 ckpt、yaml 和 CUDA PyTorch 全部保留。
+
+一、安装兼容运行器
+
+1. 关闭旧的 v3.3.5 服务器窗口。
+2. 把本升级包内容覆盖到 E:\Dongba-Music-Server。
+3. 双击 E:\Dongba-Music-Server\Install-BS-RoFormer-Mega53-v336.cmd。
+4. 安装器只下载一个较小的官方源码 ZIP，并固定到提交：
+   b0f1386fcced25f559f3e61c9f08a73cd9bddf80
+5. 窗口最后必须显示：
+   - mlp_expansion_factor_probe: [8, 4]
+   - CUDA available / NVIDIA GeForce RTX 3060
+
+如果 GitHub 自动下载失败，请用浏览器下载：
+https://github.com/openmirlab/bs-roformer-infer/archive/b0f1386fcced25f559f3e61c9f08a73cd9bddf80.zip
+
+保存成：
+D:\anzhuang\bs-roformer-infer-b0f1386fcced25f559f3e61c9f08a73cd9bddf80.zip
+
+然后再次双击 Install-BS-RoFormer-Mega53-v336.cmd。
+
+二、启动服务器
+
+1. 右键 Start-Juweier-Server-v336-Demucs-Mega53-Pilot.ps1。
+2. 选择“使用 PowerShell 运行”。
+3. 保持服务器窗口打开。
+4. 在另一个 CMD 或 PowerShell 运行：
+   curl.exe http://127.0.0.1:8001/api/v1/library/mobile/health
+5. 必须看到 version=3.3.6、processing_ready=true、GPU 为 RTX 3060。
+
+三、重新跑三首歌
+
+双击 Start-3-Song-Pilot-v336.cmd。
+
+检查状态：
+curl.exe http://127.0.0.1:8001/api/v1/library/batch/status
+
+不要启动全部歌曲。必须等三首歌全部完成并检查 G:\JuweierMusicProcessed\01_Ready
+里的 electric_guitar.wav、guitar.wav、乐谱和歌词同步结果。

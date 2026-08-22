@@ -1,18 +1,16 @@
 name: Build Juweier Music iOS TestFlight Package
-run-name: Juweier Music v3.3.0 iOS TestFlight · ${{ github.ref_name }}
+run-name: Juweier Music v3.4.0 iOS TestFlight · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.3.0"]
+    branches: ["main", "agent/juweier-v3.4.0"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-ios-testflight-package.yml"
 
 permissions:
   contents: read
-
-# v3.3.0 final server-published catalog TestFlight build.
 
 jobs:
   ios-project:
@@ -45,13 +43,9 @@ jobs:
           PY
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
-          /usr/libexec/PlistBuddy -c "Add :NSAppleMusicUsageDescription string 需要选择音乐文件进行AI分轨和演出谱面生成" ios/Runner/Info.plist || true
-          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 后续用于录音和演唱分析" ios/Runner/Info.plist || true
-          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接橘味儿音乐成品服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
-          # Keep analyzer diagnostics visible in the build log, but do not block
-          # the unsigned TestFlight Xcode project artifact on warnings/infos.
           flutter analyze lib --no-fatal-infos --no-fatal-warnings
       - name: Add TestFlight upload instructions
         shell: bash
@@ -59,9 +53,8 @@ jobs:
           cat > mobile_ios/README_TESTFLIGHT_MAC.md <<'EOF'
           # 橘味儿音乐 iOS TestFlight 上传说明
 
-          这个包是未签名 iOS Flutter/Xcode 工程。请在你的 Mac 上完成签名、归档并上传 TestFlight。
+          这是未签名的 v3.4.0 Flutter/Xcode 工程。请在 Mac 上执行：
 
-          ## 1. 解压并安装依赖
           ```bash
           cd mobile_ios
           flutter pub get
@@ -70,26 +63,14 @@ jobs:
           open Runner.xcworkspace
           ```
 
-          ## 2. Xcode 设置
-          - 选择 Runner 项目
-          - Signing & Capabilities
-          - 勾选 Automatically manage signing
-          - Team 选择你的 Apple Developer 团队
-          - Bundle Identifier：`com.db0888.juweierMusic`
-          - Version 当前来自 pubspec：3.3.0
-          - Build：327，上传新构建时需继续递增
-
-          ## 3. 归档上传
-          - 顶部设备选择：Any iOS Device 或 Generic iOS Device
-          - 菜单 Product → Archive
-          - Archive 完成后点 Distribute App
-          - 选择 App Store Connect
-          - 上传完成后到 App Store Connect → TestFlight 等待处理
+          在 Xcode 的 Signing & Capabilities 中选择 Apple Developer 团队，
+          Bundle Identifier 使用 `com.db0888.juweierMusic`，然后执行
+          Product → Archive → Distribute App → App Store Connect。
           EOF
-      - name: Upload iOS TestFlight project without nested archive
+      - name: Upload TestFlight Xcode project without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.3.0-iOS-TestFlight-Xcode-Project
+          name: Juweier-Music-v3.4.0-iOS-TestFlight-Xcode-Project
           path: mobile_ios
           if-no-files-found: error
           retention-days: 30

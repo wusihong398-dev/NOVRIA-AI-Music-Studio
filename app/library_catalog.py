@@ -18,6 +18,10 @@ from app.library_taxonomy import (
     classify_path,
     decode_tags,
 )
+from app.server_batch_rules import (
+    build_processing_plan,
+    normalize_artist_name,
+)
 
 
 AUDIO_EXTENSIONS = {
@@ -131,8 +135,11 @@ def connect_catalog(db_path: Path) -> sqlite3.Connection:
         "scene": "TEXT DEFAULT ''",
         "region": "TEXT DEFAULT ''",
         "tags": "TEXT DEFAULT '[]'",
-        "publish_status": "TEXT DEFAULT '已发布'",
+        "publish_status": "TEXT DEFAULT '待发布'",
         "processing_status": "TEXT DEFAULT '待处理'",
+        "eligibility_status": "TEXT DEFAULT ''",
+        "skip_reason": "TEXT DEFAULT ''",
+        "canonical_key": "TEXT DEFAULT ''",
         "lyrics_status": "TEXT DEFAULT '未处理'",
         "artifacts_json": "TEXT DEFAULT '{}'",
         "catalog_updated_at": "REAL DEFAULT 0",
@@ -180,7 +187,7 @@ def _clean_folder_artist(value: str) -> str:
     text = repair_text(value, "").strip()
     text = re.sub(r"^\d+[.、_ -]+", "", text)
     text = re.sub(r"[（(](?:MP3|FLAC|WAV|无损)[）)]", "", text, flags=re.I)
-    return text.strip(" ._-—")
+    return normalize_artist_name(text.strip(" ._-—"))
 
 
 def _is_letter_bucket(value: str) -> bool:
@@ -465,6 +472,11 @@ def scan_catalog_roots(
     progress: Callable[[int, int, Path], None] | None = None,
 ) -> dict:
     files, diagnostics = discover_audio_files(tuple(Path(root) for root in roots))
+    decisions: dict[str, object] = {}
+    for scan_root in dict.fromkeys(root for _, root in files):
+        group = [path for path, root in files if root == scan_root]
+        for decision in build_processing_plan(group, scan_root):
+            decisions[os.path.normcase(os.path.abspath(decision.source_path)).casefold()] = decision
     connection = connect_catalog(db_path)
     added = updated = skipped = failed = removed_generated = 0
     revision = max(int(time.time() * 1000), catalog_version(connection) + 1)
@@ -474,11 +486,13 @@ def scan_catalog_roots(
                 progress(index, len(files), path)
             try:
                 stat = path.stat()
+                decision = decisions[os.path.normcase(os.path.abspath(str(path))).casefold()]
                 existing = connection.execute(
-                    "SELECT id,imported_at,source_group,artist,artist_initial,artist_initial_locked,tags,catalog_updated_at "
+                    "SELECT id,imported_at,source_group,artist,artist_initial,artist_initial_locked,tags,catalog_updated_at,"
+                    "eligibility_status,processing_status,publish_status "
                     "FROM tracks WHERE source_path=?", (str(path),)
                 ).fetchone()
-                source_group = infer_artist_from_path(path, scan_root)
+                source_group = decision.artist
                 if (
                     existing
                     and float(existing["imported_at"] or 0) == float(stat.st_mtime)
@@ -486,25 +500,38 @@ def scan_catalog_roots(
                     and str(existing["artist"] or "").strip() not in {"", "未知歌手"}
                     and str(existing["tags"] or "[]") != "[]"
                     and float(existing["catalog_updated_at"] or 0) > 0
+                    and str(existing["eligibility_status"] or "") == decision.action
                 ):
                     skipped += 1
                     continue
                 fingerprint = quick_fingerprint(path)
                 metadata = extract_metadata(path, cover_dir, scan_root)
+                metadata["title"] = decision.title
+                metadata["artist"] = decision.artist
+                metadata["album"] = ""
                 taxonomy = classify_path(path, metadata["title"], metadata["artist"])
                 initial, initial_locked = artist_initial_for(
                     path, metadata["artist"],
                     str(existing["artist_initial"] or "") if existing else "",
                     bool(existing["artist_initial_locked"]) if existing else False,
                 )
+                processing_status = {
+                    "process": "待处理", "review": "待复核", "skip": "已跳过",
+                    "duplicate": "已跳过", "ignore": "已跳过",
+                }.get(decision.action, "待复核")
+                publish_status = "待发布" if decision.action == "process" else "不发布"
+                if existing and str(existing["processing_status"] or "") == "已完成":
+                    processing_status = "已完成"
+                    publish_status = str(existing["publish_status"] or "已发布")
                 connection.execute(
                     """
                     INSERT INTO tracks(
                         fingerprint,source_path,working_path,title,artist,album,year,
                         duration,bitrate,samplerate,channels,format,quality,cover_path,
                         imported_at,category,source_group,artist_initial,artist_initial_locked,
-                        language,genre,scene,tags,catalog_updated_at,catalog_revision
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        language,genre,scene,tags,catalog_updated_at,catalog_revision,
+                        publish_status,processing_status,eligibility_status,skip_reason,canonical_key
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(fingerprint) DO UPDATE SET
                         source_path=excluded.source_path,working_path=excluded.working_path,
                         title=excluded.title,artist=excluded.artist,album=excluded.album,
@@ -518,7 +545,11 @@ def scan_catalog_roots(
                         artist_initial_locked=CASE WHEN tracks.artist_initial_locked=1 THEN 1 ELSE excluded.artist_initial_locked END,
                         language=excluded.language,genre=excluded.genre,scene=excluded.scene,
                         tags=excluded.tags,catalog_updated_at=excluded.catalog_updated_at,
-                        catalog_revision=excluded.catalog_revision
+                        catalog_revision=excluded.catalog_revision,
+                        publish_status=CASE WHEN tracks.processing_status='已完成' THEN tracks.publish_status ELSE excluded.publish_status END,
+                        processing_status=CASE WHEN tracks.processing_status='已完成' THEN tracks.processing_status ELSE excluded.processing_status END,
+                        eligibility_status=excluded.eligibility_status,
+                        skip_reason=excluded.skip_reason,canonical_key=excluded.canonical_key
                     """,
                     (
                         fingerprint, str(path), str(path), metadata["title"], metadata["artist"],
@@ -528,6 +559,8 @@ def scan_catalog_roots(
                         float(stat.st_mtime), taxonomy["category"], source_group,
                         initial, initial_locked, taxonomy["language"], taxonomy["genre"],
                         taxonomy["scene"], taxonomy["tags"], time.time(), revision,
+                        publish_status, processing_status, decision.action,
+                        decision.reason, decision.canonical_key,
                     ),
                 )
                 if existing:
@@ -659,7 +692,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
         source_name = urllib.parse.unquote(Path(parsed.path).name) or "link_audio.mp3"
         target = destination / f"{safe_file_stem(Path(source_name).stem, 'link_audio')}{suffix}"
         part = target.with_suffix(target.suffix + ".part")
-        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.3.0"})
+        request = urllib.request.Request(url, headers={"User-Agent": "Juweier-Music/3.4.0"})
         with urllib.request.urlopen(request, timeout=60) as response, part.open("wb") as stream:
             total, downloaded = int(response.headers.get("Content-Length") or 0), 0
             while True:
@@ -676,7 +709,7 @@ def download_public_audio(url: str, destination: str | Path, ffmpeg_path: str = 
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("当前安装包缺少授权音频直链导入组件，请更新到完整版 v3.3.0") from exc
+        raise RuntimeError("当前安装包缺少授权音频直链导入组件，请更新到完整版 v3.4.0") from exc
     before = {path.resolve() for path in destination.iterdir() if path.is_file()}
 
     def hook(status: dict) -> None:

@@ -1,0 +1,12 @@
+橘味儿音乐服务器 v3.3.7 Mega53 尾块修复
+
+1. 关闭正在运行的 v3.3.6 服务器窗口。
+2. 把本压缩包内全部文件复制到 E:\Dongba-Music-Server，选择覆盖。
+3. 双击 Install-BS-RoFormer-Tail-Fix-v337.cmd。
+4. 看到“Mega53 tail-chunk fix v3.3.7 is ready”后按回车关闭。
+5. 使用 Start-Juweier-Server-v337-Demucs-Mega53-Pilot.ps1 启动服务器。
+6. 健康检查必须显示 version 3.3.7、RTX 3060、issues 为空。
+7. 运行 Start-3-Song-Pilot-v337.cmd 重试三首歌曲。
+
+本包不会重新下载或替换 CUDA、PyTorch、BS-RoFormer 0.1.6 或 1.37GB 模型。
+服务器窗口必须保持打开，直到三首任务结束。
