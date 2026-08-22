@@ -19,7 +19,7 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.5.0 Windows installer and portable client
+# release trigger: v3.5.0 Windows installer and portable client (contents dispatch)
 
 jobs:
   build-windows:
