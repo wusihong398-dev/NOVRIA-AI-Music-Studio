@@ -18,7 +18,7 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.5.0 H-source and G/F multi-disk Windows server overlay
+# release trigger: v3.5.0 H-source and G/F multi-disk Windows server overlay (contents dispatch)
 
 jobs:
   server-upgrade:
