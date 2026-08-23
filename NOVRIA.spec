@@ -49,7 +49,6 @@ exe = EXE(
     name='Juweier-Music', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=False, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
-    icon='assets/novria_app_icon.ico',
     manifest=_windows_manifest,
 )
 
@@ -67,7 +66,6 @@ worker_exe = EXE(
     name='Juweier-Separation-Worker', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True, disable_windowed_traceback=False,
     argv_emulation=False, target_arch=None, codesign_identity=None, entitlements_file=None,
-    icon='assets/novria_app_icon.ico',
     manifest=_windows_manifest,
 )
 
