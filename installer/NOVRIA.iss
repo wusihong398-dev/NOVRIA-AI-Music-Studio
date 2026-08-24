@@ -1,5 +1,5 @@
 #define MyAppName "橘味儿音乐"
-#define MyAppVersion "3.5.0"
+#define MyAppVersion "3.5.1"
 #define MyAppExeName "Juweier-Music.exe"
 
 [Setup]
@@ -9,7 +9,7 @@ AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\Juweier Music
 DefaultGroupName={#MyAppName}
 OutputDir=..\release
-OutputBaseFilename=Juweier_Music_v3.5.0_Setup_x64
+OutputBaseFilename=Juweier_Music_v3.5.1_Setup_x64
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -20,11 +20,11 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 AppPublisher=橘味儿音乐
 AppPublisherURL=https://db0888.com
 AppSupportURL=https://db0888.com
-VersionInfoVersion=3.5.0.0
+VersionInfoVersion=3.5.1.0
 VersionInfoCompany=橘味儿音乐
 VersionInfoDescription=橘味儿音乐多轨演奏工作站
 VersionInfoProductName=橘味儿音乐
-VersionInfoProductVersion=3.5.0
+VersionInfoProductVersion=3.5.1
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
