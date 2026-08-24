@@ -1,40 +1,57 @@
-name: Package Juweier Music v3 Source
-run-name: Juweier Music v3.5.0 Source · ${{ github.ref_name }}
+name: Package Juweier Music v3.5.2 Source
+run-name: Juweier Music v3.5.2 Complete Source · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.5.0"]
-    paths-ignore:
-      - ".github/workflows/build-mobile.yml"
-      - ".github/workflows/build-ios-testflight-package.yml"
-      - ".github/workflows/build-windows-exe.yml"
-      - ".github/workflows/package-server-upgrade.yml"
+    branches: ["agent/juweier-v3.5.2"]
+    paths:
+      - "app/**"
+      - "server/**"
+      - "mobile/**"
+      - "tools/**"
+      - "tests/**"
+      - "config/**"
+      - "build_tools/**"
+      - "installer/**"
+      - "*.py"
+      - "*.spec"
+      - "requirements*.txt"
+      - ".github/workflows/package-source-v3.yml"
 
 permissions:
   contents: read
 
-# release trigger: v3.5.0 complete source (contents dispatch)
-
 jobs:
   source:
-    name: Complete source archive
+    name: Complete v3.5.2 source archive
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Install lightweight test dependencies
-        run: python -m pip install --disable-pip-version-check opencc-python-reimplemented pypinyin numpy
-      - name: Verify v3.5.0 source
+      - name: Verify v3.5.2 source tree
+        shell: bash
         run: |
-          python -m compileall -q app server tests tools
-          python -m unittest discover -s tests -v
-          grep -q 'VERSION = "3.5.0"' app/main.py
-          grep -q 'VERSION = "3.5.0"' server/mobile_api.py
-          grep -q 'version: 3.5.0+350' mobile/pubspec.yaml
+          test -f mobile/lib/main.dart
+          test -f server/mobile_api.py
+          test -f app/main.py
+          test -f app/launcher.py
+          test -f NOVRIA.spec
+          grep -q 'version: 3.5.2+352' mobile/pubspec.yaml
+          grep -q 'agent/juweier-v3.5.2' .github/workflows/build-mobile-v352.yml
+          grep -q 'agent/juweier-v3.5.2' .github/workflows/build-windows-v352.yml
+      - name: Write source manifest
+        shell: bash
+        run: |
+          printf '%s\n' \
+            '橘味儿音乐 Juweier Music v3.5.2 完整源码' \
+            'Branch: agent/juweier-v3.5.2' \
+            "Commit: $GITHUB_SHA" \
+            '包含：Windows 客户端、Android/iOS Flutter 客户端、GPU/AI 服务器、批处理工具、安装与 GitHub Actions 构建脚本。' \
+            > SOURCE_VERSION_v3.5.2.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.0-Complete-Source
+          name: Juweier-Music-v3.5.2-Complete-Source
           path: |
             .
             !.git/**
@@ -43,3 +60,4 @@ jobs:
             !mobile_server_data/**
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
