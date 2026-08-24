@@ -1,5 +1,5 @@
 name: juweier_music
-version: 3.5.8+358
+version: 3.5.9+359
 description: 橘味儿音乐 Android/iOS 三端联调测试客户端
 publish_to: 'none'
 environment:
@@ -10,6 +10,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   shared_preferences: ^2.5.3
   just_audio: ^0.10.5
+  path_provider: ^2.1.5
 dev_dependencies:
   flutter_test:
     sdk: flutter
