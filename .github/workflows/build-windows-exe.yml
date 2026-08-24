@@ -1,10 +1,10 @@
 name: Build Juweier Music Windows EXE
-run-name: Juweier Music v3.5.0 Windows · ${{ github.ref_name }}
+run-name: Juweier Music v3.5.1 Windows · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.5.0"]
+    branches: ["main", "agent/juweier-v3.5.0", "agent/juweier-v3.5.1"]
     paths:
       - "app/**"
       - "assets/**"
@@ -19,7 +19,9 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.5.0 Windows installer and portable client (contents dispatch)
+# v3.5.1 test client. It keeps the published-product loader and uses the
+# existing server-side AI products; no local re-processing is required for the
+# four already-published validation songs.
 
 jobs:
   build-windows:
@@ -31,12 +33,23 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+      - name: Stamp v3.5.1 test version
+        shell: powershell
+        run: |
+          $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
+          $launcher = $launcher.Replace('VERSION = "3.5.0"', 'VERSION = "3.5.1"')
+          Set-Content "app\launcher.py" $launcher -Encoding UTF8
+          $iss = Get-Content "installer\NOVRIA.iss" -Raw -Encoding UTF8
+          $iss = $iss.Replace('AppVersion=3.5.0', 'AppVersion=3.5.1')
+          $iss = $iss.Replace('Juweier_Music_v3.5.0_Setup_x64.exe', 'Juweier_Music_v3.5.1_Setup_x64.exe')
+          $iss = $iss.Replace('Juweier Music v3.5.0', 'Juweier Music v3.5.1')
+          Set-Content "installer\NOVRIA.iss" $iss -Encoding UTF8
       - name: Build CPU-compatible EXE
         shell: powershell
         run: |
           Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build_tools\build_windows_exe.ps1
-      - name: Verify v3.5.0 performance client
+      - name: Verify v3.5.1 performance client
         shell: powershell
         run: |
           $root = "dist\Juweier-Music"
@@ -47,7 +60,7 @@ jobs:
           if (!(Test-Path $worker)) { throw "Worker EXE not found" }
           if (!(Test-Path $ffmpeg)) { throw "FFmpeg not found" }
           $launcher = Get-Content "app\launcher.py" -Raw -Encoding UTF8
-          if ($launcher -notmatch 'VERSION\s*=\s*"3\.5\.0"') { throw "v3.5.0 launcher not found" }
+          if ($launcher -notmatch 'VERSION\s*=\s*"3\.5\.1"') { throw "v3.5.1 launcher not found" }
           if (!(Select-String -Path "app\main.py" -Pattern "load_server_library_track" -Quiet)) { throw "Published product loader missing" }
           if (!(Select-String -Path "app\main.py" -Pattern "lyrics_timeline" -Quiet)) { throw "Lyrics timeline loader missing" }
           python -m unittest discover -s tests -v
@@ -60,11 +73,11 @@ jobs:
           choco install innosetup --yes --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           & $iscc "installer\NOVRIA.iss"
-          if (!(Test-Path "release\Juweier_Music_v3.5.0_Setup_x64.exe")) { throw "Installer was not created" }
+          if (!(Test-Path "release\Juweier_Music_v3.5.1_Setup_x64.exe")) { throw "Installer was not created" }
       - name: Upload Windows portable files without nested archive
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.0-Windows-x64-Portable
+          name: Juweier-Music-v3.5.1-Windows-x64-Portable
           path: dist/Juweier-Music
           if-no-files-found: error
           retention-days: 30
@@ -72,7 +85,7 @@ jobs:
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.0-Windows-Setup
-          path: release/Juweier_Music_v3.5.0_Setup_x64.exe
+          name: Juweier-Music-v3.5.1-Windows-Setup
+          path: release/Juweier_Music_v3.5.1_Setup_x64.exe
           if-no-files-found: error
           retention-days: 30
