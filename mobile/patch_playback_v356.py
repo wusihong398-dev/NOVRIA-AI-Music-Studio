@@ -5,28 +5,30 @@ path = Path('mobile/lib/main.dart')
 text = path.read_text(encoding='utf-8')
 text = re.sub(r"const appVersion = '3\.5\.[0-9]+';", "const appVersion = '3.5.6';", text, count=1)
 
-# Add one monotonic progress updater after the v3.5.5 loading-state fields.
-# Use a regex instead of an exact multiline string so earlier hotfix formatting
-# cannot make this patch fail on Android/iOS CI.
-state_pattern = re.compile(
-    r"(\s*double\s+loadingProgress\s*=\s*0\s*;\s*\n\s*String\s+loadingText\s*=\s*''\s*;\s*\n\s*bool\s+stemsReady\s*=\s*false\s*;)",
-    re.M,
-)
-state_replacement = r'''\1
+# v3.5.5 must already have added these state fields. Do not depend on their
+# whitespace or adjacency; only verify that they exist somewhere in the page.
+required_fields = [
+    'double loadingProgress = 0;',
+    "String loadingText = '';",
+    'bool stemsReady = false;',
+]
+for field in required_fields:
+    if field not in text:
+        raise SystemExit(f'v3.5.5 loading field missing: {field}')
 
-  void _advanceLoading(double value, [String? text]) {
-    final next = value.clamp(0.0, 1.0).toDouble();
-    if (next > loadingProgress) loadingProgress = next;
-    if (text != null && text.isNotEmpty) loadingText = text;
-    if (mounted) setState(() {});
-  }'''
-text, count = state_pattern.subn(state_replacement, text, count=1)
-if count != 1:
-    raise SystemExit('v3.5.5 loading state target not found')
+# Insert the monotonic updater at a stable method boundary instead of trying to
+# match the exact field layout. The selected getter is part of PerformancePage
+# and survives the preceding v3.5.3-v3.5.5 patches.
+if 'void _advanceLoading(double value' not in text:
+    marker = '  PipelineJob? get selected {'
+    if marker not in text:
+        raise SystemExit('PerformancePage selected getter target not found')
+    helper = '''  void _advanceLoading(double value, [String? text]) {\n    final next = value.clamp(0.0, 1.0).toDouble();\n    if (next > loadingProgress) loadingProgress = next;\n    if (text != null && text.isNotEmpty) loadingText = text;\n    if (mounted) setState(() {});\n  }\n\n'''
+    text = text.replace(marker, helper + marker, 1)
 
-# Replace direct progress mutations produced by the v3.5.5 patch with the
-# monotonic updater. Late/out-of-order download callbacks can no longer move
-# the visible progress backwards.
+# Replace direct progress mutations produced by v3.5.5. All visible progress
+# updates now go through _advanceLoading(), so late callbacks cannot move the
+# bar backwards on either Android or iOS.
 replacements = [
     ("    loadingProgress = .02;\n    loadingText = '正在连接歌曲服务器…';\n    if (mounted) setState(() {});", "    _advanceLoading(.02, '正在连接歌曲服务器…');"),
     ("        loadingText = '正在加载原曲…';\n        if (mounted) setState(() {});", "        _advanceLoading(loadingProgress, '正在加载原曲…');"),
@@ -40,15 +42,28 @@ replacements = [
 for old, new in replacements:
     text = text.replace(old, new, 1)
 
-# Score/lyrics spacing: give notation and lyrics separate vertical regions.
-text = text.replace("        height: 230,", "        height: 270,", 1)
-text = text.replace("text.paint(canvas, Offset(x - text.width / 2, top + lineCount * gap + 5));", "text.paint(canvas, Offset(x - text.width / 2, top + lineCount * gap + 24));", 1)
-text = text.replace("text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 8));", "text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 12));", 1)
+# Five-line staff / tablature spacing: reserve more vertical space between the
+# notation and lyrics instead of drawing lyric text immediately below the last line.
+text = text.replace('        height: 230,', '        height: 270,', 1)
+text = text.replace(
+    'text.paint(canvas, Offset(x - text.width / 2, top + lineCount * gap + 5));',
+    'text.paint(canvas, Offset(x - text.width / 2, top + lineCount * gap + 24));',
+    1,
+)
+text = text.replace(
+    'text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 8));',
+    'text.paint(canvas, Offset((size.width - text.width) / 2, size.height - text.height - 12));',
+    1,
+)
 
-# CI sanity checks: fail here if the actual intended fixes are not present.
-if "void _advanceLoading(double value" not in text:
+# Final CI assertions verify the feature itself, not a fragile source layout.
+if "const appVersion = '3.5.6';" not in text:
+    raise SystemExit('v3.5.6 version stamp missing')
+if 'void _advanceLoading(double value' not in text:
     raise SystemExit('monotonic progress updater missing')
-if "height: 270" not in text:
+if 'if (next > loadingProgress) loadingProgress = next;' not in text:
+    raise SystemExit('monotonic progress guard missing')
+if 'height: 270' not in text:
     raise SystemExit('score height spacing fix missing')
 
 path.write_text(text, encoding='utf-8')
