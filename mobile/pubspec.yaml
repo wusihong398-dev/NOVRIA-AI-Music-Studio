@@ -1,5 +1,5 @@
 name: juweier_music
-version: 3.5.3+353
+version: 3.5.4+354
 description: 橘味儿音乐 Android/iOS 三端联调测试客户端
 publish_to: 'none'
 environment:
