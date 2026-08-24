@@ -1,10 +1,10 @@
-name: Package Juweier Music v3.5.2 Source
-run-name: Juweier Music v3.5.2 Complete Source · ${{ github.ref_name }}
+name: Package Juweier Music v3.5.7 Source
+run-name: Juweier Music v3.5.7 Complete Source · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["agent/juweier-v3.5.2"]
+    branches: ["agent/juweier-v3.5.7"]
     paths:
       - "app/**"
       - "server/**"
@@ -24,12 +24,12 @@ permissions:
 
 jobs:
   source:
-    name: Complete v3.5.2 source archive
+    name: Complete v3.5.7 source archive
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Verify v3.5.2 source tree
+      - name: Verify v3.5.7 source tree
         shell: bash
         run: |
           test -f mobile/lib/main.dart
@@ -37,21 +37,20 @@ jobs:
           test -f app/main.py
           test -f app/launcher.py
           test -f NOVRIA.spec
-          grep -q 'version: 3.5.2+352' mobile/pubspec.yaml
-          grep -q 'agent/juweier-v3.5.2' .github/workflows/build-mobile-v352.yml
-          grep -q 'agent/juweier-v3.5.2' .github/workflows/build-windows-v352.yml
+          grep -q 'version: 3.5.7+357' mobile/pubspec.yaml
+          test -f mobile/patch_playback_v357.py
       - name: Write source manifest
         shell: bash
         run: |
           printf '%s\n' \
-            '橘味儿音乐 Juweier Music v3.5.2 完整源码' \
-            'Branch: agent/juweier-v3.5.2' \
+            '橘味儿音乐 Juweier Music v3.5.7 完整源码' \
+            'Branch: agent/juweier-v3.5.7' \
             "Commit: $GITHUB_SHA" \
             '包含：Windows 客户端、Android/iOS Flutter 客户端、GPU/AI 服务器、批处理工具、安装与 GitHub Actions 构建脚本。' \
-            > SOURCE_VERSION_v3.5.2.txt
+            > SOURCE_VERSION_v3.5.7.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.2-Complete-Source
+          name: Juweier-Music-v3.5.7-Complete-Source
           path: |
             .
             !.git/**
