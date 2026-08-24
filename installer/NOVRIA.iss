@@ -27,7 +27,10 @@ VersionInfoProductName=橘味儿音乐
 VersionInfoProductVersion=3.5.1
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; GitHub's Inno Setup 6.7.1 image does not ship ChineseSimplified.isl.
+; Use the built-in language so CI can always create the installer. The app UI
+; itself remains Simplified Chinese.
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 ; PyTorch ships thousands of duplicate third-party licence copies in very deep
