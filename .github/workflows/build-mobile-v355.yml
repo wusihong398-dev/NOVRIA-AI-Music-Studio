@@ -1,0 +1,138 @@
+name: Build Juweier Music v3.5.5 Android and iOS
+run-name: Juweier Music v3.5.5 Android + iOS · ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["agent/juweier-v3.5.5"]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/build-mobile-v355.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Apply playback patches
+        run: |
+          python3 mobile/patch_playback_v353.py
+          python3 mobile/patch_playback_v354.py
+          python3 mobile/patch_playback_v355.py
+      - name: Create Flutter Android project
+        shell: bash
+        run: |
+          flutter create --org com.db0888 --project-name juweier_music --platforms=android,ios mobile_build
+          rm -rf mobile_build/lib
+          cp -r mobile/lib mobile_build/lib
+          cp mobile/pubspec.yaml mobile_build/pubspec.yaml
+          cp -r mobile/assets mobile_build/assets
+          cd mobile_build
+          flutter pub get
+          dart run flutter_launcher_icons
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('android/app/src/main/AndroidManifest.xml')
+          s=p.read_text()
+          if '<uses-permission android:name="android.permission.INTERNET" />' not in s:
+              s=s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">','<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />')
+          s=s.replace('android:label="juweier_music"','android:label="橘味儿音乐"')
+          s=s.replace('<application','<application android:usesCleartextTraffic="true"',1)
+          p.write_text(s)
+          PY
+      - name: Verify v3.5.5 mobile features
+        run: |
+          grep -q "appVersion = '3.5.5'" mobile_build/lib/main.dart
+          grep -q "IndexedStack" mobile_build/lib/main.dart
+          grep -q "LinearProgressIndicator" mobile_build/lib/main.dart
+          grep -q "setStemEnabled" mobile_build/lib/main.dart
+          grep -q "歌词校正" mobile_build/lib/main.dart
+      - name: Build Android APK and AAB
+        working-directory: mobile_build
+        run: |
+          flutter analyze lib --no-fatal-infos --no-fatal-warnings
+          flutter build apk --release
+          flutter build appbundle --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.5.5-Android-APK
+          path: mobile_build/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.5.5-Android-AAB
+          path: mobile_build/build/app/outputs/bundle/release/app-release.aab
+          retention-days: 30
+          compression-level: 0
+
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Apply playback patches
+        run: |
+          python3 mobile/patch_playback_v353.py
+          python3 mobile/patch_playback_v354.py
+          python3 mobile/patch_playback_v355.py
+      - name: Create Flutter iOS project
+        shell: bash
+        run: |
+          flutter create --org com.db0888 --project-name juweier_music --platforms=android,ios mobile_build
+          rm -rf mobile_build/lib
+          cp -r mobile/lib mobile_build/lib
+          cp mobile/pubspec.yaml mobile_build/pubspec.yaml
+          cp -r mobile/assets mobile_build/assets
+          cd mobile_build
+          flutter pub get
+          dart run flutter_launcher_icons
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('ios/Runner.xcodeproj/project.pbxproj')
+          p.write_text(re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 14.0;', p.read_text()))
+          PY
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接橘味儿音乐成品服务器" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
+      - name: Verify v3.5.5 mobile features
+        run: |
+          grep -q "appVersion = '3.5.5'" mobile_build/lib/main.dart
+          grep -q "IndexedStack" mobile_build/lib/main.dart
+          grep -q "LinearProgressIndicator" mobile_build/lib/main.dart
+          grep -q "setStemEnabled" mobile_build/lib/main.dart
+          grep -q "歌词校正" mobile_build/lib/main.dart
+      - name: Build iOS simulator
+        working-directory: mobile_build
+        run: |
+          flutter analyze lib --no-fatal-infos --no-fatal-warnings
+          flutter build ios --simulator --debug
+      - name: Stage iOS Simulator app
+        run: |
+          mkdir -p ios-simulator
+          cp -R mobile_build/build/ios/iphonesimulator/Runner.app ios-simulator/Runner.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.5.5-iOS-Simulator
+          path: ios-simulator
+          retention-days: 30
+          compression-level: 0
