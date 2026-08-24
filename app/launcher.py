@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 
 from app import main as m
 
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 DISPLAY_NAME = "橘味儿音乐"
 
 
@@ -203,9 +203,6 @@ def install_runtime_patches():
     m.MainWindow._find_ffmpeg = _find_ffmpeg
     m.SeparationWorker = ProcessSeparationWorker
 
-    # v2.1.7 implements source/work-file de-duplication in MusicLibraryPage
-    # directly, so launcher monkey-patching is no longer needed.
-
 
 def write_gpu_diagnostic(log_fp):
     try:
@@ -316,7 +313,6 @@ def install_live_transpose_controls(win):
     reset_btn.clicked.connect(lambda: (arrangement.transpose.setValue(0), refresh_labels()))
     arrangement.transpose.valueChanged.connect(lambda _v: refresh_labels())
 
-    # Keyboard shortcuts for hands-busy rehearsal; buttons remain the primary control.
     shortcuts = [
         QShortcut(QKeySequence("Ctrl+Down"), win),
         QShortcut(QKeySequence("Ctrl+Up"), win),
