@@ -1,0 +1,49 @@
+name: Package Juweier Music v3.5.8 Server Upgrade
+run-name: Juweier Music v3.5.8 Server Upgrade · ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+  push:
+    branches: [agent/juweier-v3.5.8]
+    paths:
+      - server/**
+      - tools/patch_server_manual_lyrics_v358.py
+      - Import-Manual-Lyrics-v358.ps1
+      - .github/workflows/package-server-v358.yml
+permissions:
+  contents: read
+jobs:
+  server-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply v3.5.8 server patch
+        run: python3 tools/patch_server_manual_lyrics_v358.py
+      - name: Verify server patch
+        run: |
+          python3 -m compileall -q server tools app
+          grep -q 'VERSION = "3.5.8"' server/mobile_api.py
+          grep -q 'manual-lyrics' server/mobile_api.py
+          grep -q '人工歌词优先' server/mobile_api.py
+      - name: Stage server upgrade
+        run: |
+          mkdir -p server-upgrade
+          cp -R app server tools server-upgrade/
+          cp requirements-server.txt server-upgrade/ || true
+          cp requirements-lyrics-server.txt server-upgrade/ || true
+          cp Import-Manual-Lyrics-v358.ps1 server-upgrade/
+          cp Start-Juweier-Server-v350.cmd server-upgrade/ || true
+          cp Start-Juweier-Server-v350-Multi-Disk.ps1 server-upgrade/ || true
+          printf '%s\n' \
+            '橘味儿音乐 v3.5.8 服务器升级包' \
+            '新增：人工 TXT/LRC/DOCX 歌词导入；人工歌词覆盖 AI 文本并保留备份。' \
+            '部署后仍使用现有 8001 端口与 H/G/F 存储配置。' \
+            > server-upgrade/README_v3.5.8.txt
+          find server-upgrade -type d -name __pycache__ -prune -exec rm -rf {} +
+          find server-upgrade -type f -name '*.pyc' -delete
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.5.8-Windows-Server-Upgrade
+          path: server-upgrade
+          retention-days: 30
+          if-no-files-found: error
