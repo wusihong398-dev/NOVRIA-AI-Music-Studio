@@ -1,10 +1,10 @@
 name: Build Juweier Music Android and iOS
-run-name: Juweier Music v3.5.0 Android + iOS · ${{ github.ref_name }}
+run-name: Juweier Music v3.5.1 Android + iOS · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/juweier-v3.5.0"]
+    branches: ["main", "agent/juweier-v3.5.0", "agent/juweier-v3.5.1"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-mobile.yml"
@@ -12,7 +12,9 @@ on:
 permissions:
   contents: read
 
-# release trigger: v3.5.0 Android, AAB and iOS Simulator (contents dispatch)
+# v3.5.1 three-platform test release: Android + iOS simulator.
+# The client stays product-only and connects automatically to https://api.db0888.com,
+# so the four previously published AI-processed songs are used directly for validation.
 
 jobs:
   android:
@@ -37,6 +39,13 @@ jobs:
           cp -r mobile/lib mobile_build/lib
           cp mobile/pubspec.yaml mobile_build/pubspec.yaml
           cp -r mobile/assets mobile_build/assets
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('mobile_build/lib/main.dart')
+          text = main.read_text(encoding='utf-8')
+          text = text.replace("const appVersion = '3.5.0';", "const appVersion = '3.5.1';")
+          main.write_text(text, encoding='utf-8')
+          PY
           cd mobile_build
           flutter pub get
           dart run flutter_launcher_icons
@@ -50,12 +59,13 @@ jobs:
           s=s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
           manifest.write_text(s)
           PY
-      - name: Verify product-only mobile source
+      - name: Verify product-only v3.5.1 mobile source
         shell: bash
         run: |
-          grep -q "appVersion = '3.5.0'" mobile/lib/main.dart
-          grep -q '我的演奏' mobile/lib/main.dart
-          grep -q '总音量' mobile/lib/main.dart
+          grep -q "appVersion = '3.5.1'" mobile_build/lib/main.dart
+          grep -q "mobileAiServer = 'https://api.db0888.com'" mobile_build/lib/main.dart
+          grep -q '我的演奏' mobile_build/lib/main.dart
+          grep -q '总音量' mobile_build/lib/main.dart
           ! grep -q 'file_picker' mobile/pubspec.yaml
       - name: Build release APK and AAB
         working-directory: mobile_build
@@ -66,7 +76,7 @@ jobs:
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.0-Android-APK
+          name: Juweier-Music-v3.5.1-Android-APK
           path: mobile_build/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 30
@@ -74,7 +84,7 @@ jobs:
       - name: Upload Android AAB
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.0-Android-AAB
+          name: Juweier-Music-v3.5.1-Android-AAB
           path: mobile_build/build/app/outputs/bundle/release/app-release.aab
           if-no-files-found: error
           retention-days: 30
@@ -98,6 +108,13 @@ jobs:
           cp -r mobile/lib mobile_build/lib
           cp mobile/pubspec.yaml mobile_build/pubspec.yaml
           cp -r mobile/assets mobile_build/assets
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('mobile_build/lib/main.dart')
+          text = main.read_text(encoding='utf-8')
+          text = text.replace("const appVersion = '3.5.0';", "const appVersion = '3.5.1';")
+          main.write_text(text, encoding='utf-8')
+          PY
           cd mobile_build
           flutter pub get
           dart run flutter_launcher_icons
@@ -113,6 +130,11 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接橘味儿音乐成品服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
+      - name: Verify v3.5.1 server product client
+        shell: bash
+        run: |
+          grep -q "appVersion = '3.5.1'" mobile_build/lib/main.dart
+          grep -q "mobileAiServer = 'https://api.db0888.com'" mobile_build/lib/main.dart
       - name: Build iOS simulator validation app
         working-directory: mobile_build
         run: |
@@ -126,7 +148,7 @@ jobs:
       - name: Upload iOS simulator package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.0-iOS-Simulator
+          name: Juweier-Music-v3.5.1-iOS-Simulator
           path: ios-simulator
           if-no-files-found: error
           retention-days: 30
