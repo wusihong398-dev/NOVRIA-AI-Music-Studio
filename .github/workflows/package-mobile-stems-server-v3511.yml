@@ -1,0 +1,51 @@
+name: Package Juweier Music v3.5.11 Mobile Stem Server Upgrade
+run-name: Juweier Music v3.5.11 Mobile Stem Server Upgrade · ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+  push:
+    branches: [agent/juweier-v3.5.11]
+    paths:
+      - tools/generate_mobile_stems_v3511.py
+      - Generate-Mobile-Stems-v3511.ps1
+      - .github/workflows/package-mobile-stems-server-v3511.yml
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage upgrade package
+        shell: powershell
+        run: |
+          $out='Juweier-Music-v3.5.11-Mobile-Stem-Server-Upgrade'
+          New-Item -ItemType Directory -Force "$out\tools" | Out-Null
+          Copy-Item 'tools\generate_mobile_stems_v3511.py' "$out\tools\generate_mobile_stems_v3511.py" -Force
+          Copy-Item 'Generate-Mobile-Stems-v3511.ps1' "$out\Generate-Mobile-Stems-v3511.ps1" -Force
+          @'
+          橘味儿音乐 v3.5.11 手机轻量分轨升级
+
+          用途：
+          - 不重新 AI 分轨。
+          - 保留原 WAV 高质量分轨。
+          - 为已发布成品额外生成 AAC/M4A 手机播放分轨。
+          - v3.5.11 Android/iOS 优先加载轻量分轨，明显降低 40% 后的等待时间。
+
+          使用：
+          1. 把本升级包内容覆盖/复制到 E:\Dongba-Music-Server（不会覆盖数据库和歌曲）。
+          2. 保持服务器环境变量与现有 v3.5.8 启动环境一致。
+          3. 在 PowerShell 执行：
+             cd E:\Dongba-Music-Server
+             .\Generate-Mobile-Stems-v3511.ps1
+          4. 等待出现“完成”。无需重新处理原曲。
+
+          可选码率：
+             $env:JUWEIER_MOBILE_STEM_BITRATE='160k'
+             .\Generate-Mobile-Stems-v3511.ps1
+          '@ | Set-Content "$out\README-v3.5.11.txt" -Encoding UTF8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.5.11-Mobile-Stem-Server-Upgrade
+          path: Juweier-Music-v3.5.11-Mobile-Stem-Server-Upgrade
+          retention-days: 30
+          compression-level: 0
