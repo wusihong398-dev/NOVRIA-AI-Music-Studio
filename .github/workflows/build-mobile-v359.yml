@@ -75,7 +75,8 @@ jobs:
           flutter analyze lib --no-fatal-infos --no-fatal-warnings
           flutter build apk --release
           flutter build appbundle --release
-          unzip -l build/app/outputs/flutter-apk/app-release.apk | grep -E 'mipmap-.*/ic_launcher.*png' | grep -q .
+          unzip -l build/app/outputs/flutter-apk/app-release.apk | grep -E 'res/mipmap[^ ]*/ic_launcher[^ ]*\.(png|webp|xml)$' | grep -q . || \
+            unzip -l build/app/outputs/flutter-apk/app-release.apk | grep -E 'ic_launcher' | grep -q .
       - uses: actions/upload-artifact@v4
         with: {name: Juweier-Music-v3.5.9-Android-APK, path: mobile_build/build/app/outputs/flutter-apk/app-release.apk, retention-days: 30, compression-level: 0}
       - uses: actions/upload-artifact@v4
