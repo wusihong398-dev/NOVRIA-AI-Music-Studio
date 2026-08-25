@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v2.1.7.
+"""Mobile API companion for 橘味儿音乐 v3.1.0.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -7,10 +7,14 @@ audio here; Demucs and the analysis pipeline remain on the capable computer.
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -22,23 +26,141 @@ from pathlib import Path
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from app.project_utils import atomic_write_json, safe_file_stem
+from app.library_catalog import (
+    catalog_track,
+    connect_catalog,
+    default_library_root,
+    ensure_library_layout,
+    list_catalog,
+    scan_catalog,
+)
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "2.1.7"
+VERSION = "3.1.0"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
 STATE_FILE = ROOT / "jobs.json"
+ACCOUNT_DB = ROOT / "accounts.sqlite3"
 TOKEN = os.environ.get("JUWEIER_API_TOKEN", "").strip()
+LIBRARY_PATHS = ensure_library_layout(default_library_root())
+LIBRARY_DB = LIBRARY_PATHS["database"] / "juweier_music_library.sqlite3"
+connect_catalog(LIBRARY_DB).close()
 for folder in (UPLOADS, OUTPUTS):
     folder.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title=f"{APP_NAME} Mobile API", version=VERSION)
 lock = threading.RLock()
 executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JUWEIER_WORKERS", "1"))))
+
+
+class AuthPayload(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+    nickname: str = Field(default="", max_length=32)
+
+
+class ChatPayload(BaseModel):
+    content: str = Field(min_length=1, max_length=500)
+
+
+class LibraryProcessPayload(BaseModel):
+    arrangement_mode: str = "乐队现场版"
+    transpose: int = Field(default=0, ge=-12, le=12)
+    output: str = "wav_mp3"
+
+
+def _db() -> sqlite3.Connection:
+    connection = sqlite3.connect(ACCOUNT_DB, timeout=20)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _init_accounts() -> None:
+    connection = _db()
+    try:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                nickname TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS community_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_community_messages_created
+            ON community_messages(created_at DESC);
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _password_hash(password: str, salt_hex: str | None = None) -> str:
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240_000)
+    return f"{salt.hex()}:{digest.hex()}"
+
+
+def _password_matches(password: str, stored: str) -> bool:
+    try:
+        salt_hex, expected = stored.split(":", 1)
+        actual = _password_hash(password, salt_hex).split(":", 1)[1]
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _new_session(connection: sqlite3.Connection, user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    connection.execute(
+        "INSERT INTO sessions(token,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+        (token, user_id, now + 30 * 24 * 3600, now),
+    )
+    connection.execute("DELETE FROM sessions WHERE expires_at<?", (now,))
+    return token
+
+
+def _session_user(authorization: str | None) -> sqlite3.Row | None:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    value = authorization[7:].strip()
+    if not value or (TOKEN and hmac.compare_digest(value, TOKEN)):
+        return None
+    connection = _db()
+    try:
+        return connection.execute(
+            """SELECT users.id,users.username,users.nickname
+               FROM sessions JOIN users ON users.id=sessions.user_id
+               WHERE sessions.token=? AND sessions.expires_at>?""",
+            (value, time.time()),
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+_init_accounts()
 
 
 def _load_jobs() -> dict[str, dict]:
@@ -70,11 +192,24 @@ def _update(job_id: str, **values) -> None:
         atomic_write_json(STATE_FILE, jobs)
 
 
-def authorize(authorization: str | None = Header(default=None)) -> None:
+def authorize(authorization: str | None = Header(default=None)) -> str:
+    if authorization and authorization.startswith("Bearer "):
+        value = authorization[7:].strip()
+        if TOKEN and hmac.compare_digest(value, TOKEN):
+            return "server"
+        user = _session_user(authorization)
+        if user:
+            return str(user["username"])
     if not TOKEN:
-        return
-    if authorization != f"Bearer {TOKEN}":
-        raise HTTPException(status_code=401, detail="无效的访问令牌")
+        return "anonymous"
+    raise HTTPException(status_code=401, detail="无效的访问令牌")
+
+
+def current_user(authorization: str | None = Header(default=None)) -> sqlite3.Row:
+    user = _session_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录橘味儿音乐账号")
+    return user
 
 
 def _gpu_name() -> str:
@@ -92,6 +227,107 @@ def _gpu_name() -> str:
 @app.get("/api/health")
 def health(_: None = Depends(authorize)) -> dict:
     return {"status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name()}
+
+
+@app.post("/api/v1/auth/register", status_code=201)
+def register(payload: AuthPayload) -> dict:
+    username = payload.username.strip()
+    nickname = payload.nickname.strip() or username
+    if not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff]{3,32}", username):
+        raise HTTPException(status_code=400, detail="账号只能使用中文、字母、数字、下划线或短横线")
+    connection = _db()
+    try:
+        try:
+            cursor = connection.execute(
+                "INSERT INTO users(username,nickname,password_hash,created_at) VALUES(?,?,?,?)",
+                (username, nickname, _password_hash(payload.password), time.time()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="该账号已经注册") from exc
+        token = _new_session(connection, int(cursor.lastrowid))
+        connection.commit()
+        return {"token": token, "username": username, "nickname": nickname, "expires_in": 30 * 24 * 3600}
+    finally:
+        connection.close()
+
+
+@app.post("/api/v1/auth/login")
+def login(payload: AuthPayload) -> dict:
+    connection = _db()
+    try:
+        row = connection.execute(
+            "SELECT id,username,nickname,password_hash FROM users WHERE username=? COLLATE NOCASE",
+            (payload.username.strip(),),
+        ).fetchone()
+        if not row or not _password_matches(payload.password, str(row["password_hash"])):
+            raise HTTPException(status_code=401, detail="账号或密码错误")
+        token = _new_session(connection, int(row["id"]))
+        connection.commit()
+        return {
+            "token": token,
+            "username": str(row["username"]),
+            "nickname": str(row["nickname"]),
+            "expires_in": 30 * 24 * 3600,
+        }
+    finally:
+        connection.close()
+
+
+@app.get("/api/v1/account/me")
+def account_me(user: sqlite3.Row = Depends(current_user)) -> dict:
+    return {"id": int(user["id"]), "username": str(user["username"]), "nickname": str(user["nickname"])}
+
+
+@app.get("/api/v1/community/messages")
+def community_messages(limit: int = 100, _: sqlite3.Row = Depends(current_user)) -> dict:
+    count = max(1, min(200, int(limit)))
+    connection = _db()
+    try:
+        rows = connection.execute(
+            """SELECT community_messages.id,community_messages.content,community_messages.created_at,
+                      users.username,users.nickname
+               FROM community_messages JOIN users ON users.id=community_messages.user_id
+               ORDER BY community_messages.id DESC LIMIT ?""",
+            (count,),
+        ).fetchall()
+    finally:
+        connection.close()
+    return {
+        "messages": [
+            {
+                "id": int(row["id"]),
+                "content": str(row["content"]),
+                "created_at": float(row["created_at"]),
+                "username": str(row["username"]),
+                "nickname": str(row["nickname"]),
+            }
+            for row in reversed(rows)
+        ]
+    }
+
+
+@app.post("/api/v1/community/messages", status_code=201)
+def send_community_message(payload: ChatPayload, user: sqlite3.Row = Depends(current_user)) -> dict:
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+    now = time.time()
+    connection = _db()
+    try:
+        cursor = connection.execute(
+            "INSERT INTO community_messages(user_id,content,created_at) VALUES(?,?,?)",
+            (int(user["id"]), content, now),
+        )
+        connection.commit()
+        return {
+            "id": int(cursor.lastrowid),
+            "content": content,
+            "created_at": now,
+            "username": str(user["username"]),
+            "nickname": str(user["nickname"]),
+        }
+    finally:
+        connection.close()
 
 
 @app.post("/api/v1/jobs", status_code=202)
@@ -123,12 +359,28 @@ async def create_job(
             stream.write(chunk)
     await file.close()
 
+    queued_id = _queue_job(
+        file_name=file.filename or upload_path.name,
+        input_path=upload_path,
+        arrangement_mode=arrangement_mode,
+        transpose=transpose,
+        output=output,
+    )
+    return {"job_id": queued_id, "status": "queued"}
+
+
+def _queue_job(
+    *, file_name: str, input_path: Path, arrangement_mode: str,
+    transpose: int, output: str, library_track_id: int | None = None,
+) -> str:
+    job_id = uuid.uuid4().hex
     now = time.time()
     with lock:
         jobs[job_id] = {
             "id": job_id,
-            "file_name": file.filename or upload_path.name,
-            "input_path": str(upload_path),
+            "file_name": file_name,
+            "input_path": str(input_path),
+            "library_track_id": library_track_id,
             "arrangement_mode": arrangement_mode,
             "transpose": max(-12, min(12, int(transpose))),
             "output": output,
@@ -143,16 +395,76 @@ async def create_job(
         }
         atomic_write_json(STATE_FILE, jobs)
     executor.submit(_run_job, job_id)
-    return {"job_id": job_id, "status": "queued"}
+    return job_id
+
+
+@app.get("/api/v1/library")
+def library(
+    request: Request, q: str = "", category: str = "全部", limit: int = 500,
+    _: None = Depends(authorize),
+) -> dict:
+    songs = list_catalog(LIBRARY_DB, q, category, limit)
+    for song in songs:
+        track_id = int(song["id"])
+        song.pop("source_path", None)
+        song.pop("working_path", None)
+        song["audio_url"] = str(request.url_for("library_audio", track_id=track_id))
+        if song.get("cover_path"):
+            song["cover_url"] = str(request.url_for("library_cover", track_id=track_id))
+        song.pop("cover_path", None)
+    return {"songs": songs, "count": len(songs), "categories": ["全部", "本地导入", "抖音流行", "酷狗排行榜"]}
+
+
+@app.post("/api/v1/library/scan")
+def scan_library(_: None = Depends(authorize)) -> dict:
+    result = scan_catalog(LIBRARY_PATHS["originals"], LIBRARY_DB, LIBRARY_PATHS["covers"])
+    return {**result, "root": str(LIBRARY_PATHS["root"])}
+
+
+@app.get("/api/v1/library/{track_id}/audio", name="library_audio")
+def library_audio(track_id: int, _: None = Depends(authorize)):
+    song = catalog_track(LIBRARY_DB, track_id)
+    path = Path(str(song.get("working_path") or song.get("source_path"))) if song else None
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="歌曲文件不存在")
+    return FileResponse(path, filename=path.name)
+
+
+@app.get("/api/v1/library/{track_id}/cover", name="library_cover")
+def library_cover(track_id: int, _: None = Depends(authorize)):
+    song = catalog_track(LIBRARY_DB, track_id)
+    path = Path(str(song.get("cover_path", ""))) if song else None
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="封面不存在")
+    return FileResponse(path, filename=path.name)
+
+
+@app.post("/api/v1/library/{track_id}/process", status_code=202)
+def process_library_song(track_id: int, payload: LibraryProcessPayload, _: None = Depends(authorize)) -> dict:
+    song = catalog_track(LIBRARY_DB, track_id)
+    if not song:
+        raise HTTPException(status_code=404, detail="歌曲不存在")
+    input_path = Path(str(song.get("working_path") or song.get("source_path")))
+    if not input_path.is_file():
+        raise HTTPException(status_code=404, detail="歌曲文件不存在")
+    queued_id = _queue_job(
+        file_name=input_path.name, input_path=input_path,
+        arrangement_mode=payload.arrangement_mode, transpose=payload.transpose,
+        output=payload.output, library_track_id=track_id,
+    )
+    return {"job_id": queued_id, "status": "queued"}
 
 
 def _run_job(job_id: str) -> None:
     job = jobs[job_id]
     input_path = Path(job["input_path"])
-    output_root = OUTPUTS / job_id
+    output_root = (
+        LIBRARY_PATHS["processed"] / f"{safe_file_stem(input_path.stem)}_{job_id[:8]}"
+        if job.get("library_track_id") else OUTPUTS / job_id
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     try:
-        _update(job_id, status="processing", stage="准备六轨模型", progress=7)
+        _update(job_id, status="processing", stage="准备七轨兼容模型", progress=7)
         command = [
             sys.executable,
             "-m",
@@ -185,21 +497,21 @@ def _run_job(job_id: str) -> None:
                     _update(job_id, stage=str(message.get("text", "准备模型")), progress=7 + value * 0.08)
                 elif kind == "separation_progress":
                     value = float(message.get("value", 0))
-                    _update(job_id, stage=str(message.get("text", "六轨分离")), progress=15 + value * 0.40)
+                    _update(job_id, stage=str(message.get("text", "基础六轨分离")), progress=15 + value * 0.40)
                 elif kind == "done":
                     stem_dir = str(message.get("stem_dir", ""))
                 elif kind == "failed":
                     last_error = str(message.get("error", "六轨分离失败"))
         code = process.wait()
         if code != 0 or not stem_dir:
-            raise RuntimeError(last_error or f"六轨 Worker 退出码 {code}")
+            raise RuntimeError(last_error or f"分轨 Worker 退出码 {code}")
 
         artifacts = {f"stem_{p.stem}": str(p) for p in Path(stem_dir).glob("*.wav")}
         _update(job_id, stage="BPM / 调性 / 和弦分析", progress=58, artifacts=artifacts)
         analysis, chord_rows = _analyze(input_path)
         analysis, chord_rows = _transpose_analysis(analysis, chord_rows, int(job.get("transpose", 0)))
         artifacts["chords"] = str(_write_chords(output_root, chord_rows))
-        _update(job_id, stage="生成各乐手谱面", progress=72, key=analysis["key"], artifacts=artifacts)
+        _update(job_id, stage="生成五线谱、六线谱及各乐手谱面", progress=72, key=analysis["key"], artifacts=artifacts)
         artifacts.update(_write_scores(output_root, job["file_name"], analysis, chord_rows))
         _update(job_id, stage="生成新 MIDI 编配", progress=88, artifacts=artifacts)
         midi = _write_arrangement(output_root, analysis, chord_rows)
@@ -241,7 +553,34 @@ def _analyze(path: Path) -> tuple[dict, list[dict]]:
         ratio = start / max(1, len(chords) - 1)
         section = "前奏" if ratio < .1 else "主歌" if ratio < .45 else "副歌" if ratio < .72 else "间奏" if ratio < .88 else "尾奏"
         rows.append({"bar": len(rows) + 1, "seconds": float(beat_times[start]), "section": section, "chords": compact or [key]})
-    return {"bpm": round(bpm, 1), "key": key}, rows
+    melody_notes = []
+    try:
+        f0, _, _ = librosa.pyin(
+            y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"),
+            sr=sample_rate, frame_length=2048, hop_length=512,
+        )
+        times = librosa.times_like(f0, sr=sample_rate, hop_length=512)
+        current = None
+        start = 0
+        for index, value in enumerate(f0):
+            midi = int(round(float(librosa.hz_to_midi(value)))) if np.isfinite(value) else None
+            if midi != current:
+                if current is not None and start < index:
+                    duration = float(times[index - 1] - times[start] + 512 / sample_rate)
+                    if duration >= .08:
+                        melody_notes.append({"start": float(times[start]), "duration": duration, "midi": current})
+                current = midi
+                start = index
+        if current is not None and len(times) > start:
+            melody_notes.append({"start": float(times[start]), "duration": max(.08, float(times[-1] - times[start])), "midi": current})
+        melody_notes = melody_notes[:2000]
+    except Exception:
+        melody_notes = []
+    return {
+        "bpm": round(bpm, 1), "key": key,
+        "duration": float(librosa.get_duration(y=y, sr=sample_rate)),
+        "melody_notes": melody_notes,
+    }, rows
 
 
 def _write_chords(folder: Path, rows: list[dict]) -> Path:
@@ -267,6 +606,10 @@ def _transpose_analysis(analysis: dict, rows: list[dict], semitones: int) -> tup
         return analysis, rows
     result = dict(analysis)
     result["key"] = _transpose_chord(str(result.get("key", "C")), semitones)
+    result["melody_notes"] = [
+        {**note, "midi": int(note.get("midi", 60)) + semitones}
+        for note in result.get("melody_notes", [])
+    ]
     transposed = []
     for row in rows:
         item = dict(row)
@@ -282,7 +625,10 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
                   "E": ("E", 0), "F": ("F", 0), "F#": ("F", 1), "G": ("G", 0),
                   "G#": ("G", 1), "A": ("A", 0), "A#": ("A", 1), "B": ("B", 0)}
     measures = []
-    for index, row in enumerate(rows or [{"chords": [analysis.get("key", "C")]}], start=1):
+    melody = list(analysis.get("melody_notes", []))
+    measure_count = max(len(rows), (len(melody) + 3) // 4, 1)
+    for index in range(1, measure_count + 1):
+        row = rows[index - 1] if index <= len(rows) else {"chords": [analysis.get("key", "C")]}
         chord = str((row.get("chords") or [analysis.get("key", "C")])[0])
         match = re.match(r"^([A-G](?:#)?)(m|maj7|m7|7)?", chord)
         root = match.group(1) if match else "C"
@@ -296,9 +642,22 @@ def _write_musicxml(folder: Path, title: str, analysis: dict, rows: list[dict]) 
                 "<time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>"
             )
         alter_xml = f"<root-alter>{alter}</root-alter>" if alter else ""
+        note_xml = []
+        for event in melody[(index - 1) * 4:index * 4]:
+            midi = int(event.get("midi", 60))
+            pitch = names[midi % 12]
+            note_step, note_alter = note_steps[pitch]
+            octave = midi // 12 - 1
+            alter_note_xml = f"<alter>{note_alter}</alter>" if note_alter else ""
+            note_xml.append(
+                f"<note><pitch><step>{note_step}</step>{alter_note_xml}<octave>{octave}</octave></pitch>"
+                "<duration>1</duration><type>quarter</type></note>"
+            )
+        if not note_xml:
+            note_xml.append("<note><rest/><duration>4</duration><type>whole</type></note>")
         measures.append(
             f'<measure number="{index}">{attributes}<harmony><root><root-step>{step}</root-step>{alter_xml}</root>'
-            f'<kind>{kind}</kind></harmony><note><rest/><duration>4</duration><type>whole</type></note></measure>'
+            f'<kind>{kind}</kind></harmony>{"".join(note_xml)}</measure>'
         )
     path = folder / "lead_sheet.musicxml"
     document = (
@@ -339,6 +698,20 @@ def _write_scores(folder: Path, title: str, analysis: dict, rows: list[dict]) ->
         path.write_text(table(name, hint), encoding="utf-8")
         result[key] = str(path)
     result["musicxml"] = str(_write_musicxml(folder, title, analysis, rows))
+    tuning = [40, 45, 50, 55, 59, 64]
+    tab_notes = []
+    for note in analysis.get("melody_notes", []):
+        midi = int(note.get("midi", 60))
+        choices = [(midi - open_note, string + 1) for string, open_note in enumerate(tuning) if 0 <= midi - open_note <= 24]
+        fret, string = min(choices, default=(0, 1), key=lambda item: (item[0], -item[1]))
+        tab_notes.append({**note, "string": string, "fret": fret})
+    score_data = folder / "score_data.json"
+    atomic_write_json(score_data, {
+        "title": title, "bpm": analysis.get("bpm", 120), "key": analysis.get("key", "C"),
+        "duration": analysis.get("duration", 0), "bars": rows,
+        "staff_notes": analysis.get("melody_notes", []), "tab_notes": tab_notes,
+    })
+    result["score_data"] = str(score_data)
     return result
 
 

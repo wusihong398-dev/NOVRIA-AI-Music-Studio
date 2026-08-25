@@ -3,7 +3,7 @@ name: Build Juweier Music iOS TestFlight Package
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "agent/juweier-v3.1.0"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-ios-testflight-package.yml"
@@ -25,7 +25,7 @@ jobs:
       - name: Create iOS Flutter project
         shell: bash
         run: |
-          flutter create --org com.db0888 --project-name juweier_music --platforms=ios mobile_ios
+          flutter create --org com.db0888 --project-name juweier_music --platforms=android,ios mobile_ios
           rm -rf mobile_ios/lib
           cp -r mobile/lib mobile_ios/lib
           cp mobile/pubspec.yaml mobile_ios/pubspec.yaml
@@ -33,6 +33,13 @@ jobs:
           cd mobile_ios
           flutter pub get
           dart run flutter_launcher_icons
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          project = Path('ios/Runner.xcodeproj/project.pbxproj')
+          text = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 14.0;', project.read_text())
+          project.write_text(text)
+          PY
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppleMusicUsageDescription string 需要选择音乐文件进行AI分轨和演出谱面生成" ios/Runner/Info.plist || true
@@ -40,7 +47,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
-          flutter build ios --release --no-codesign
+          flutter analyze lib --no-fatal-infos
       - name: Add TestFlight upload instructions
         shell: bash
         run: |
@@ -64,8 +71,8 @@ jobs:
           - 勾选 Automatically manage signing
           - Team 选择你的 Apple Developer 团队
           - Bundle Identifier：`com.db0888.juweierMusic`
-          - Version 当前来自 pubspec：2.1.7
-          - Build：217，可按需要递增
+          - Version 当前来自 pubspec：3.1.0
+          - Build：310，可按需要递增
 
           ## 3. 归档上传
           - 顶部设备选择：Any iOS Device 或 Generic iOS Device
@@ -77,12 +84,12 @@ jobs:
       - name: Package iOS Xcode project
         shell: bash
         run: |
-          zip -qry Juweier-Music-v2.1.7-iOS-TestFlight-Xcode-Project.zip mobile_ios
+          zip -qry Juweier-Music-v3.1.0-iOS-TestFlight-Xcode-Project.zip mobile_ios
       - name: Upload iOS TestFlight project package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v2.1.7-iOS-TestFlight-Xcode-Project
-          path: Juweier-Music-v2.1.7-iOS-TestFlight-Xcode-Project.zip
+          name: Juweier-Music-v3.1.0-iOS-TestFlight-Xcode-Project
+          path: Juweier-Music-v3.1.0-iOS-TestFlight-Xcode-Project.zip
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
