@@ -1,0 +1,149 @@
+name: Build Juweier Music v3.5.10 Android and iOS
+run-name: Juweier Music v3.5.10 Android + iOS · ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+  push:
+    branches: [agent/juweier-v3.5.10]
+    paths: [mobile/**, .github/workflows/build-mobile-v3510.yml]
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with: {distribution: temurin, java-version: '17'}
+      - uses: subosito/flutter-action@v2
+        with: {channel: stable, cache: true}
+      - name: Patch source
+        run: |
+          python3 mobile/patch_playback_v353.py
+          python3 mobile/patch_playback_v354.py
+          python3 mobile/patch_playback_v355.py
+          python3 mobile/patch_lyrics_v355.py
+          python3 mobile/patch_playback_v356.py
+          python3 mobile/patch_playback_v357.py
+          python3 mobile/patch_playback_v358.py
+          python3 mobile/patch_offline_v359.py
+          python3 mobile/patch_offline_v3510.py
+      - name: Prepare Android and rebuild icon
+        run: |
+          flutter create --org com.db0888 --project-name juweier_music --platforms=android mobile_build
+          rm -rf mobile_build/lib && cp -r mobile/lib mobile_build/lib
+          cp mobile/pubspec.yaml mobile_build/pubspec.yaml
+          cp -r mobile/assets mobile_build/assets
+          cd mobile_build
+          flutter pub get
+          python3 -m pip install --quiet pillow
+          python3 - <<'PY'
+          from PIL import Image
+          from pathlib import Path
+          p=Path('assets/juweier_icon.png')
+          im=Image.open(p).convert('RGBA')
+          canvas=Image.new('RGBA',(1024,1024),(0,0,0,0))
+          im.thumbnail((960,960), Image.Resampling.LANCZOS)
+          canvas.alpha_composite(im, ((1024-im.width)//2,(1024-im.height)//2))
+          canvas.save(p)
+          assert p.stat().st_size > 4096
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('pubspec.yaml'); s=p.read_text(encoding='utf-8')
+          s=s.replace('  ios: true','  ios: false',1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          dart run flutter_launcher_icons
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('android/app/src/main/AndroidManifest.xml'); s=p.read_text()
+          if 'android.permission.INTERNET' not in s:
+              s=s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">','<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n<uses-permission android:name="android.permission.INTERNET" />')
+          s=s.replace('android:label="juweier_music"','android:label="橘味儿音乐"')
+          p.write_text(s)
+          PY
+      - name: Verify and build Android
+        run: |
+          grep -q "appVersion = '3.5.10'" mobile_build/lib/main.dart
+          grep -q "七轨并行加载" mobile_build/lib/main.dart
+          grep -q "本地成品库" mobile_build/lib/main.dart
+          grep -q "HttpHeaders.rangeHeader" mobile_build/lib/main.dart
+          grep -q "_measureServerLatency" mobile_build/lib/main.dart
+          test -s mobile_build/android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          test -s mobile_build/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          cd mobile_build
+          flutter analyze lib --no-fatal-infos --no-fatal-warnings
+          flutter build apk --release
+          flutter build appbundle --release
+          test -s build/app/outputs/flutter-apk/app-release.apk
+          test -s build/app/outputs/bundle/release/app-release.aab
+      - uses: actions/upload-artifact@v4
+        with: {name: Juweier-Music-v3.5.10-Android-APK, path: mobile_build/build/app/outputs/flutter-apk/app-release.apk, retention-days: 30, compression-level: 0}
+      - uses: actions/upload-artifact@v4
+        with: {name: Juweier-Music-v3.5.10-Android-AAB, path: mobile_build/build/app/outputs/bundle/release/app-release.aab, retention-days: 30, compression-level: 0}
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: {channel: stable, cache: true}
+      - name: Patch source
+        run: |
+          python3 mobile/patch_playback_v353.py
+          python3 mobile/patch_playback_v354.py
+          python3 mobile/patch_playback_v355.py
+          python3 mobile/patch_lyrics_v355.py
+          python3 mobile/patch_playback_v356.py
+          python3 mobile/patch_playback_v357.py
+          python3 mobile/patch_playback_v358.py
+          python3 mobile/patch_offline_v359.py
+          python3 mobile/patch_offline_v3510.py
+      - name: Prepare iOS and rebuild icon
+        run: |
+          flutter create --org com.db0888 --project-name juweier_music --platforms=ios mobile_build
+          rm -rf mobile_build/lib && cp -r mobile/lib mobile_build/lib
+          cp mobile/pubspec.yaml mobile_build/pubspec.yaml
+          cp -r mobile/assets mobile_build/assets
+          cd mobile_build
+          flutter pub get
+          python3 -m venv .iconvenv
+          .iconvenv/bin/python -m pip install --quiet --upgrade pip pillow
+          .iconvenv/bin/python - <<'PY'
+          from PIL import Image
+          from pathlib import Path
+          p=Path('assets/juweier_icon.png')
+          im=Image.open(p).convert('RGBA')
+          canvas=Image.new('RGBA',(1024,1024),(0,0,0,0))
+          im.thumbnail((960,960), Image.Resampling.LANCZOS)
+          canvas.alpha_composite(im, ((1024-im.width)//2,(1024-im.height)//2))
+          canvas.save(p)
+          assert p.stat().st_size > 4096
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('pubspec.yaml'); s=p.read_text(encoding='utf-8')
+          s=s.replace('  android: true','  android: false',1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          dart run flutter_launcher_icons
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
+      - name: Verify and build iOS
+        run: |
+          grep -q "appVersion = '3.5.10'" mobile_build/lib/main.dart
+          grep -q "七轨并行加载" mobile_build/lib/main.dart
+          grep -q "本地成品库" mobile_build/lib/main.dart
+          grep -q "HttpHeaders.rangeHeader" mobile_build/lib/main.dart
+          grep -q "_measureServerLatency" mobile_build/lib/main.dart
+          test -s mobile_build/ios/Runner/Assets.xcassets/AppIcon.appiconset/Contents.json
+          test "$(find mobile_build/ios/Runner/Assets.xcassets/AppIcon.appiconset -type f -name '*.png' -size +1k | wc -l)" -ge 10
+          cd mobile_build
+          flutter analyze lib --no-fatal-infos --no-fatal-warnings
+          flutter build ios --simulator --debug
+          find build/ios/iphonesimulator/Runner.app -maxdepth 1 -type f -name 'AppIcon*.png' -size +1k | grep -q .
+      - name: Stage app
+        run: mkdir -p ios-simulator && cp -R mobile_build/build/ios/iphonesimulator/Runner.app ios-simulator/Runner.app
+      - uses: actions/upload-artifact@v4
+        with: {name: Juweier-Music-v3.5.10-iOS-Simulator, path: ios-simulator, retention-days: 30, compression-level: 0}
