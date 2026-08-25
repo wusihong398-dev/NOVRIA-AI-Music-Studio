@@ -13,8 +13,16 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "2.1.7"', launcher)
+        self.assertIn('VERSION = "3.2.0"', launcher)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
+
+    def test_v3_account_community_and_soundfont_fallback(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('class CommunityPage', desktop)
+        self.assertIn('已跳过（未配置 SoundFont）', desktop)
+        self.assertIn('/api/v1/auth/register', server)
+        self.assertIn('/api/v1/community/messages', server)
 
     def test_done_handlers_do_not_destroy_running_qthreads(self):
         source = (ROOT / 'app/main.py').read_text(encoding='utf-8')

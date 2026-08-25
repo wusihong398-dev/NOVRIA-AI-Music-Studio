@@ -1,8 +1,19 @@
-# 橘味儿音乐 v2.1.7（三端版）
+# 橘味儿音乐 v3.2.0（三端新版）
 
-这是在 v2.1.6 源码上完成的稳定版，包含 Windows 桌面端、Android 客户端、iOS 客户端，以及供手机调用的 Windows/GPU AI 服务。
+这是在稳定版 v2.1.7 上继续升级的三端完整版，包含 Windows 桌面端、Android 客户端、iOS 客户端，以及供手机调用的 Windows/GPU AI 服务。
 
-## 本次修复
+## v3.2.0 新增与修复
+
+- 使用正式橘子音符图标，桌面端和移动端统一为橙色暗色视觉。
+- Windows、Android、iOS 共用账号系统和内测群聊。
+- 修复播放中拖动进度条后跳回旧位置的问题，所有分轨同步定位。
+- 基础模型仍为 `htdemucs_6s` 六轨；综合吉他轨会继续执行二次频谱分离，生成独立木吉他与电吉他轨，不虚标七轨模型。
+- Android/iOS 新增服务器歌曲库，可按歌曲、歌手、抖音流行、酷狗排行榜搜索并直接提交 AI 处理。
+- 新增主旋律音高转写、MusicXML、可视五线谱和实际品位六线谱，并随播放位置滚动。
+- 默认本地歌曲库为 `G:\JuweierMusicLibrary`，原曲放在 `01_Originals`，不会重复复制。
+- AI 服务器同时支持局域网 `http://电脑IP:8000` 与 Cloudflare HTTPS 域名。
+- 修复 `file_picker 12` API 变更导致的 Android/iOS 构建失败。
+- SoundFont 未配置时保留编配 MIDI 并跳过音频渲染，不再使整条流水线失败。
 
 - 修复批处理或自动流水线到 100% 后，`QThread` 尚未退出便被销毁导致的 Windows 硬退出。
 - 修复源音频与转换后的工作 WAV 同时被扫描，造成“一首歌显示两首”。
@@ -17,12 +28,12 @@
 
 | 端 | 目录 / 入口 | 说明 |
 |---|---|---|
-| Windows | `app/`、`Run-Juweier-Music.bat` | 完整 AI 音乐工作站，负责六轨、分析、编配、谱面和演出 |
+| Windows | `app/`、`Run-Juweier-Music.bat` | 本地服务器/测试工作站，负责六轨基础分离、电吉他二次分离、分析、编配、谱面和演出 |
 | Android | `mobile/` | Flutter 正式客户端；上传音频、查看进度、管理任务和谱面 |
 | iOS | `mobile/` | 与 Android 共用 Flutter 代码；提供未签名包与 TestFlight 工程工作流 |
 | 手机 AI 服务 | `server/mobile_api.py`、`Run-Mobile-Server.bat` | 在 Windows/GPU 电脑执行 Demucs 与分析，向手机提供任务 API |
 
-手机端不会在手机本机运行 Demucs 大模型。手机上传音频后，由 Windows/GPU 电脑完成六轨分离、BPM/调性/和弦分析、乐手参考谱、MusicXML 和新编配 MIDI。
+手机端不会在手机本机运行 Demucs 大模型。手机可选择服务器歌曲库或上传音频，由 Windows/GPU 电脑完成分轨、BPM/调性/和弦分析、主旋律转写、五线谱、六线谱和新编配 MIDI。
 
 ## Windows 源码运行
 
@@ -31,18 +42,19 @@
 3. 双击 `Check-GPU.bat` 检查 CUDA。
 4. 双击 `Run-Juweier-Music.bat`。
 
-第一次六轨分离会下载并校验 `htdemucs_6s` 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v2.1.7-Windows-x64`。
+第一次分轨会下载并校验 `htdemucs_6s` 模型。Windows EXE 可通过 GitHub Actions 的 **Build Juweier Music Windows EXE** 生成；产物名为 `Juweier-Music-v3.2.0-Windows-x64`，其中含安装程序和便携 ZIP。
 
 ## Android / iOS 使用
 
 1. Windows/GPU 电脑先完成上面的 AI 环境安装。
-2. 双击 `Run-Mobile-Server.bat`，默认端口为 `18120`。
-3. 手机与电脑处于同一局域网；在 App 设置中填入 `http://电脑局域网IP:18120`。
+2. 双击 `Run-Mobile-Server.bat`，默认端口为 `8000`。
+3. 手机与电脑处于同一局域网；在 App 设置中填入 `http://电脑局域网IP:8000`；外网填写 Cloudflare HTTPS API 域名。
 4. 如设置了环境变量 `JUWEIER_API_TOKEN`，手机端同时填写相同令牌。
 
 GitHub Actions：
 
-- **Build Juweier Music Android and iOS**：生成 Android release APK 与未签名 iOS `.app` 包。
+- **Package Juweier Music v3 Source**：首先生成完整源码 ZIP。
+- **Build Juweier Music Android and iOS**：生成 Android release APK 与 iOS 模拟器验证包。
 - **Build Juweier Music iOS TestFlight Package**：生成可在 Mac/Xcode 中签名、归档和上传 TestFlight 的完整工程。
 
 iOS App Store/TestFlight 必须使用你自己的 Apple Developer Team 与签名证书；仓库不会也不应包含私钥。
@@ -50,6 +62,10 @@ iOS App Store/TestFlight 必须使用你自己的 Apple Developer Team 与签名
 ## 移动 API
 
 - `GET /health`
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
+- `GET /api/v1/account/me`
+- `GET/POST /api/v1/community/messages`
 - `POST /api/v1/jobs`
 - `GET /api/v1/jobs/{job_id}`
 - `GET /api/v1/artifacts/{job_id}/{name}`

@@ -53,6 +53,132 @@ def repair_text(value: Any, fallback: str = "") -> str:
     return text.strip() or fallback
 
 
+_LRC_TIME = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+
+
+def _parse_lrc(text: str) -> list[dict]:
+    rows: list[dict] = []
+    offset_match = re.search(r"\[offset:([+-]?\d+)\]", text, flags=re.I)
+    offset_ms = int(offset_match.group(1)) if offset_match else 0
+    for line in text.splitlines():
+        stamps = list(_LRC_TIME.finditer(line))
+        lyric = _LRC_TIME.sub("", line).strip()
+        if not stamps or not lyric or re.fullmatch(r"\[[a-z]+:.*\]", lyric, flags=re.I):
+            continue
+        for stamp in stamps:
+            fraction = stamp.group(3) or "0"
+            start = max(
+                0.0,
+                int(stamp.group(1)) * 60 + int(stamp.group(2))
+                + int(fraction) / (10 ** len(fraction)) + offset_ms / 1000,
+            )
+            rows.append({"start": round(start, 3), "text": lyric})
+    rows.sort(key=lambda row: row["start"])
+    return rows
+
+
+def _embedded_lyrics(path: Path) -> str:
+    try:
+        import mutagen
+        audio = mutagen.File(str(path), easy=False)
+        tags = getattr(audio, "tags", None)
+        if not tags:
+            return ""
+        for key in tags.keys():
+            value = tags[key]
+            lowered = str(key).casefold()
+            if lowered.startswith(("sylt", "uslt")):
+                raw = getattr(value, "text", "")
+                return "\n".join(str(item) for item in raw) if isinstance(raw, list) else str(raw or "")
+            if lowered in {"lyrics", "unsyncedlyrics", "syncedlyrics", "©lyr"}:
+                return "\n".join(str(item) for item in value) if isinstance(value, (list, tuple)) else str(value or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def load_synced_lyrics(path: str | Path, duration: float = 0) -> list[dict]:
+    audio_path = Path(path)
+    text = ""
+    for candidate in (audio_path.with_suffix(".lrc"), audio_path.parent / f"{audio_path.stem}.LRC"):
+        if not candidate.is_file():
+            continue
+        for encoding in ("utf-8-sig", "gb18030", "big5"):
+            try:
+                text = candidate.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text:
+            break
+    if not text:
+        text = _embedded_lyrics(audio_path)
+    if not text.strip():
+        return []
+    rows = _parse_lrc(text)
+    if not rows:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        step = max(2.0, float(duration or len(lines) * 4) / max(1, len(lines)))
+        rows = [{"start": round(index * step, 3), "text": line} for index, line in enumerate(lines)]
+    for index, row in enumerate(rows):
+        next_start = rows[index + 1]["start"] if index + 1 < len(rows) else max(float(duration), row["start"] + 4)
+        row["end"] = round(max(row["start"] + .2, next_start), 3)
+    return rows
+
+
+def split_guitar_stem(stem_dir: str | Path) -> dict:
+    """Split the six-stem model's combined guitar into aligned acoustic/electric files."""
+    import shutil
+    import librosa
+    import numpy as np
+    import soundfile as sf
+
+    def percentile_scale(values):
+        low, high = np.percentile(values, (10, 90))
+        if high - low < 1e-8:
+            return np.full_like(values, 0.5, dtype=np.float32)
+        return np.clip((values - low) / (high - low), 0, 1).astype(np.float32)
+
+    folder = Path(stem_dir)
+    guitar = folder / "guitar.wav"
+    if not guitar.is_file():
+        raise FileNotFoundError(f"缺少基础吉他轨：{guitar}")
+    combined = folder / "guitar_combined.wav"
+    if not combined.exists():
+        shutil.copy2(guitar, combined)
+    audio, sample_rate = sf.read(str(combined), always_2d=True, dtype="float32")
+    if not len(audio):
+        raise RuntimeError("基础吉他轨为空")
+
+    acoustic_channels, electric_channels, frame_scores = [], [], []
+    n_fft, hop = 2048, 512
+    for channel in audio.T:
+        spectrum = librosa.stft(channel, n_fft=n_fft, hop_length=hop, center=True)
+        magnitude = np.abs(spectrum) + 1e-9
+        frequencies = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
+        flatness = librosa.feature.spectral_flatness(S=magnitude)[0]
+        centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sample_rate)[0]
+        high = magnitude[frequencies >= 1800].sum(axis=0) / magnitude.sum(axis=0)
+        electric_time = 0.42 * percentile_scale(flatness) + 0.33 * percentile_scale(centroid) + 0.25 * percentile_scale(high)
+        electric_time = np.convolve(electric_time, np.ones(9) / 9, mode="same")
+        frame_scores.append(float(np.mean(electric_time)))
+        frequency_prior = 0.35 + 0.65 / (1 + np.exp(-(frequencies - 900) / 650))
+        mask = np.clip(0.10 + 0.72 * frequency_prior[:, None] * electric_time[None, :], 0.08, 0.82)
+        electric = librosa.istft(spectrum * mask, hop_length=hop, length=len(channel))
+        electric_channels.append(electric.astype(np.float32))
+        acoustic_channels.append((channel - electric).astype(np.float32))
+    sf.write(str(guitar), np.column_stack(acoustic_channels), sample_rate, subtype="PCM_24")
+    sf.write(str(folder / "electric_guitar.wav"), np.column_stack(electric_channels), sample_rate, subtype="PCM_24")
+    diagnostics = {
+        "method": "spectral-soft-mask-v1", "base_model": "htdemucs_6s",
+        "sample_rate": int(sample_rate), "duration": float(len(audio) / sample_rate),
+        "electric_activity": round(float(np.mean(frame_scores)), 4),
+        "outputs": ["guitar.wav", "electric_guitar.wav", "guitar_combined.wav"],
+    }
+    (folder / "guitar_second_stage.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return diagnostics
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     """Persist JSON without leaving a half-written recovery file after a crash."""
 

@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 _datas = [('assets','assets')]
 _binaries = []
 _hidden = []
-for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen']:
+for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp']:
     try:
         d, b, h = collect_all(pkg)
         _datas += d
@@ -15,7 +15,7 @@ for pkg in ['demucs', 'torch', 'torchaudio', 'soundfile', 'sounddevice', 'libros
 
 _hidden += collect_submodules('demucs')
 _common_hidden = _hidden + [
-    'numpy', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen',
+    'numpy', 'soundfile', 'sounddevice', 'librosa', 'scipy', 'mido', 'mutagen', 'yt_dlp',
     'demucs.separate', 'demucs.pretrained', 'demucs.apply', 'demucs.api',
 ]
 
