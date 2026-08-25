@@ -105,8 +105,9 @@ jobs:
           cp -r mobile/assets mobile_build/assets
           cd mobile_build
           flutter pub get
-          python3 -m pip install --quiet pillow
-          python3 - <<'PY'
+          python3 -m venv .iconvenv
+          .iconvenv/bin/python -m pip install --quiet --upgrade pip pillow
+          .iconvenv/bin/python - <<'PY'
           from PIL import Image
           from pathlib import Path
           p=Path('assets/juweier_icon.png')
