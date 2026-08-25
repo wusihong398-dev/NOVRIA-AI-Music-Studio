@@ -5,7 +5,6 @@ path = Path('mobile/lib/main.dart')
 text = path.read_text(encoding='utf-8')
 text = re.sub(r"const appVersion = '3\.5\.[0-9]+';", "const appVersion = '3.5.10';", text, count=1)
 
-# v3.5.10: show the real device -> api.db0888.com RTT instead of guessing from CI.
 state_anchor = "  final Map<int, double> offlineDownloadProgress = <int, double>{};"
 if state_anchor in text and "int? serverLatencyMs;" not in text:
     text = text.replace(state_anchor, state_anchor + "\n  int? serverLatencyMs;", 1)
@@ -132,8 +131,6 @@ helpers = r'''  Future<int?> _measureServerLatency() async {
 if "Future<int?> _measureServerLatency()" not in text:
     text = text.replace(method_anchor, helpers + method_anchor, 1)
 
-# Replace the v3.5.9 downloader with resumable Range requests. Part files are kept
-# after lock/background suspension so the user can continue instead of restarting.
 download_pattern = re.compile(
     r"  Future<void> _downloadToFile\(String url, File target, String token, void Function\(double\) onProgress\) async \{.*?\n  \}\n\n  Future<void> downloadProductOffline\(PipelineJob job\) async \{.*?\n  \}\n\n  Future<void> deleteOfflineProduct",
     re.S,
@@ -191,8 +188,6 @@ download_replacement = r'''  Future<void> _downloadToFile(String url, File targe
       if (mounted) setState(() {});
     }
     try {
-      // All independent assets are fetched concurrently. This removes 7 serial
-      // request/TTFB waits and is much faster on higher latency mobile networks.
       await Future.wait(assets.entries.map((entry) async {
         final url = '${widget.store.serverBase}/api/v1/library/mobile/catalog/${job.libraryId}/${entry.value}';
         final target = File('${dir.path}${Platform.pathSeparator}${entry.key}');
@@ -201,8 +196,6 @@ download_replacement = r'''  Future<void> _downloadToFile(String url, File targe
       offlineReady.add(job.libraryId);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('成品已完整下载到本地，可离线演奏')));
     } catch (error) {
-      // Keep .part files. iOS/Android may suspend sockets after manual lock;
-      // tapping continue resumes with HTTP Range instead of starting over.
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('下载已暂停，已保存进度；解锁后点“继续下载”即可断点续传')));
     } finally {
       offlineDownloadProgress.remove(job.libraryId);
@@ -215,8 +208,6 @@ text, n = download_pattern.subn(download_replacement, text, count=1)
 if n != 1:
     raise SystemExit('v3.5.9 offline downloader block target missing')
 
-# Replace serial 1/7...7/7 stem loading with parallel prefetch. Each player is
-# returned from its Future and merged only after completion to avoid shared-map races.
 stem_pattern = re.compile(
     r"    final stemPlayers = <String, AudioPlayer>\{\};\n    var done = 0;\n    for \(final entry in keys\.entries\) \{.*?\n      done\+\+;\n    \}",
     re.S,
@@ -256,19 +247,16 @@ text, n = stem_pattern.subn(stem_replacement, text, count=1)
 if n != 1:
     raise SystemExit('v3.5.9 serial stem loading target missing')
 
-# Measure RTT at the start of a load without blocking playback for long.
 load_anchor = "    loadingJobId = job.id;\n    final generation = ++loadGeneration;"
 if load_anchor in text and "serverLatencyMs = await _measureServerLatency();" not in text:
     text = text.replace(load_anchor, load_anchor + "\n    serverLatencyMs = await _measureServerLatency();", 1)
 
-# Make the latency visible beside loading state when the semantic text exists.
 text = text.replace(
     "Text(loadingText, style: const TextStyle(color: Color(0xFFBDAAB5)))",
     "Text(serverLatencyMs == null ? loadingText : '$loadingText  ·  网络 ${serverLatencyMs}ms', style: const TextStyle(color: Color(0xFFBDAAB5)))",
     1,
 )
 
-# Add persistent local-product directory manager next to the offline download card.
 ui_anchor = "        const SizedBox(height: 12),\n        Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(children: ["
 if ui_anchor in text and "本地成品目录" not in text:
     text = text.replace(
@@ -279,6 +267,8 @@ if ui_anchor in text and "本地成品目录" not in text:
 
 if "七轨并行加载" not in text or "Future.wait(assets.entries.map" not in text:
     raise SystemExit('v3.5.10 parallel loading patch incomplete')
+if "本地成品目录" not in text:
+    raise SystemExit('v3.5.10 local product directory UI missing')
 if "appVersion = '3.5.10'" not in text:
     raise SystemExit('v3.5.10 version stamp missing')
 
