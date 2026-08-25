@@ -76,7 +76,6 @@ jobs:
           cp -r mobile/assets mobile_build/assets
           cd mobile_build
           flutter pub get
-
           python3 -m venv .iconvenv
           .iconvenv/bin/python -m pip install --quiet --upgrade pip pillow
           .iconvenv/bin/python - <<'PY'
@@ -89,7 +88,6 @@ jobs:
           bg.alpha_composite(im, ((1024-im.width)//2,(1024-im.height)//2))
           bg.convert('RGB').save(p)
           PY
-
           python3 - <<'PY'
           from pathlib import Path
           p=Path('pubspec.yaml')
@@ -116,18 +114,16 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-
           echo "$IOS_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
           security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" -P "$IOS_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-
           echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
           security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
           PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          export PROFILE_NAME
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
-
           python3 - <<'PY'
           from pathlib import Path
           import os,re
@@ -137,15 +133,17 @@ jobs:
           team=os.environ['APPLE_TEAM_ID']
           profile=os.environ['PROFILE_NAME']
           s=re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = [^;]+;', f'PRODUCT_BUNDLE_IDENTIFIER = {bundle};', s)
+          s=re.sub(r'CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;', s)
           if 'DEVELOPMENT_TEAM =' in s:
               s=re.sub(r'DEVELOPMENT_TEAM = [^;]+;', f'DEVELOPMENT_TEAM = {team};', s)
           else:
-              s=s.replace('CODE_SIGN_STYLE = Automatic;', f'CODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = {team};\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{profile}";')
-          s=s.replace('CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;')
-          s=re.sub(r'PROVISIONING_PROFILE_SPECIFIER = [^;]+;', f'PROVISIONING_PROFILE_SPECIFIER = "{profile}";', s)
+              s=s.replace('CODE_SIGN_STYLE = Manual;', f'CODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = {team};')
+          if 'PROVISIONING_PROFILE_SPECIFIER =' in s:
+              s=re.sub(r'PROVISIONING_PROFILE_SPECIFIER = [^;]+;', f'PROVISIONING_PROFILE_SPECIFIER = "{profile}";', s)
+          else:
+              s=s.replace(f'DEVELOPMENT_TEAM = {team};', f'DEVELOPMENT_TEAM = {team};\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{profile}";')
           p.write_text(s, encoding='utf-8')
           PY
-
           cat > ios/ExportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -161,14 +159,9 @@ jobs:
           </dict>
           </plist>
           EOF
-        env:
-          PROFILE_NAME: ${{ env.PROFILE_NAME }}
 
       - name: Build signed IPA
         shell: bash
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
         run: |
           cd mobile_build
           flutter build ipa --release --build-name=3.5.10 --build-number=${{ github.run_number }} --export-options-plist=ios/ExportOptions.plist
