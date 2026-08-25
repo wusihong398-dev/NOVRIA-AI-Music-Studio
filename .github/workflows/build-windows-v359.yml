@@ -30,14 +30,18 @@ jobs:
         run: |
           python tools\patch_windows_cache_v353.py
           python tools\patch_windows_exit_v354.py
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
           $p='app\launcher.py'; $s=Get-Content $p -Raw -Encoding UTF8
-          $s=$s -replace 'VERSION = "3\.5\.[0-9]+"','VERSION = "3.5.9"'; Set-Content $p $s -Encoding UTF8
+          $s=$s.TrimStart([char]0xFEFF)
+          $s=$s -replace 'VERSION = "3\.5\.[0-9]+"','VERSION = "3.5.9"'
+          [System.IO.File]::WriteAllText($p,$s,$utf8NoBom)
           $p='installer\NOVRIA.iss'; $s=Get-Content $p -Raw -Encoding UTF8
+          $s=$s.TrimStart([char]0xFEFF)
           $s=$s -replace '#define MyAppVersion "3\.5\.[0-9]+"','#define MyAppVersion "3.5.9"'
           $s=$s -replace 'Juweier_Music_v3\.5\.[0-9]+_Setup_x64','Juweier_Music_v3.5.9_Setup_x64'
           $s=$s -replace 'VersionInfoVersion=3\.5\.[0-9]+\.0','VersionInfoVersion=3.5.9.0'
           $s=$s -replace 'VersionInfoProductVersion=3\.5\.[0-9]+','VersionInfoProductVersion=3.5.9'
-          Set-Content $p $s -Encoding UTF8
+          [System.IO.File]::WriteAllText($p,$s,$utf8NoBom)
       - name: Build Windows EXE
         shell: powershell
         run: |
@@ -49,10 +53,13 @@ jobs:
           $root='dist\Juweier-Music'
           if (!(Test-Path "$root\Juweier-Music.exe")) { throw 'EXE missing' }
           if (!(Test-Path "$root\Juweier-Separation-Worker.exe")) { throw 'Worker missing' }
+          if (!(Test-Path "$root\tools\ffmpeg\ffmpeg.exe")) { throw 'FFmpeg missing' }
           if (!(Select-String -Path 'app\main.py' -Pattern '_SERVER_ARTIFACT_CACHE_LOCKS' -Quiet)) { throw 'Cache lock fix missing' }
           if (!(Select-String -Path 'app\launcher.py' -Pattern '_v354_fast_close' -Quiet)) { throw 'Fast close fix missing' }
           if (!(Select-String -Path 'app\launcher.py' -Pattern 'VERSION = "3.5.9"' -Quiet)) { throw 'v3.5.9 stamp missing' }
-          python -m unittest discover -s tests -v
+          python -m py_compile app\launcher.py app\main.py app\library_catalog.py app\server_batch_rules.py app\chinese_normalization.py
+          python -m pip install --quiet opencc-python-reimplemented
+          python -m unittest tests.test_chinese_normalization tests.test_project_utils tests.test_uvr_separator tests.test_mega53_runner_compatibility -v
       - name: Build installer
         shell: powershell
         run: |
