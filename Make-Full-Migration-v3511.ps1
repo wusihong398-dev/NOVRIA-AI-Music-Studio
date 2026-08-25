@@ -21,7 +21,9 @@ Write-Host "Bundle: $bundle"
 if (-not (Test-Path $ServerRoot)) { throw "Server root missing: $ServerRoot" }
 
 # Stop only the API listener if present so SQLite and product files are copied consistently.
-$pid8001 = (Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
+$listener = Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+$pid8001 = $null
+if ($listener) { $pid8001 = $listener.OwningProcess }
 if ($pid8001) {
   Write-Host "Stopping port 8001 process PID $pid8001"
   Stop-Process -Id $pid8001 -Force
@@ -33,9 +35,16 @@ $serverDst = Join-Path $core 'Dongba-Music-Server'
 New-Item -ItemType Directory -Force -Path $serverDst | Out-Null
 $excludeDirs = @('.venv','.venv-mobile-api','__pycache__','.git','build','dist','release','.pytest_cache')
 $excludeFiles = @('*.pyc','*.pyo','*.tmp','*.part','*.log')
-$xd = $excludeDirs | ForEach-Object { '/XD'; Join-Path $ServerRoot $_ }
+$xd = @()
+foreach ($dir in $excludeDirs) {
+  $xd += '/XD'
+  $xd += (Join-Path $ServerRoot $dir)
+}
 $xf = @()
-foreach ($f in $excludeFiles) { $xf += '/XF'; $xf += $f }
+foreach ($f in $excludeFiles) {
+  $xf += '/XF'
+  $xf += $f
+}
 $roboArgs = @($ServerRoot,$serverDst,'/E','/COPY:DAT','/DCOPY:DAT','/R:2','/W:2','/XJ','/NFL','/NDL','/NP') + $xd + $xf
 & robocopy @roboArgs | Out-Host
 if ($LASTEXITCODE -ge 8) { throw "robocopy core failed with code $LASTEXITCODE" }
@@ -43,16 +52,26 @@ if ($LASTEXITCODE -ge 8) { throw "robocopy core failed with code $LASTEXITCODE" 
 # Copy SQLite database plus WAL/SHM if present.
 $dbDir = Join-Path $ServerRoot 'database'
 if (Test-Path $dbDir) {
-  New-Item -ItemType Directory -Force -Path (Join-Path $serverDst 'database') | Out-Null
+  $dbDst = Join-Path $serverDst 'database'
+  New-Item -ItemType Directory -Force -Path $dbDst | Out-Null
   Get-ChildItem $dbDir -File -ErrorAction SilentlyContinue | Where-Object {
     $_.Name -like '*.sqlite3' -or $_.Name -like '*.sqlite3-wal' -or $_.Name -like '*.sqlite3-shm' -or $_.Name -like '*.db'
-  } | Copy-Item -Destination (Join-Path $serverDst 'database') -Force
+  } | Copy-Item -Destination $dbDst -Force
 }
 
 function Get-TreeSummary([string]$Path) {
-  if (-not (Test-Path $Path)) { return [pscustomobject]@{Path=$Path;Exists=$false;Files=0;Bytes=0} }
+  if (-not (Test-Path $Path)) {
+    return [pscustomobject]@{Path=$Path;Exists=$false;Files=[int64]0;Bytes=[int64]0}
+  }
   $m = Get-ChildItem $Path -File -Recurse -ErrorAction SilentlyContinue | Measure-Object Length -Sum
-  [pscustomobject]@{Path=$Path;Exists=$true;Files=[int64]$m.Count;Bytes=[int64]($m.Sum ?? 0)}
+  $sumBytes = [int64]0
+  if ($null -ne $m.Sum) { $sumBytes = [int64]$m.Sum }
+  return [pscustomobject]@{
+    Path = $Path
+    Exists = $true
+    Files = [int64]$m.Count
+    Bytes = $sumBytes
+  }
 }
 
 $summary = @(
@@ -84,7 +103,8 @@ if ($IncludeOriginals -and (Test-Path $OriginalsRoot)) {
 
 if ($IncludeProcessed) {
   foreach ($entry in @(@($ProcessedRoot1,'processed_G'),@($ProcessedRoot2,'processed_F'))) {
-    $src = $entry[0]; $name = $entry[1]
+    $src = $entry[0]
+    $name = $entry[1]
     if (Test-Path $src) {
       $dst = Join-Path $data $name
       New-Item -ItemType Directory -Force -Path $dst | Out-Null
@@ -98,7 +118,9 @@ if ($IncludeProcessed) {
 $hashTargets = Get-ChildItem $core -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
   $_.Extension -in '.ps1','.py','.json','.yaml','.yml','.toml','.txt','.sqlite3','.db'
 }
-$hashTargets | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash | Export-Csv -NoTypeInformation -Encoding UTF8 (Join-Path $bundle 'SHA256SUMS.csv')
+if ($hashTargets) {
+  $hashTargets | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash | Export-Csv -NoTypeInformation -Encoding UTF8 (Join-Path $bundle 'SHA256SUMS.csv')
+}
 
 Write-Host ''
 Write-Host 'MIGRATION PACK READY' -ForegroundColor Green
