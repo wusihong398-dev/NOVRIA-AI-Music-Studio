@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "橘味儿音乐"
-VERSION = "2.1.7"
+VERSION = "3.0.0"
 STEM_ORDER = [
     ("vocals", "🎤", "人声 Vocal"),
     ("drums", "🥁", "鼓 Drums"),
@@ -132,7 +132,7 @@ class SeparationWorker(QThread):
 
         req = urllib.request.Request(
             self.MODEL_URL,
-            headers={"User-Agent": "Juweier-Music/2.1.7"}
+            headers={"User-Agent": "Juweier-Music/3.0.0"}
         )
         with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -2278,7 +2278,7 @@ class UniversalImportPage(QWidget):
             parsed=urllib.parse.urlparse(url)
             name=Path(parsed.path).name or "downloaded_audio"
             dest=downloads/name
-            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/2.1.7"})
+            req=urllib.request.Request(url,headers={"User-Agent":"Juweier-Music/3.0.0"})
             with urllib.request.urlopen(req,timeout=30) as resp, open(dest,"wb") as f:
                 total=int(resp.headers.get("Content-Length") or 0)
                 read=0
@@ -3895,7 +3895,16 @@ class MusicLibraryPage(QWidget):
         sf_path=str(job.get("render_soundfont","") or "")
 
         if not sf_path or not Path(sf_path).exists():
-            raise RuntimeError("未设置 SoundFont。请先在 AI 改编页面选择 SoundFont。")
+            # MIDI 编配已经是可交付成果。SoundFont 是可选的本地音色库，
+            # 未配置时跳过音频渲染，不再让整条 AI 流水线失败。
+            job["artifacts"]["render_notice"] = "未配置 SoundFont，已保留 MIDI 并跳过音频渲染"
+            con=self._db()
+            con.execute(
+                "UPDATE tracks SET render_status='已跳过（未配置 SoundFont）' WHERE id=?",
+                (job["track_id"],),
+            )
+            con.commit();con.close()
+            return
 
         fluidsynth=self.main._find_fluidsynth()
         if not fluidsynth:
@@ -3951,6 +3960,191 @@ class MusicLibraryPage(QWidget):
         con.close()
         if row and Path(row["working_path"]).exists():
             self.main.load_imported_working_file(row["working_path"])
+
+
+class CommunityPage(QWidget):
+    """Desktop account and beta community client backed by mobile_api.py."""
+
+    CONFIG_FILE = BASE_DIR / "config" / "community.json"
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.token = ""
+        self.username = ""
+        self.nickname = ""
+
+        root = QVBoxLayout(self)
+        title = QLabel("账号 / 内测群聊")
+        title.setObjectName("PageTitle")
+        root.addWidget(title)
+        hint = QLabel("Windows、Android 与 iOS 使用同一账号和群聊；服务器可填写电脑局域网地址或 Cloudflare HTTPS 域名。")
+        hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        account_box = QGroupBox("橘味儿账号")
+        form = QGridLayout(account_box)
+        self.server_edit = QLineEdit("http://192.168.1.100:8000")
+        self.server_edit.setPlaceholderText("例如 http://电脑IP:8000 或 https://api.example.com")
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("账号（至少 3 位）")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setPlaceholderText("密码（至少 6 位）")
+        self.nickname_edit = QLineEdit()
+        self.nickname_edit.setPlaceholderText("昵称（注册时可选）")
+        login_btn = QPushButton("登录")
+        register_btn = QPushButton("注册")
+        apply_button_accent(login_btn, "primary")
+        login_btn.clicked.connect(lambda: self.authenticate(False))
+        register_btn.clicked.connect(lambda: self.authenticate(True))
+        self.logout_btn = QPushButton("退出登录")
+        self.logout_btn.clicked.connect(self.logout)
+        self.account_status = QLabel("未登录")
+        self.account_status.setObjectName("SectionHint")
+        form.addWidget(QLabel("AI 服务器"), 0, 0)
+        form.addWidget(self.server_edit, 0, 1, 1, 4)
+        form.addWidget(QLabel("账号"), 1, 0)
+        form.addWidget(self.user_edit, 1, 1)
+        form.addWidget(QLabel("密码"), 1, 2)
+        form.addWidget(self.password_edit, 1, 3)
+        form.addWidget(QLabel("昵称"), 2, 0)
+        form.addWidget(self.nickname_edit, 2, 1)
+        form.addWidget(login_btn, 2, 2)
+        form.addWidget(register_btn, 2, 3)
+        form.addWidget(self.logout_btn, 2, 4)
+        form.addWidget(self.account_status, 3, 0, 1, 5)
+        root.addWidget(account_box)
+
+        chat_box = QGroupBox("v3.0 内测群聊")
+        chat_layout = QVBoxLayout(chat_box)
+        self.messages = QTextBrowser()
+        self.messages.setPlaceholderText("登录后可与三端内测用户交流。")
+        chat_layout.addWidget(self.messages, 1)
+        send_row = QHBoxLayout()
+        self.message_edit = QLineEdit()
+        self.message_edit.setPlaceholderText("输入消息，最多 500 字")
+        self.message_edit.returnPressed.connect(self.send_message)
+        refresh_btn = QPushButton("刷新")
+        send_btn = QPushButton("发送")
+        apply_button_accent(send_btn, "primary")
+        refresh_btn.clicked.connect(self.refresh_messages)
+        send_btn.clicked.connect(self.send_message)
+        send_row.addWidget(self.message_edit, 1)
+        send_row.addWidget(refresh_btn)
+        send_row.addWidget(send_btn)
+        chat_layout.addLayout(send_row)
+        root.addWidget(chat_box, 1)
+        self._load_config()
+
+    def _base_url(self):
+        return self.server_edit.text().strip().rstrip("/")
+
+    def _request(self, method, path, payload=None):
+        base = self._base_url()
+        if not base.startswith(("http://", "https://")):
+            raise RuntimeError("服务器地址必须以 http:// 或 https:// 开头")
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(detail) from exc
+        except Exception as exc:
+            raise RuntimeError(f"无法连接服务器：{exc}") from exc
+
+    def _load_config(self):
+        try:
+            data = json.loads(self.CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        self.server_edit.setText(str(data.get("server", self.server_edit.text())))
+        self.token = str(data.get("token", ""))
+        self.username = str(data.get("username", ""))
+        self.nickname = str(data.get("nickname", ""))
+        self.user_edit.setText(self.username)
+        self._update_status()
+        if self.token:
+            QTimer.singleShot(700, self.refresh_messages)
+
+    def _save_config(self):
+        self.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.CONFIG_FILE, {
+            "server": self._base_url(), "token": self.token,
+            "username": self.username, "nickname": self.nickname,
+        })
+
+    def _update_status(self):
+        text = f"已登录：{self.nickname or self.username}（{self.username}）" if self.token else "未登录"
+        self.account_status.setText(text)
+        self.logout_btn.setEnabled(bool(self.token))
+
+    def authenticate(self, register):
+        payload = {
+            "username": self.user_edit.text().strip(),
+            "password": self.password_edit.text(),
+            "nickname": self.nickname_edit.text().strip(),
+        }
+        try:
+            data = self._request("POST", "/api/v1/auth/register" if register else "/api/v1/auth/login", payload)
+            self.token = str(data.get("token", ""))
+            self.username = str(data.get("username", payload["username"]))
+            self.nickname = str(data.get("nickname", self.username))
+            self.password_edit.clear()
+            self._save_config()
+            self._update_status()
+            self.refresh_messages()
+        except Exception as exc:
+            QMessageBox.warning(self, "账号操作失败", str(exc))
+
+    def logout(self):
+        self.token = ""
+        self._save_config()
+        self._update_status()
+        self.messages.clear()
+
+    def refresh_messages(self):
+        if not self.token:
+            return
+        try:
+            data = self._request("GET", "/api/v1/community/messages?limit=100")
+            rows = []
+            for item in data.get("messages", []):
+                stamp = time.strftime("%m-%d %H:%M", time.localtime(float(item.get("created_at", 0))))
+                name = html.escape(str(item.get("nickname") or item.get("username") or "用户"))
+                content = html.escape(str(item.get("content", ""))).replace("\n", "<br>")
+                rows.append(f"<p><b style='color:#FF8A2A'>{name}</b> <span style='color:#A995A6'>{stamp}</span><br>{content}</p>")
+            self.messages.setHtml("".join(rows) or "<p>群里还没有消息，来发第一条吧。</p>")
+            bar = self.messages.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        except Exception as exc:
+            self.account_status.setText(f"群聊刷新失败：{exc}")
+
+    def send_message(self):
+        content = self.message_edit.text().strip()
+        if not self.token:
+            QMessageBox.information(self, "提示", "请先登录账号。")
+            return
+        if not content:
+            return
+        try:
+            self._request("POST", "/api/v1/community/messages", {"content": content[:500]})
+            self.message_edit.clear()
+            self.refresh_messages()
+        except Exception as exc:
+            QMessageBox.warning(self, "发送失败", str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -4036,6 +4230,7 @@ class MainWindow(QMainWindow):
             ("Setlist 歌单","setlist"),
             ("AI 歌声","voice"),
             ("作品中心","projects"),
+            ("账号 / 内测群聊","projects"),
             ("设置","settings"),
         ]
         for text, ico in nav_items:
@@ -4069,6 +4264,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.setlist)
         self.stack.addWidget(self.voice_lab)
         self.stack.addWidget(Placeholder("作品中心：工程管理继续完善中"))
+        self.community = CommunityPage(self)
+        self.stack.addWidget(self.community)
         self.settings_page = SettingsPage(self)
         self.stack.addWidget(self.settings_page)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)

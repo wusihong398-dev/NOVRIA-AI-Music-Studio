@@ -3,7 +3,7 @@ name: Build Juweier Music Android and iOS
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "agent/juweier-v3.0.0"]
     paths:
       - "mobile/**"
       - ".github/workflows/build-mobile.yml"
@@ -53,7 +53,7 @@ jobs:
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v2.1.7-Android-APK
+          name: Juweier-Music-v3.0.0-Android-APK
           path: mobile_build/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 30
@@ -80,24 +80,31 @@ jobs:
           cd mobile_build
           flutter pub get
           dart run flutter_launcher_icons
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          project = Path('ios/Runner.xcodeproj/project.pbxproj')
+          text = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 14.0;', project.read_text())
+          project.write_text(text)
+          PY
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 需要连接局域网内的橘味儿音乐AI服务器" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" ios/Runner/Info.plist || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" ios/Runner/Info.plist || true
-      - name: Build iOS without signing
+      - name: Build iOS simulator validation app
         working-directory: mobile_build
-        run: flutter build ios --release --no-codesign
-      - name: Package unsigned iOS app
+        run: flutter build ios --simulator --debug
+      - name: Package iOS simulator app
         shell: bash
         run: |
-          cd mobile_build/build/ios/iphoneos
-          zip -0qry ../../../../Juweier-Music-v2.1.7-iOS-Unsigned.zip Runner.app
-      - name: Upload iOS unsigned package
+          cd mobile_build/build/ios/iphonesimulator
+          zip -0qry ../../../../Juweier-Music-v3.0.0-iOS-Simulator.zip Runner.app
+      - name: Upload iOS simulator package
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v2.1.7-iOS-Unsigned
-          path: Juweier-Music-v2.1.7-iOS-Unsigned.zip
+          name: Juweier-Music-v3.0.0-iOS-Simulator
+          path: Juweier-Music-v3.0.0-iOS-Simulator.zip
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

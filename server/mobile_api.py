@@ -1,4 +1,4 @@
-"""Mobile API companion for 橘味儿音乐 v2.1.7.
+"""Mobile API companion for 橘味儿音乐 v3.0.0.
 
 Run this on the Windows/GPU computer. Android and iOS clients upload source
 audio here; Demucs and the analysis pipeline remain on the capable computer.
@@ -7,10 +7,14 @@ audio here; Demucs and the analysis pipeline remain on the capable computer.
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -22,16 +26,18 @@ from pathlib import Path
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from app.project_utils import atomic_write_json, safe_file_stem
 
 
 APP_NAME = "橘味儿音乐"
-VERSION = "2.1.7"
+VERSION = "3.0.0"
 ROOT = Path(os.environ.get("JUWEIER_DATA_DIR", Path.cwd() / "mobile_server_data")).resolve()
 UPLOADS = ROOT / "uploads"
 OUTPUTS = ROOT / "outputs"
 STATE_FILE = ROOT / "jobs.json"
+ACCOUNT_DB = ROOT / "accounts.sqlite3"
 TOKEN = os.environ.get("JUWEIER_API_TOKEN", "").strip()
 for folder in (UPLOADS, OUTPUTS):
     folder.mkdir(parents=True, exist_ok=True)
@@ -39,6 +45,105 @@ for folder in (UPLOADS, OUTPUTS):
 app = FastAPI(title=f"{APP_NAME} Mobile API", version=VERSION)
 lock = threading.RLock()
 executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JUWEIER_WORKERS", "1"))))
+
+
+class AuthPayload(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+    nickname: str = Field(default="", max_length=32)
+
+
+class ChatPayload(BaseModel):
+    content: str = Field(min_length=1, max_length=500)
+
+
+def _db() -> sqlite3.Connection:
+    connection = sqlite3.connect(ACCOUNT_DB, timeout=20)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _init_accounts() -> None:
+    connection = _db()
+    try:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                nickname TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS community_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_community_messages_created
+            ON community_messages(created_at DESC);
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _password_hash(password: str, salt_hex: str | None = None) -> str:
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240_000)
+    return f"{salt.hex()}:{digest.hex()}"
+
+
+def _password_matches(password: str, stored: str) -> bool:
+    try:
+        salt_hex, expected = stored.split(":", 1)
+        actual = _password_hash(password, salt_hex).split(":", 1)[1]
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _new_session(connection: sqlite3.Connection, user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    connection.execute(
+        "INSERT INTO sessions(token,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+        (token, user_id, now + 30 * 24 * 3600, now),
+    )
+    connection.execute("DELETE FROM sessions WHERE expires_at<?", (now,))
+    return token
+
+
+def _session_user(authorization: str | None) -> sqlite3.Row | None:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    value = authorization[7:].strip()
+    if not value or (TOKEN and hmac.compare_digest(value, TOKEN)):
+        return None
+    connection = _db()
+    try:
+        return connection.execute(
+            """SELECT users.id,users.username,users.nickname
+               FROM sessions JOIN users ON users.id=sessions.user_id
+               WHERE sessions.token=? AND sessions.expires_at>?""",
+            (value, time.time()),
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+_init_accounts()
 
 
 def _load_jobs() -> dict[str, dict]:
@@ -70,11 +175,24 @@ def _update(job_id: str, **values) -> None:
         atomic_write_json(STATE_FILE, jobs)
 
 
-def authorize(authorization: str | None = Header(default=None)) -> None:
+def authorize(authorization: str | None = Header(default=None)) -> str:
+    if authorization and authorization.startswith("Bearer "):
+        value = authorization[7:].strip()
+        if TOKEN and hmac.compare_digest(value, TOKEN):
+            return "server"
+        user = _session_user(authorization)
+        if user:
+            return str(user["username"])
     if not TOKEN:
-        return
-    if authorization != f"Bearer {TOKEN}":
-        raise HTTPException(status_code=401, detail="无效的访问令牌")
+        return "anonymous"
+    raise HTTPException(status_code=401, detail="无效的访问令牌")
+
+
+def current_user(authorization: str | None = Header(default=None)) -> sqlite3.Row:
+    user = _session_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录橘味儿音乐账号")
+    return user
 
 
 def _gpu_name() -> str:
@@ -92,6 +210,107 @@ def _gpu_name() -> str:
 @app.get("/api/health")
 def health(_: None = Depends(authorize)) -> dict:
     return {"status": "healthy", "app": APP_NAME, "version": VERSION, "gpu": _gpu_name()}
+
+
+@app.post("/api/v1/auth/register", status_code=201)
+def register(payload: AuthPayload) -> dict:
+    username = payload.username.strip()
+    nickname = payload.nickname.strip() or username
+    if not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff]{3,32}", username):
+        raise HTTPException(status_code=400, detail="账号只能使用中文、字母、数字、下划线或短横线")
+    connection = _db()
+    try:
+        try:
+            cursor = connection.execute(
+                "INSERT INTO users(username,nickname,password_hash,created_at) VALUES(?,?,?,?)",
+                (username, nickname, _password_hash(payload.password), time.time()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="该账号已经注册") from exc
+        token = _new_session(connection, int(cursor.lastrowid))
+        connection.commit()
+        return {"token": token, "username": username, "nickname": nickname, "expires_in": 30 * 24 * 3600}
+    finally:
+        connection.close()
+
+
+@app.post("/api/v1/auth/login")
+def login(payload: AuthPayload) -> dict:
+    connection = _db()
+    try:
+        row = connection.execute(
+            "SELECT id,username,nickname,password_hash FROM users WHERE username=? COLLATE NOCASE",
+            (payload.username.strip(),),
+        ).fetchone()
+        if not row or not _password_matches(payload.password, str(row["password_hash"])):
+            raise HTTPException(status_code=401, detail="账号或密码错误")
+        token = _new_session(connection, int(row["id"]))
+        connection.commit()
+        return {
+            "token": token,
+            "username": str(row["username"]),
+            "nickname": str(row["nickname"]),
+            "expires_in": 30 * 24 * 3600,
+        }
+    finally:
+        connection.close()
+
+
+@app.get("/api/v1/account/me")
+def account_me(user: sqlite3.Row = Depends(current_user)) -> dict:
+    return {"id": int(user["id"]), "username": str(user["username"]), "nickname": str(user["nickname"])}
+
+
+@app.get("/api/v1/community/messages")
+def community_messages(limit: int = 100, _: sqlite3.Row = Depends(current_user)) -> dict:
+    count = max(1, min(200, int(limit)))
+    connection = _db()
+    try:
+        rows = connection.execute(
+            """SELECT community_messages.id,community_messages.content,community_messages.created_at,
+                      users.username,users.nickname
+               FROM community_messages JOIN users ON users.id=community_messages.user_id
+               ORDER BY community_messages.id DESC LIMIT ?""",
+            (count,),
+        ).fetchall()
+    finally:
+        connection.close()
+    return {
+        "messages": [
+            {
+                "id": int(row["id"]),
+                "content": str(row["content"]),
+                "created_at": float(row["created_at"]),
+                "username": str(row["username"]),
+                "nickname": str(row["nickname"]),
+            }
+            for row in reversed(rows)
+        ]
+    }
+
+
+@app.post("/api/v1/community/messages", status_code=201)
+def send_community_message(payload: ChatPayload, user: sqlite3.Row = Depends(current_user)) -> dict:
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+    now = time.time()
+    connection = _db()
+    try:
+        cursor = connection.execute(
+            "INSERT INTO community_messages(user_id,content,created_at) VALUES(?,?,?)",
+            (int(user["id"]), content, now),
+        )
+        connection.commit()
+        return {
+            "id": int(cursor.lastrowid),
+            "content": content,
+            "created_at": now,
+            "username": str(user["username"]),
+            "nickname": str(user["nickname"]),
+        }
+    finally:
+        connection.close()
 
 
 @app.post("/api/v1/jobs", status_code=202)

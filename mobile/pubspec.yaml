@@ -1,9 +1,9 @@
 name: juweier_music
-version: 2.1.7+217
+version: 3.0.0+300
 description: 橘味儿音乐 Android/iOS 正式客户端
 publish_to: 'none'
 environment:
-  sdk: '>=3.3.0 <4.0.0'
+  sdk: '>=3.10.0 <4.0.0'
 dependencies:
   flutter:
     sdk: flutter
