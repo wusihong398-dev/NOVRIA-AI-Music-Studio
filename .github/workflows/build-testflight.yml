@@ -7,7 +7,7 @@ on:
       source_ref:
         description: Source branch/tag to build
         required: true
-        default: agent/juweier-v3.5.10
+        default: agent/juweier-v3.5.11
         type: string
       upload_to_testflight:
         description: Upload IPA to TestFlight after build
@@ -63,7 +63,8 @@ jobs:
             mobile/patch_playback_v357.py \
             mobile/patch_playback_v358.py \
             mobile/patch_offline_v359.py \
-            mobile/patch_offline_v3510.py; do
+            mobile/patch_offline_v3510.py \
+            mobile/patch_offline_v3511.py; do
             [ -f "$patch" ] && python3 "$patch"
           done
 
@@ -164,13 +165,13 @@ jobs:
         shell: bash
         run: |
           cd mobile_build
-          flutter build ipa --release --build-name=3.5.10 --build-number=${{ github.run_number }} --export-options-plist=ios/ExportOptions.plist
+          flutter build ipa --release --build-name=3.5.11 --build-number=${{ github.run_number }} --export-options-plist=ios/ExportOptions.plist
           test -n "$(find build/ios/ipa -name '*.ipa' -size +1M -print -quit)"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Juweier-Music-v3.5.10-TestFlight-IPA
+          name: Juweier-Music-v3.5.11-TestFlight-IPA
           path: mobile_build/build/ios/ipa/*.ipa
           retention-days: 30
           compression-level: 0
