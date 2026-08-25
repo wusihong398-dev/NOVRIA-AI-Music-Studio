@@ -1,0 +1,65 @@
+name: Build Juweier Music v3.5.10 Windows
+run-name: Juweier Music v3.5.10 Windows · ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+  push:
+    branches: [agent/juweier-v3.5.10]
+    paths:
+      - app/**
+      - tools/**
+      - assets/**
+      - config/**
+      - build_tools/**
+      - installer/**
+      - NOVRIA.spec
+      - requirements*.txt
+      - .github/workflows/build-windows-v3510.yml
+permissions:
+  contents: read
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', cache: pip}
+      - name: Apply Windows fixes and stamp v3.5.10
+        shell: powershell
+        run: |
+          python tools\patch_windows_cache_v353.py
+          python tools\patch_windows_exit_v354.py
+          python tools\patch_windows_cache_v3510.py
+          $p='app\launcher.py'; $s=Get-Content $p -Raw -Encoding UTF8
+          $s=$s -replace 'VERSION = "3\.5\.[0-9]+"','VERSION = "3.5.10"'; [System.IO.File]::WriteAllText($p,$s,(New-Object System.Text.UTF8Encoding($false)))
+          $p='installer\NOVRIA.iss'; $s=Get-Content $p -Raw -Encoding UTF8
+          $s=$s -replace '#define MyAppVersion "3\.5\.[0-9]+"','#define MyAppVersion "3.5.10"'
+          $s=$s -replace 'Juweier_Music_v3\.5\.[0-9]+_Setup_x64','Juweier_Music_v3.5.10_Setup_x64'
+          $s=$s -replace 'VersionInfoVersion=3\.5\.[0-9]+\.0','VersionInfoVersion=3.5.10.0'
+          $s=$s -replace 'VersionInfoProductVersion=3\.5\.[0-9]+','VersionInfoProductVersion=3.5.10'
+          [System.IO.File]::WriteAllText($p,$s,(New-Object System.Text.UTF8Encoding($false)))
+      - name: Build Windows EXE
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          .\build_tools\build_windows_exe.ps1
+      - name: Verify Windows build
+        shell: powershell
+        run: |
+          $root='dist\Juweier-Music'
+          if (!(Test-Path "$root\Juweier-Music.exe")) { throw 'EXE missing' }
+          if (!(Test-Path "$root\Juweier-Separation-Worker.exe")) { throw 'Worker missing' }
+          if (!(Select-String -Path 'app\main.py' -Pattern 'ThreadPoolExecutor\(max_workers=max_workers\)' -Quiet)) { throw 'Parallel artifact cache fix missing' }
+          if (!(Select-String -Path 'app\launcher.py' -Pattern 'VERSION = "3.5.10"' -Quiet)) { throw 'v3.5.10 stamp missing' }
+          $env:PYTHONUTF8='1'
+          python -m unittest discover -s tests -v
+      - name: Build installer
+        shell: powershell
+        run: |
+          choco install innosetup --yes --no-progress
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'installer\NOVRIA.iss'
+          if (!(Test-Path 'release\Juweier_Music_v3.5.10_Setup_x64.exe')) { throw 'Installer missing' }
+      - uses: actions/upload-artifact@v4
+        with: {name: Juweier-Music-v3.5.10-Windows-x64-Portable, path: dist/Juweier-Music, retention-days: 30, compression-level: 0}
+      - uses: actions/upload-artifact@v4
+        with: {name: Juweier-Music-v3.5.10-Windows-Setup, path: release/Juweier_Music_v3.5.10_Setup_x64.exe, retention-days: 30, compression-level: 0}
