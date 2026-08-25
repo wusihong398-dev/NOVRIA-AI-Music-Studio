@@ -1,0 +1,179 @@
+name: Build Juweier Music v3.5.10 TestFlight
+run-name: Juweier Music v3.5.10 TestFlight · ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: Upload IPA to TestFlight after build
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in APPLE_TEAM_ID IOS_BUNDLE_ID IOS_P12_BASE64 IOS_P12_PASSWORD IOS_PROVISIONING_PROFILE_BASE64; do
+            if [ -z "${!name}" ]; then
+              echo "Missing secret: $name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Configure the Apple signing secrets in Repository Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+
+      - name: Patch v3.5.10 source
+        run: |
+          python3 mobile/patch_playback_v353.py
+          python3 mobile/patch_playback_v354.py
+          python3 mobile/patch_playback_v355.py
+          python3 mobile/patch_lyrics_v355.py
+          python3 mobile/patch_playback_v356.py
+          python3 mobile/patch_playback_v357.py
+          python3 mobile/patch_playback_v358.py
+          python3 mobile/patch_offline_v359.py
+          python3 mobile/patch_offline_v3510.py
+
+      - name: Prepare signed iOS project
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          flutter create --org com.db0888 --project-name juweier_music --platforms=ios mobile_build
+          rm -rf mobile_build/lib && cp -r mobile/lib mobile_build/lib
+          cp mobile/pubspec.yaml mobile_build/pubspec.yaml
+          cp -r mobile/assets mobile_build/assets
+          cd mobile_build
+          flutter pub get
+
+          python3 -m venv .iconvenv
+          .iconvenv/bin/python -m pip install --quiet --upgrade pip pillow
+          .iconvenv/bin/python - <<'PY'
+          from PIL import Image
+          from pathlib import Path
+          p=Path('assets/juweier_icon.png')
+          im=Image.open(p).convert('RGBA')
+          canvas=Image.new('RGBA',(1024,1024),(255,255,255,255))
+          im.thumbnail((960,960), Image.Resampling.LANCZOS)
+          canvas.alpha_composite(im, ((1024-im.width)//2,(1024-im.height)//2))
+          canvas.save(p)
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('pubspec.yaml')
+          s=p.read_text(encoding='utf-8').replace('  android: true','  android: false',1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          dart run flutter_launcher_icons
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName 橘味儿音乐" ios/Runner/Info.plist || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re
+          p=Path('ios/Runner.xcodeproj/project.pbxproj')
+          s=p.read_text(encoding='utf-8')
+          bundle=os.environ['IOS_BUNDLE_ID']
+          team=os.environ['APPLE_TEAM_ID']
+          s=re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = [^;]+;', f'PRODUCT_BUNDLE_IDENTIFIER = {bundle};', s)
+          s=re.sub(r'DEVELOPMENT_TEAM = [^;]+;', f'DEVELOPMENT_TEAM = {team};', s)
+          p.write_text(s, encoding='utf-8')
+          PY
+
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          echo "$IOS_P12_BASE64" | base64 --decode > certificate.p12
+          security import certificate.p12 -k "$KEYCHAIN" -P "$IOS_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > profile.mobileprovision
+          PROFILE_UUID=$(security cms -D -i profile.mobileprovision | /usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin)
+          cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          PROFILE_NAME=$(security cms -D -i profile.mobileprovision | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin)
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          p=Path('ios/Runner.xcodeproj/project.pbxproj')
+          s=p.read_text(encoding='utf-8')
+          profile=os.environ['PROFILE_NAME']
+          s=s.replace('CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;')
+          s=s.replace('DEVELOPMENT_TEAM = '+os.environ['APPLE_TEAM_ID']+';', 'DEVELOPMENT_TEAM = '+os.environ['APPLE_TEAM_ID']+';\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "'+profile+'";')
+          p.write_text(s, encoding='utf-8')
+          PY
+        env:
+          PROFILE_NAME: ${{ env.PROFILE_NAME }}
+
+      - name: Build signed IPA
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+        run: |
+          cd mobile_build
+          flutter build ipa --release \
+            --build-name=3.5.10 \
+            --build-number=${{ github.run_number }} \
+            --export-options-plist=ios/ExportOptions.plist
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Juweier-Music-v3.5.10-TestFlight-IPA
+          path: mobile_build/build/ios/ipa/*.ipa
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload_to_testflight == true }}
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          if [ -z "$APP_STORE_CONNECT_API_KEY_ID" ] || [ -z "$APP_STORE_CONNECT_ISSUER_ID" ] || [ -z "$APP_STORE_CONNECT_API_KEY_P8_BASE64" ]; then
+            echo "App Store Connect API secrets are missing"
+            exit 1
+          fi
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          echo "$APP_STORE_CONNECT_API_KEY_P8_BASE64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          IPA=$(find mobile_build/build/ios/ipa -name '*.ipa' | head -1)
+          xcrun altool --upload-app -f "$IPA" -t ios \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
