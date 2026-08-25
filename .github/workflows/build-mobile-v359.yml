@@ -47,6 +47,13 @@ jobs:
           canvas.save(p)
           assert p.stat().st_size > 4096
           PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('pubspec.yaml')
+          s=p.read_text(encoding='utf-8')
+          s=s.replace('  ios: true','  ios: false',1)
+          p.write_text(s, encoding='utf-8')
+          PY
           dart run flutter_launcher_icons
           python3 - <<'PY'
           from pathlib import Path
@@ -109,6 +116,13 @@ jobs:
           canvas.alpha_composite(im, ((1024-im.width)//2,(1024-im.height)//2))
           canvas.save(p)
           assert p.stat().st_size > 4096
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('pubspec.yaml')
+          s=p.read_text(encoding='utf-8')
+          s=s.replace('  android: true','  android: false',1)
+          p.write_text(s, encoding='utf-8')
           PY
           dart run flutter_launcher_icons
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 橘味儿音乐" ios/Runner/Info.plist || true
