@@ -13,8 +13,71 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def test_release_version_and_brand(self):
         launcher = (ROOT / 'app/launcher.py').read_text(encoding='utf-8')
-        self.assertIn('VERSION = "2.1.7"', launcher)
+        mobile_manifest = (ROOT / 'mobile/pubspec.yaml').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('VERSION = "3.2.5"', launcher)
+        self.assertIn('version: 3.2.5+325', mobile_manifest)
+        self.assertIn('VERSION = "3.2.5"', server)
         self.assertIn('DISPLAY_NAME = "橘味儿音乐"', launcher)
+
+    def test_sidebar_pages_are_real_and_server_library_isolated(self):
+        desktop = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+        server = (ROOT / "server" / "mobile_api.py").read_text(encoding="utf-8")
+        self.assertIn("class WorksCenterPage", desktop)
+        self.assertIn("self.stack.addWidget(self.works_center)", desktop)
+        self.assertNotIn('Placeholder("作品中心', desktop)
+        self.assertIn(r'G:\JuweierMusicLibrary\01_Originals\按歌手分类(MP3）', server)
+        self.assertIn('"source_scope": "server"', server)
+
+    def test_v3_account_community_and_soundfont_fallback(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        self.assertIn('class CommunityPage', desktop)
+        self.assertIn('已跳过（未配置 SoundFont）', desktop)
+        self.assertIn('/api/v1/auth/register', server)
+        self.assertIn('/api/v1/community/messages', server)
+        self.assertIn('/api/v1/auth/sms/send', server)
+        self.assertIn('/api/v1/auth/password/reset', server)
+        self.assertIn('ALIBABA_CLOUD_ACCESS_KEY_ID', server)
+        self.assertNotIn('LTAI', server)
+
+    def test_library_job_routes_stay_inside_cloudflare_library_route(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        self.assertIn('/api/v1/library/mobile/jobs/{job_id}', server)
+        self.assertIn('/api/v1/library/mobile/artifacts/{job_id}/{name}', server)
+        self.assertIn('/api/v1/library/mobile/health', server)
+        self.assertIn("'/api/v1/library/mobile/jobs/$id'", mobile)
+
+    def test_processing_runtime_is_checked_before_accepting_expensive_work(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        self.assertIn('def _runtime_capabilities()', server)
+        self.assertIn('def _require_processing_runtime()', server)
+        self.assertIn('lyrics_asr_available', server)
+        self.assertIn('检查 AI 处理环境', server)
+        self.assertIn('定位服务器歌曲', mobile)
+        self.assertIn('提交 AI 处理任务', mobile)
+        self.assertIn('服务器未安装 AI 分轨运行环境', mobile)
+
+    def test_g_drive_library_is_global_and_visible_before_processors(self):
+        desktop = (ROOT / 'app/main.py').read_text(encoding='utf-8')
+        self.assertLess(desktop.index('G 盘歌手歌曲库'), desktop.index('批量 AI 处理器'))
+        self.assertIn('全局 G 盘歌曲', desktop)
+        self.assertIn('def load_server_library_track', desktop)
+        self.assertIn('self.main.load_server_library_track(tid, row)', desktop)
+        self.assertIn('本次未读取、未扫描客户端 G 盘', desktop)
+        self.assertIn('ServerLibraryClient', desktop)
+        self.assertIn('加入当前 G 盘歌曲', desktop)
+
+    def test_server_scores_share_one_synced_lyrics_timeline(self):
+        server = (ROOT / 'server/mobile_api.py').read_text(encoding='utf-8')
+        mobile = (ROOT / 'mobile/lib/main.dart').read_text(encoding='utf-8')
+        self.assertIn('transcribe_synced_lyrics', server)
+        self.assertIn('lyrics_timeline.json', server)
+        self.assertIn('electric_guitar_tab', server)
+        self.assertIn('acoustic_guitar_tab', server)
+        self.assertIn("lyrics_message", mobile)
 
     def test_done_handlers_do_not_destroy_running_qthreads(self):
         source = (ROOT / 'app/main.py').read_text(encoding='utf-8')
